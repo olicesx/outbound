@@ -410,3 +410,35 @@ func TestProxyIpCacheSetCleansOtherExpiredEntries(t *testing.T) {
 		t.Fatal("fresh entry missing after Set")
 	}
 }
+
+func TestCleanupGlobalErrorLogTimes(t *testing.T) {
+	// Reset map for test
+	globalErrorLogTimes.Range(func(key, value any) bool {
+		globalErrorLogTimes.Delete(key)
+		return true
+	})
+
+	now := time.Now().UnixNano()
+	staleTime := time.Now().Add(-maxErrorLogAge - time.Hour).UnixNano()
+
+	pNow := new(int64)
+	*pNow = now
+	pStale := new(int64)
+	*pStale = staleTime
+
+	globalErrorLogTimes.Store("fresh", pNow)
+	globalErrorLogTimes.Store("stale", pStale)
+	globalErrorLogTimes.Store("junk", "not a pointer")
+
+	cleanupGlobalErrorLogTimes()
+
+	if _, ok := globalErrorLogTimes.Load("fresh"); !ok {
+		t.Error("fresh entry was unexpectedly deleted")
+	}
+	if _, ok := globalErrorLogTimes.Load("stale"); ok {
+		t.Error("stale entry was not deleted")
+	}
+	if _, ok := globalErrorLogTimes.Load("junk"); ok {
+		t.Error("junk entry was not deleted")
+	}
+}

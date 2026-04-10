@@ -34,6 +34,45 @@ const (
 	cacheCleanupInterval = time.Minute
 )
 
+var (
+	errorLogInterval = 10 * time.Second
+
+	// globalErrorLogTimes keeps track of the last time an error was logged for each proxy address globally.
+	// This ensures rate limiting works across different ProxyIpCache instances and cloned dialers.
+	globalErrorLogTimes sync.Map
+	janitorOnce         sync.Once
+)
+
+const (
+	janitorInterval = 1 * time.Hour
+	maxErrorLogAge  = 24 * time.Hour
+)
+
+func startJanitor() {
+	go func() {
+		ticker := time.NewTicker(janitorInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			cleanupGlobalErrorLogTimes()
+		}
+	}()
+}
+
+func cleanupGlobalErrorLogTimes() {
+	now := time.Now().UnixNano()
+	globalErrorLogTimes.Range(func(key, value any) bool {
+		lastPtr, ok := value.(*int64)
+		if !ok {
+			globalErrorLogTimes.Delete(key)
+			return true
+		}
+		if now-atomic.LoadInt64(lastPtr) > int64(maxErrorLogAge) {
+			globalErrorLogTimes.Delete(key)
+		}
+		return true
+	})
+}
+
 // ProxyIpCache manages sticky IP resolution for proxy server domains.
 // It separately caches IPs that work for TCP and UDP since some proxies
 // may have different availability per protocol.
@@ -145,6 +184,37 @@ func (c *ProxyIpCache) Set(originalAddr, actualAddr string, network string, ipVe
 			"ip_version":    ipVersion,
 			"cycle":         cycle,
 		}).Debug("[StickyIP] Cached proxy IP")
+	}
+}
+
+// AllowErrorLog checks if an error log should be allowed for the given proxy address
+// based on the global rate limit. It uses atomic operations to ensure only one thread
+// logs the error when multiple concurrent requests fail.
+func (c *ProxyIpCache) AllowErrorLog(proxyAddr string) bool {
+	if proxyAddr == "" {
+		return true
+	}
+
+	janitorOnce.Do(startJanitor)
+
+	// Optimization: double-checked loading to avoid 'new(int64)' allocation in hot path.
+	var lastPtr *int64
+	if val, ok := globalErrorLogTimes.Load(proxyAddr); ok {
+		lastPtr = val.(*int64)
+	} else {
+		val, _ = globalErrorLogTimes.LoadOrStore(proxyAddr, new(int64))
+		lastPtr = val.(*int64)
+	}
+
+	now := time.Now().UnixNano()
+	for {
+		last := atomic.LoadInt64(lastPtr)
+		if now-last < int64(errorLogInterval) {
+			return false
+		}
+		if atomic.CompareAndSwapInt64(lastPtr, last, now) {
+			return true
+		}
 	}
 }
 
@@ -345,6 +415,10 @@ func (d *StickyIpDialer) IncrementCheckCycle() {
 	if newCycle > 0 {
 		d.cache.InvalidateCycle(newCycle - 1)
 	}
+}
+
+func (d *StickyIpDialer) allowErrorLog() bool {
+	return d.cache.AllowErrorLog(d.proxyAddr)
 }
 
 // InvalidateProtocolCache invalidates the cached IP for a specific protocol.
@@ -596,7 +670,9 @@ func (d *StickyIpDialer) dialWithIpResolution(ctx context.Context, network, addr
 	if lastErr == nil {
 		lastErr = errNoUsableProxyIPs
 	}
-	logAllIPsFailed(d.proxyAddr, lastErr)
+	if d.allowErrorLog() {
+		logAllIPsFailed(d.proxyAddr, lastErr)
+	}
 	return nil, &net.OpError{Op: "dial", Err: lastErr}
 }
 

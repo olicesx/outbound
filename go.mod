@@ -13,7 +13,7 @@ require (
 	github.com/gorilla/websocket v1.5.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mzz2017/disk-bloom v1.0.1
-	github.com/olicesx/quic-go v0.0.0-20260830152627-5abcdbe23c94
+	github.com/olicesx/quic-go v0.0.0-20260831031827-fbf90cb0a47d
 	github.com/refraction-networking/utls v1.8.2
 	github.com/sagernet/sing v0.6.0
 	github.com/sagernet/sing-shadowtls v0.2.0
@@ -45,9 +45,9 @@ require (
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
+	github.com/olicesx/qpack v0.0.0-20260831031549-0844ed36f1cd // indirect
 	github.com/onsi/ginkgo/v2 v2.22.2 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/samber/lo v1.52.0 // indirect
 	go.opentelemetry.io/otel v1.29.0 // indirect
 	go.opentelemetry.io/otel/trace v1.29.0 // indirect
@@ -60,4 +60,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260830152627-5abcdbe23c94
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260831031827-fbf90cb0a47d

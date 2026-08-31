@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"sync"
 	"sync/atomic"
 	"syscall"
 
@@ -14,65 +13,72 @@ import (
 )
 
 var (
+	// SymmetricDirect and FullconeDirect are process-wide lazy views of the
+	// latest published DirectDialers pair. They remain the compatibility
+	// entry points; generation-scoped callers should use NewDirectDialers
+	// instead of reading these globals.
 	SymmetricDirect netproxy.Dialer = &lazyDirectDialer{fullcone: false}
 	FullconeDirect  netproxy.Dialer = &lazyDirectDialer{fullcone: true}
-	directMu        sync.Mutex
-	directInited    bool
-	// directFallbackDNS records InitDirectDialers' argument atomically so a
-	// dial racing ahead of that call still builds with the configured
-	// resolver instead of baking a no-fallback dialer forever.
-	directFallbackDNS atomic.Value // string
-	_symmetricDirect  netproxy.Dialer
-	_fullconeDirect   netproxy.Dialer
+
+	// globalDirectDialers holds one immutable Symmetric+Fullcone snapshot.
+	// Readers load a single pointer so they never observe a mixed-generation pair.
+	globalDirectDialers atomic.Pointer[DirectDialers]
 )
 
-func buildDirectDialers(fallbackDNS string) {
-	fallback := Option{}
-	if fallbackDNS != "" {
-		fallback = Option{FallbackDNS: fallbackDNS}
-	}
-	_symmetricDirect = NewDirectDialerLaddr(netip.Addr{}, Option{FullCone: false, FallbackDNS: fallback.FallbackDNS})
-	_fullconeDirect = NewDirectDialerLaddr(netip.Addr{}, Option{FullCone: true, FallbackDNS: fallback.FallbackDNS})
+// DirectDialers is an immutable Symmetric/Fullcone pair that shares the
+// process-wide packetReceiver registry and does not publish process globals.
+// kdae can keep one pair per generation without racing InitDirectDialers.
+type DirectDialers struct {
+	Symmetric netproxy.Dialer
+	Fullcone  netproxy.Dialer
 }
 
-// lazyDirectDialer provides lazy initialization for direct dialers.
-// It ensures InitDirectDialers is called before any dial operation.
+// Dialers is the generation-scoped pair name used by callers that want a
+// snapshot rather than the process-wide lazy globals.
+type Dialers = DirectDialers
+
+// NewDirectDialers builds a generation-scoped pair. It does not modify the
+// exported globals; call InitDirectDialers to publish a pair process-wide.
+func NewDirectDialers(fallbackDNS string) DirectDialers {
+	return DirectDialers{
+		Symmetric: NewDirectDialerLaddr(netip.Addr{}, Option{FullCone: false, FallbackDNS: fallbackDNS}),
+		Fullcone:  NewDirectDialerLaddr(netip.Addr{}, Option{FullCone: true, FallbackDNS: fallbackDNS}),
+	}
+}
+
+func loadGlobalDirectDialers() *DirectDialers {
+	for {
+		if pair := globalDirectDialers.Load(); pair != nil {
+			return pair
+		}
+		lazy := NewDirectDialers("")
+		if globalDirectDialers.CompareAndSwap(nil, &lazy) {
+			return &lazy
+		}
+	}
+}
+
+// lazyDirectDialer provides lazy initialization for the exported globals.
+// It always reads from a single atomic snapshot.
 type lazyDirectDialer struct {
 	fullcone bool
 }
 
-func (d *lazyDirectDialer) ensureInit() {
-	directMu.Lock()
-	defer directMu.Unlock()
-	if directInited {
-		return
-	}
-	var fallbackDNS string
-	if v, ok := directFallbackDNS.Load().(string); ok {
-		fallbackDNS = v
-	}
-	buildDirectDialers(fallbackDNS)
-	directInited = true
-}
-
 func (d *lazyDirectDialer) getDialer() netproxy.Dialer {
-	d.ensureInit()
+	pair := loadGlobalDirectDialers()
 	if d.fullcone {
-		return _fullconeDirect
+		return pair.Fullcone
 	}
-	return _symmetricDirect
+	return pair.Symmetric
 }
 
-// InitDirectDialers initializes the global direct dialers with optional fallback DNS.
-// Later calls rebuild the dialers so a restart or config reload can publish a
-// new fallback resolver. If never called, dialers are lazily initialized
-// without fallback DNS on first use.
+// InitDirectDialers publishes a new immutable global pair with optional
+// fallback DNS. Later calls replace the snapshot atomically so a restart or
+// config reload can publish a new fallback resolver. If never called, dialers
+// are lazily initialized without fallback DNS on first use.
 func InitDirectDialers(fallbackDNS string) {
-	directFallbackDNS.Store(fallbackDNS)
-	directMu.Lock()
-	defer directMu.Unlock()
-	buildDirectDialers(fallbackDNS)
-	directInited = true
+	pair := NewDirectDialers(fallbackDNS)
+	globalDirectDialers.Store(&pair)
 }
 
 func (d *lazyDirectDialer) DialContext(ctx context.Context, network, addr string) (netproxy.Conn, error) {

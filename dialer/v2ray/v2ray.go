@@ -15,7 +15,6 @@ import (
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
-	"github.com/daeuniverse/outbound/protocol/direct"
 	"github.com/daeuniverse/outbound/protocol/http"
 	"github.com/daeuniverse/outbound/transport/grpc"
 	"github.com/daeuniverse/outbound/transport/httpheader"
@@ -252,7 +251,7 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 				"transport":         []string{"1"},
 			}.Encode(),
 		}
-		d, err = http.NewHTTPProxy(&u, direct.SymmetricDirect)
+		d, err = http.NewHTTPProxy(&u, nextDialer)
 		if err != nil {
 			return nil, nil, err
 		}

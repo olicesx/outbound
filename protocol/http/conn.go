@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
@@ -37,9 +38,32 @@ var httpMethods = [][]byte{
 	[]byte("PRI"),
 }
 
+const (
+	connLifeIdle int32 = iota
+	connLifeHandshaking
+	connLifeReady
+	connLifeClosed
+)
+
+type publishResult int
+
+const (
+	publishOK publishResult = iota
+	publishRejected
+	publishStolen
+)
+
+type publishedConn struct {
+	conn netproxy.Conn
+	h2   bool
+}
+
+type handshakeCancel struct {
+	cancel context.CancelFunc
+}
+
 type Conn struct {
 	nextDialer netproxy.Dialer
-	conn       netproxy.Conn
 
 	proxy        *HttpProxy
 	magicNetwork string
@@ -50,11 +74,18 @@ type Conn struct {
 
 	ctxShakeFinished    context.Context
 	cancelShakeFinished func()
-	muShake             sync.Mutex
-	muFinishShakeFuncs  sync.Mutex
-	finishShakeFuncs    []func(conn netproxy.Conn)
+	closeCtx            context.Context
+	closeCancel         context.CancelFunc
 
-	isH2      bool
+	// life is a monotonic lifecycle: idle -> handshaking -> ready -> closed.
+	life      atomic.Int32
+	published atomic.Pointer[publishedConn]
+	hsCancel  atomic.Pointer[handshakeCancel]
+
+	muShake            sync.Mutex
+	muFinishShakeFuncs sync.Mutex
+	finishShakeFuncs   []func(conn netproxy.Conn)
+
 	closeOnce sync.Once
 
 	pendingFirstWrite bytes.Buffer
@@ -65,16 +96,17 @@ func (c *Conn) SetDeadline(t time.Time) error {
 	defer c.muFinishShakeFuncs.Unlock()
 	select {
 	case <-c.ctxShakeFinished.Done():
-		if c.conn == nil {
+		conn, h2 := c.currentConn()
+		if conn == nil {
 			return io.EOF
 		}
-		if c.isH2 {
+		if h2 {
 			return nil
 		}
-		return c.conn.SetDeadline(t)
+		return conn.SetDeadline(t)
 	default:
 		c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
-			if c.isH2 {
+			if _, h2 := c.currentConn(); h2 {
 				return
 			}
 			_ = conn.SetDeadline(t)
@@ -88,16 +120,17 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 	defer c.muFinishShakeFuncs.Unlock()
 	select {
 	case <-c.ctxShakeFinished.Done():
-		if c.conn == nil {
+		conn, h2 := c.currentConn()
+		if conn == nil {
 			return io.EOF
 		}
-		if c.isH2 {
+		if h2 {
 			return nil
 		}
-		return c.conn.SetReadDeadline(t)
+		return conn.SetReadDeadline(t)
 	default:
 		c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
-			if c.isH2 {
+			if _, h2 := c.currentConn(); h2 {
 				return
 			}
 			_ = conn.SetReadDeadline(t)
@@ -111,16 +144,17 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 	defer c.muFinishShakeFuncs.Unlock()
 	select {
 	case <-c.ctxShakeFinished.Done():
-		if c.conn == nil {
+		conn, h2 := c.currentConn()
+		if conn == nil {
 			return io.EOF
 		}
-		if c.isH2 {
+		if h2 {
 			return nil
 		}
-		return c.conn.SetWriteDeadline(t)
+		return conn.SetWriteDeadline(t)
 	default:
 		c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
-			if c.isH2 {
+			if _, h2 := c.currentConn(); h2 {
 				return
 			}
 			_ = conn.SetWriteDeadline(t)
@@ -131,6 +165,7 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 
 func NewConn(ctx context.Context, nextDialer netproxy.Dialer, proxy *HttpProxy, addr string, network string) *Conn {
 	ctxShakeFinished, cancelShakeFinished := context.WithCancel(context.Background())
+	closeCtx, closeCancel := context.WithCancel(context.Background())
 	return &Conn{
 		nextDialer:          nextDialer,
 		proxy:               proxy,
@@ -139,32 +174,127 @@ func NewConn(ctx context.Context, nextDialer netproxy.Dialer, proxy *HttpProxy, 
 		handshakeDeadline:   netproxy.CaptureDeadline(ctx),
 		ctxShakeFinished:    ctxShakeFinished,
 		cancelShakeFinished: cancelShakeFinished,
+		closeCtx:            closeCtx,
+		closeCancel:         closeCancel,
 	}
 }
 
 func (c *Conn) newHandshakeContext() (context.Context, context.CancelFunc) {
-	return netproxy.NewDialTimeoutContextWithCapturedDeadline(c.handshakeDeadline)
+	base, cancelBase := netproxy.NewDialTimeoutContextWithCapturedDeadline(c.handshakeDeadline)
+	ctx, cancelLinked := context.WithCancel(c.closeCtx)
+	if deadline, ok := base.Deadline(); ok {
+		var cancelDeadline context.CancelFunc
+		ctx, cancelDeadline = context.WithDeadline(ctx, deadline)
+		cancel := func() {
+			cancelDeadline()
+			cancelLinked()
+			cancelBase()
+		}
+		c.storeHandshakeCancel(cancel)
+		return ctx, cancel
+	}
+	cancel := func() {
+		cancelLinked()
+		cancelBase()
+	}
+	c.storeHandshakeCancel(cancel)
+	return ctx, cancel
+}
+
+func (c *Conn) storeHandshakeCancel(cancel context.CancelFunc) {
+	c.hsCancel.Store(&handshakeCancel{cancel: cancel})
+	if c.closed() {
+		cancel()
+	}
+}
+
+func (c *Conn) currentConn() (netproxy.Conn, bool) {
+	if published := c.published.Load(); published != nil {
+		return published.conn, published.h2
+	}
+	return nil, false
+}
+
+func (c *Conn) closed() bool {
+	return c.life.Load() == connLifeClosed
+}
+
+// publishConn installs a locally-owned candidate after a closed-check.
+// The candidate stays off the published slot until this returns publishOK
+// so a racing Close cannot miss it and a late ignored-ctx Dial cannot
+// publish after Close.
+func (c *Conn) publishConn(conn netproxy.Conn, h2 bool) publishResult {
+	if conn == nil || c.closed() {
+		return publishRejected
+	}
+	published := &publishedConn{conn: conn, h2: h2}
+	if !c.published.CompareAndSwap(nil, published) {
+		return publishRejected
+	}
+	c.life.CompareAndSwap(connLifeHandshaking, connLifeReady)
+	if !c.closed() {
+		return publishOK
+	}
+	// Close raced the publication. Taking the slot back means Write still
+	// owns the candidate; a failed take-back means Close already closed it.
+	if c.published.CompareAndSwap(published, nil) {
+		return publishRejected
+	}
+	return publishStolen
+}
+
+func watchConnCancel(ctx context.Context, conn netproxy.Conn) func() {
+	if ctx == nil || conn == nil {
+		return func() {}
+	}
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	return func() { stop() }
+}
+
+func (c *Conn) discardCandidate(conn netproxy.Conn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.Close()
+}
+
+func (c *Conn) applyFinishShakeFuncs(conn netproxy.Conn) {
+	if conn == nil {
+		return
+	}
+	c.muFinishShakeFuncs.Lock()
+	defer c.muFinishShakeFuncs.Unlock()
+	for _, f := range c.finishShakeFuncs {
+		f(conn)
+	}
 }
 
 func (c *Conn) Write(b []byte) (n int, err error) {
+	if published := c.published.Load(); published != nil && published.conn != nil {
+		return published.conn.Write(b)
+	}
+	if c.closed() {
+		return 0, io.EOF
+	}
+
 	c.muShake.Lock()
 	defer c.muShake.Unlock()
-	defer func() {
-		if err == nil && c.conn != nil {
-			c.muFinishShakeFuncs.Lock()
-			defer c.muFinishShakeFuncs.Unlock()
-			// SetDeadline after c.conn filled.
-			for _, f := range c.finishShakeFuncs {
-				f(c.conn)
-			}
-		}
-	}()
+
+	if published := c.published.Load(); published != nil && published.conn != nil {
+		return published.conn.Write(b)
+	}
+	if c.closed() {
+		return 0, io.EOF
+	}
 	select {
 	case <-c.ctxShakeFinished.Done():
-		if c.conn == nil {
+		conn, _ := c.currentConn()
+		if conn == nil {
 			return 0, io.EOF
 		}
-		return c.conn.Write(b)
+		return conn.Write(b)
 	default:
 		// Handshake
 		handshakeInput := b
@@ -250,11 +380,18 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 		}
 
 		connectHttp1 := func(handshakeCtx context.Context, rawConn netproxy.Conn) (conn netproxy.Conn, n int, err error) {
+			if handshakeCtx != nil {
+				if err := handshakeCtx.Err(); err != nil {
+					return nil, 0, err
+				}
+			}
 			restoreDeadline, err := netproxy.ApplyConnDeadlineFromContext(handshakeCtx, rawConn)
 			if err != nil {
 				return nil, 0, err
 			}
 			defer restoreDeadline()
+			stopWatch := watchConnCancel(handshakeCtx, rawConn)
+			defer stopWatch()
 
 			proxyReq := req.Clone(context.Background())
 			err = proxyReq.WriteProxy(rawConn)
@@ -313,25 +450,54 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 
 		// Thanks to v2fly/v2ray-core.
 		connectHttp2 := func(handshakeCtx context.Context, rawConn netproxy.Conn, h2clientConn *http2.ClientConn, req *http.Request) (conn *http2Conn, n int, err error) {
-			proxyReq := req.Clone(context.Background())
+			if handshakeCtx != nil {
+				select {
+				case <-handshakeCtx.Done():
+					return nil, 0, handshakeCtx.Err()
+				default:
+				}
+			}
+
+			requestCtx, cancelRequest := context.WithCancel(c.closeCtx)
+			requestOwnedByConn := false
+			defer func() {
+				if !requestOwnedByConn {
+					cancelRequest()
+				}
+			}()
+			proxyReq := req.Clone(requestCtx)
 			pr, pw := io.Pipe()
 			proxyReq.Body = pr
 
-			reqCtx := context.Background()
-			cancelReqCtx := func() {}
-			if deadline, ok := handshakeCtx.Deadline(); ok {
-				if time.Until(deadline) <= 0 {
-					_ = pw.CloseWithError(context.DeadlineExceeded)
-					return nil, 0, context.DeadlineExceeded
-				}
-				reqCtx, cancelReqCtx = context.WithDeadline(context.Background(), deadline)
-				proxyReq = proxyReq.WithContext(reqCtx)
+			var stopHandshakeWatch func() bool
+			var handshakeWatchDone chan struct{}
+			if handshakeCtx != nil {
+				handshakeWatchDone = make(chan struct{})
+				stopHandshakeWatch = context.AfterFunc(handshakeCtx, func() {
+					cancelRequest()
+					close(handshakeWatchDone)
+				})
 			}
-			defer cancelReqCtx()
+			detachHandshakeWatch := func() error {
+				if stopHandshakeWatch == nil {
+					return nil
+				}
+				if stopHandshakeWatch() {
+					stopHandshakeWatch = nil
+					return nil
+				}
+				<-handshakeWatchDone
+				stopHandshakeWatch = nil
+				return handshakeCtx.Err()
+			}
+			defer func() {
+				if stopHandshakeWatch != nil {
+					_ = stopHandshakeWatch()
+				}
+			}()
 
 			var pErr error
 			done := make(chan struct{})
-
 			go func() {
 				defer close(done)
 				_, pErr = pw.Write(b)
@@ -341,11 +507,8 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 			if err != nil {
 				_ = pw.CloseWithError(err)
 				<-done
-				if reqErr := reqCtx.Err(); reqErr != nil {
-					if errors.Is(reqErr, context.DeadlineExceeded) {
-						return nil, 0, context.DeadlineExceeded
-					}
-					return nil, 0, reqErr
+				if handshakeErr := detachHandshakeWatch(); handshakeErr != nil {
+					return nil, 0, handshakeErr
 				}
 				return nil, 0, err
 			}
@@ -355,14 +518,47 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 				_ = resp.Body.Close()
 				return nil, 0, pErr
 			}
-
+			if handshakeErr := detachHandshakeWatch(); handshakeErr != nil {
+				_ = resp.Body.Close()
+				return nil, 0, handshakeErr
+			}
 			if resp.StatusCode != http.StatusOK {
 				_ = resp.Body.Close()
 				return nil, 0, fmt.Errorf("proxy responded with non 200 code: %v", resp.Status)
 			}
+
+			requestOwnedByConn = true
 			return newHTTP2Conn(&netproxy.FakeNetConn{
 				Conn: rawConn,
-			}, pw, resp.Body), len(b), nil
+			}, pw, resp.Body, cancelRequest), len(b), nil
+		}
+
+		c.life.CompareAndSwap(connLifeIdle, connLifeHandshaking)
+		if c.closed() {
+			return 0, io.EOF
+		}
+
+		finishHandshake := func(candidate netproxy.Conn, h2 bool, n int, err error) (int, error) {
+			if err != nil {
+				c.discardCandidate(candidate)
+				return n, err
+			}
+			if candidate == nil {
+				if c.closed() {
+					return 0, io.EOF
+				}
+				return n, nil
+			}
+			switch c.publishConn(candidate, h2) {
+			case publishOK:
+				c.applyFinishShakeFuncs(candidate)
+				return n, nil
+			case publishStolen:
+				return 0, io.EOF
+			default:
+				c.discardCandidate(candidate)
+				return 0, io.EOF
+			}
 		}
 
 		if !c.proxy.https {
@@ -370,38 +566,48 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 			defer cancel()
 			conn, err := c.nextDialer.DialContext(ctx, c.magicNetwork, c.proxy.Addr)
 			if err != nil {
+				if conn != nil {
+					c.discardCandidate(conn)
+				}
 				return 0, err
 			}
-			c.conn = conn
-			effConn, n, err := connectHttp1(ctx, conn)
-			if err == nil {
-				c.conn = effConn
+			if c.closed() {
+				c.discardCandidate(conn)
+				return 0, io.EOF
 			}
-			return n, err
+			effConn, n, err := connectHttp1(ctx, conn)
+			if err != nil && effConn == nil {
+				c.discardCandidate(conn)
+				return n, err
+			}
+			return finishHandshake(effConn, false, n, err)
 		}
 
 		handshakeCtx, cancel := c.newHandshakeContext()
 		defer cancel()
 		rawConn, h2Conn, err := connPool.GetConn(handshakeCtx, c.nextDialer, c.proxy.Addr, c.magicNetwork)
 		if err != nil {
+			if rawConn != nil && h2Conn == nil {
+				c.discardCandidate(rawConn)
+			}
 			return 0, err
+		}
+		if c.closed() {
+			if h2Conn == nil {
+				c.discardCandidate(rawConn)
+			}
+			return 0, io.EOF
 		}
 		if h2Conn != nil {
 			proxyConn, n, err := connectHttp2(handshakeCtx, rawConn, h2Conn, req)
-			if err != nil {
-				return 0, err
-			}
-			c.conn = proxyConn
-			c.isH2 = true
-			return n, nil
-		} else {
-			c.conn = rawConn
-			effConn, n, err := connectHttp1(handshakeCtx, rawConn)
-			if err == nil {
-				c.conn = effConn
-			}
+			return finishHandshake(proxyConn, true, n, err)
+		}
+		effConn, n, err := connectHttp1(handshakeCtx, rawConn)
+		if err != nil && effConn == nil {
+			c.discardCandidate(rawConn)
 			return n, err
 		}
+		return finishHandshake(effConn, false, n, err)
 	}
 }
 
@@ -439,34 +645,40 @@ func isPossibleHTTPRequestLinePrefix(b []byte) bool {
 
 func (c *Conn) Read(b []byte) (n int, err error) {
 	<-c.ctxShakeFinished.Done()
-	if c.conn == nil {
+	conn, _ := c.currentConn()
+	if conn == nil {
 		return 0, io.EOF
 	}
-	return c.conn.Read(b)
+	return conn.Read(b)
 }
 
 func (c *Conn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
+		c.life.Store(connLifeClosed)
+		if c.closeCancel != nil {
+			c.closeCancel()
+		}
+		if hs := c.hsCancel.Load(); hs != nil && hs.cancel != nil {
+			hs.cancel()
+		}
 		if c.cancelShakeFinished != nil {
 			c.cancelShakeFinished()
 		}
-		if c.conn == nil {
+		published := c.published.Swap(nil)
+		if published == nil || published.conn == nil {
 			return
 		}
-		if c.isH2 {
-			// Close the logical stream (request pipe + response body).
-			// The pooled physical HTTP/2 connection stays in the pool.
-			err = c.conn.Close()
-			return
-		}
-		err = c.conn.Close()
+		// Logical H2 Close closes the request pipe + response body only.
+		// The pooled physical HTTP/2 connection stays in the pool because
+		// http2Conn.Close does not close the underlay.
+		err = published.conn.Close()
 	})
 	return err
 }
 
-func newHTTP2Conn(c net.Conn, pipedReqBody *io.PipeWriter, respBody io.ReadCloser) *http2Conn {
-	return &http2Conn{Conn: c, in: pipedReqBody, out: respBody}
+func newHTTP2Conn(c net.Conn, pipedReqBody *io.PipeWriter, respBody io.ReadCloser, cancel context.CancelFunc) *http2Conn {
+	return &http2Conn{Conn: c, in: pipedReqBody, out: respBody, cancel: cancel}
 }
 
 // prefixedConn replays bytes a handshake bufio.Reader consumed past the
@@ -488,8 +700,11 @@ func (p *prefixedConn) Read(b []byte) (n int, err error) {
 
 type http2Conn struct {
 	net.Conn
-	in  *io.PipeWriter
-	out io.ReadCloser
+	in        *io.PipeWriter
+	out       io.ReadCloser
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (h *http2Conn) Read(p []byte) (n int, err error) {
@@ -501,15 +716,21 @@ func (h *http2Conn) Write(p []byte) (n int, err error) {
 }
 
 func (h *http2Conn) Close() error {
-	inErr := h.in.Close()
-	outErr := h.out.Close()
-	if inErr != nil && outErr != nil {
-		return fmt.Errorf("in.Close(): %w; out.Close(): %v", inErr, outErr)
-	}
-	if inErr != nil {
-		return inErr
-	}
-	return outErr
+	h.closeOnce.Do(func() {
+		if h.cancel != nil {
+			h.cancel()
+		}
+		inErr := h.in.Close()
+		outErr := h.out.Close()
+		if inErr != nil && outErr != nil {
+			h.closeErr = fmt.Errorf("in.Close(): %w; out.Close(): %v", inErr, outErr)
+		} else if inErr != nil {
+			h.closeErr = inErr
+		} else {
+			h.closeErr = outErr
+		}
+	})
+	return h.closeErr
 }
 
 type h2Conn struct {

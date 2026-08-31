@@ -13,7 +13,9 @@ import (
 	"io"
 	"math/big"
 	"net"
+	stdhttp "net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -297,6 +299,248 @@ func TestConnBufferedPrefixFallbackKeepsPayload(t *testing.T) {
 	}
 }
 
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for condition")
+}
+
+type barrierDialer struct {
+	entered chan struct{}
+	release chan struct{}
+	conn    netproxy.Conn
+	ignore  bool
+	calls   atomic.Int32
+}
+
+func (d *barrierDialer) DialContext(ctx context.Context, _, _ string) (netproxy.Conn, error) {
+	d.calls.Add(1)
+	select {
+	case d.entered <- struct{}{}:
+	default:
+	}
+	if d.ignore {
+		<-d.release
+		return d.conn, nil
+	}
+	select {
+	case <-d.release:
+		return d.conn, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+type countingConn struct {
+	net.Conn
+	writes atomic.Int32
+	closes atomic.Int32
+}
+
+func (c *countingConn) Read(p []byte) (int, error) {
+	if c.Conn != nil {
+		return c.Conn.Read(p)
+	}
+	return 0, io.EOF
+}
+
+func (c *countingConn) Write(p []byte) (int, error) {
+	c.writes.Add(1)
+	if c.Conn != nil {
+		return c.Conn.Write(p)
+	}
+	return len(p), nil
+}
+
+func (c *countingConn) Close() error {
+	c.closes.Add(1)
+	if c.Conn != nil {
+		return c.Conn.Close()
+	}
+	return nil
+}
+
+func (c *countingConn) SetDeadline(time.Time) error      { return nil }
+func (c *countingConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *countingConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *countingConn) LocalAddr() net.Addr              { return nil }
+func (c *countingConn) RemoteAddr() net.Addr             { return nil }
+
+func TestCloseDuringDialCancelsHandshake(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	candidate := &countingConn{}
+	dialer := &barrierDialer{entered: entered, release: release, conn: candidate}
+	conn := NewConn(context.Background(), dialer, &HttpProxy{Addr: "proxy.example:8080"}, "example.com:443", "tcp")
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte("client hello"))
+		errCh <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("DialContext was not entered")
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	close(release)
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("Write succeeded after Close during Dial")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write remained blocked after Close during Dial")
+	}
+	if conn.published.Load() != nil {
+		t.Fatal("handshake published a conn after Close during Dial")
+	}
+	if candidate.closes.Load() != 0 {
+		t.Fatalf("candidate closed %d times, want 0 because Dial returned ctx error", candidate.closes.Load())
+	}
+}
+
+func TestCloseDuringIgnoredDialClosesLateCandidate(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+	candidate := &countingConn{Conn: client}
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			if _, err := server.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	dialer := &barrierDialer{entered: entered, release: release, conn: candidate, ignore: true}
+	conn := NewConn(context.Background(), dialer, &HttpProxy{Addr: "proxy.example:8080"}, "example.com:443", "tcp")
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte("client hello"))
+		errCh <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("DialContext was not entered")
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	close(release)
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("Write succeeded after ignored Dial returned late")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write remained blocked after late ignored Dial")
+	}
+	waitFor(t, time.Second, func() bool { return candidate.closes.Load() == 1 })
+	if conn.published.Load() != nil {
+		t.Fatal("late ignored Dial published a conn")
+	}
+	if candidate.closes.Load() != 1 {
+		t.Fatalf("candidate closed %d times, want exactly 1", candidate.closes.Load())
+	}
+}
+
+func TestCloseBeforeWriteDoesNotDial(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	dialer := &barrierDialer{entered: entered, release: release, conn: &countingConn{}}
+	conn := NewConn(context.Background(), dialer, &HttpProxy{Addr: "proxy.example:8080"}, "example.com:443", "tcp")
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	n, err := conn.Write([]byte("client hello"))
+	if n != 0 || err == nil {
+		t.Fatalf("Write after Close = (%d, %v), want error", n, err)
+	}
+	if dialer.calls.Load() != 0 {
+		t.Fatalf("DialContext called %d times after Close-before-Write", dialer.calls.Load())
+	}
+}
+
+func TestPublishConnRejectedAfterCloseDiscardsLocalCandidate(t *testing.T) {
+	candidate := &countingConn{}
+	conn := NewConn(context.Background(), noopDialer{}, &HttpProxy{Addr: "proxy.example:8080"}, "example.com:443", "tcp")
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := conn.publishConn(candidate, false); got != publishRejected {
+		t.Fatalf("publishConn after Close = %v, want rejected", got)
+	}
+	if conn.published.Load() != nil {
+		t.Fatal("rejected publish installed a conn")
+	}
+}
+
+func TestPublishConnAndCloseExactlyOnceOwnership(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		candidate := &countingConn{}
+		conn := NewConn(context.Background(), noopDialer{}, &HttpProxy{Addr: "proxy.example:8080"}, "example.com:443", "tcp")
+		conn.life.Store(connLifeHandshaking)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			switch conn.publishConn(candidate, false) {
+			case publishRejected:
+				conn.discardCandidate(candidate)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = conn.Close()
+		}()
+		close(start)
+		wg.Wait()
+		if got := candidate.closes.Load(); got != 1 {
+			t.Fatalf("iteration %d: candidate closed %d times, want exactly 1", i, got)
+		}
+	}
+}
+
+func TestCloseDoesNotAcquireShakeMutex(t *testing.T) {
+	conn := NewConn(context.Background(), noopDialer{}, &HttpProxy{Addr: "proxy.example:8080"}, "example.com:443", "tcp")
+	conn.muShake.Lock()
+	done := make(chan struct{})
+	go func() {
+		_ = conn.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		conn.muShake.Unlock()
+		t.Fatal("Close blocked on muShake")
+	}
+	conn.muShake.Unlock()
+}
+
 func TestCloseUnblocksHandshakeRead(t *testing.T) {
 	conn := NewConn(context.Background(), &recordingDialer{conn: &recordingConn{}}, &HttpProxy{Addr: "proxy.example:8080"}, "example.com:443", "tcp")
 	done := make(chan error, 1)
@@ -321,10 +565,11 @@ func TestCloseUnblocksHandshakeRead(t *testing.T) {
 func TestHTTP2LogicalCloseDoesNotClosePooledPhysicalConn(t *testing.T) {
 	physical := &closeCountConn{}
 	pr, pw := io.Pipe()
-	logical := newHTTP2Conn(physical, pw, pr)
+	logical := newHTTP2Conn(physical, pw, pr, nil)
 	c := NewConn(context.Background(), &recordingDialer{conn: physical}, &HttpProxy{Addr: "proxy.example:443", https: true}, "example.com:443", "tcp")
-	c.conn = logical
-	c.isH2 = true
+	if c.publishConn(logical, true) != publishOK {
+		t.Fatal("failed to publish logical h2 conn")
+	}
 	c.cancelShakeFinished()
 
 	if err := c.Close(); err != nil && err != io.ErrClosedPipe {
@@ -340,10 +585,11 @@ func TestHTTP2LogicalCloseClosesRequestPipeAndResponseBody(t *testing.T) {
 	pr, pw := io.Pipe()
 	t.Cleanup(func() { _ = pr.Close() })
 	body := &closeCountReadCloser{Reader: bytes.NewReader(nil)}
-	logical := newHTTP2Conn(physical, pw, body)
+	logical := newHTTP2Conn(physical, pw, body, nil)
 	c := NewConn(context.Background(), &recordingDialer{conn: physical}, &HttpProxy{Addr: "proxy.example:443", https: true}, "example.com:443", "tcp")
-	c.conn = logical
-	c.isH2 = true
+	if c.publishConn(logical, true) != publishOK {
+		t.Fatal("failed to publish logical h2 conn")
+	}
 	c.cancelShakeFinished()
 
 	if err := c.Close(); err != nil && err != io.ErrClosedPipe {
@@ -357,6 +603,83 @@ func TestHTTP2LogicalCloseClosesRequestPipeAndResponseBody(t *testing.T) {
 	}
 	if physical.closes.Load() != 0 {
 		t.Fatalf("physical conn closed %d times, want 0", physical.closes.Load())
+	}
+}
+
+func TestHTTP2HandshakeContextDoesNotAbortPublishedStream(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	received := make(chan string, 2)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		server := http2.Server{}
+		server.ServeConn(serverSide, &http2.ServeConnOpts{Handler: stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+			w.WriteHeader(stdhttp.StatusOK)
+			w.(stdhttp.Flusher).Flush()
+			buf := make([]byte, 3)
+			for range 2 {
+				if _, err := io.ReadFull(r.Body, buf); err != nil {
+					return
+				}
+				received <- string(buf)
+			}
+		})})
+	}()
+
+	transport := &http2.Transport{}
+	h2Client, err := transport.NewClientConn(clientSide)
+	if err != nil {
+		t.Fatalf("NewClientConn: %v", err)
+	}
+	oldPool := connPool
+	connPool = newH2ConnsPool()
+	t.Cleanup(func() {
+		connPool = oldPool
+		_ = h2Client.Close()
+		_ = clientSide.Close()
+		_ = serverSide.Close()
+		select {
+		case <-serverDone:
+		case <-time.After(time.Second):
+		}
+	})
+
+	const proxyAddr = "proxy.example:443"
+	key := "|tcp|" + proxyAddr
+	conns := newLockedList()
+	conns.l.PushFront(&h2Conn{rawConn: clientSide, h2Conn: h2Client})
+	connPool.h2ConnsPool[key] = conns
+
+	dialer := &recordingDialer{}
+	conn := NewConn(context.Background(), dialer, &HttpProxy{Addr: proxyAddr, https: true}, "target.example:443", "tcp")
+	if n, err := conn.Write([]byte("one")); err != nil || n != 3 {
+		t.Fatalf("first Write = (%d, %v), want (3, nil)", n, err)
+	}
+	if dialer.calls != 0 {
+		t.Fatalf("dialer called %d times despite cached H2 connection", dialer.calls)
+	}
+	select {
+	case got := <-received:
+		if got != "one" {
+			t.Fatalf("first proxy payload = %q, want one", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("proxy did not receive first payload")
+	}
+
+	if n, err := conn.Write([]byte("two")); err != nil || n != 3 {
+		t.Fatalf("second Write = (%d, %v), want (3, nil)", n, err)
+	}
+	select {
+	case got := <-received:
+		if got != "two" {
+			t.Fatalf("second proxy payload = %q, want two", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("published H2 stream was aborted with the handshake context")
+	}
+	if err := conn.Close(); err != nil && err != io.ErrClosedPipe {
+		t.Fatalf("Close: %v", err)
 	}
 }
 

@@ -117,6 +117,18 @@ func (c *Conn) SetDeadline(t time.Time) error {
 		}
 		return conn.SetDeadline(t)
 	}
+	select {
+	case <-c.ctxShakeFinished.Done():
+		conn, h2 := c.currentConn()
+		if conn == nil {
+			return io.EOF
+		}
+		if h2 {
+			return nil
+		}
+		return conn.SetDeadline(t)
+	default:
+	}
 	c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
 		if _, h2 := c.currentConn(); h2 {
 			return
@@ -139,6 +151,18 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 		}
 		return conn.SetReadDeadline(t)
 	}
+	select {
+	case <-c.ctxShakeFinished.Done():
+		conn, h2 := c.currentConn()
+		if conn == nil {
+			return io.EOF
+		}
+		if h2 {
+			return nil
+		}
+		return conn.SetReadDeadline(t)
+	default:
+	}
 	c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
 		if _, h2 := c.currentConn(); h2 {
 			return
@@ -160,6 +184,18 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 			return nil
 		}
 		return conn.SetWriteDeadline(t)
+	}
+	select {
+	case <-c.ctxShakeFinished.Done():
+		conn, h2 := c.currentConn()
+		if conn == nil {
+			return io.EOF
+		}
+		if h2 {
+			return nil
+		}
+		return conn.SetWriteDeadline(t)
+	default:
 	}
 	c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
 		if _, h2 := c.currentConn(); h2 {
@@ -342,14 +378,16 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 
 			req, err = http.ReadRequest(bufio.NewReader(bytes.NewReader(handshakeInput)))
 			if err != nil {
-				if errors.Is(err, io.ErrUnexpectedEOF) && c.pendingFirstWrite.Len() <= maxPendingFirstWriteSize {
-					// Request more data.
-					if c.pendingFirstWrite.Len() == 0 {
-						_, _ = c.pendingFirstWrite.Write(handshakeInput)
-					}
-					return len(b), nil
-				}
 				if errors.Is(err, io.ErrUnexpectedEOF) {
+					// handshakeInput includes the current write. Check it before
+					// retaining the bytes so a large first write cannot bypass the
+					// pending buffer budget.
+					if len(handshakeInput) <= maxPendingFirstWriteSize {
+						if c.pendingFirstWrite.Len() == 0 {
+							_, _ = c.pendingFirstWrite.Write(handshakeInput)
+						}
+						return len(b), nil
+					}
 					c.pendingFirstWrite.Reset()
 					err = fmt.Errorf("http: request header exceeds %d bytes: %w", maxPendingFirstWriteSize, err)
 				}

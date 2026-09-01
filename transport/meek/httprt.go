@@ -26,11 +26,13 @@ const maxMeekResponseBodySize = 1 << 20
 func meekRoundTripperCacheKey(scope, addr, url string, tlsConfig *tls.Config) string {
 	serverName := ""
 	insecure := false
+	nextProtos := ""
 	if tlsConfig != nil {
 		serverName = tlsConfig.ServerName
 		insecure = tlsConfig.InsecureSkipVerify
+		nextProtos = strings.Join(tlsConfig.NextProtos, "\x01")
 	}
-	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%t", scope, addr, url, serverName, insecure)
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%t\x00%s", scope, addr, url, serverName, insecure, nextProtos)
 }
 
 type httpTripperClient struct {

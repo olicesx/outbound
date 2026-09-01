@@ -48,6 +48,9 @@ func NewSS2022Core(conf *ciphers.CipherConf2022, pskList [][]byte, uPSK []byte) 
 	if conf.NewCipher == nil {
 		return nil, fmt.Errorf("invalid cipher config: missing AEAD constructor")
 	}
+	if len(pskList) > 1 && conf.NewBlockCipher == nil {
+		return nil, fmt.Errorf("multi-PSK EIH requires an AES cipher")
+	}
 
 	var (
 		blockCipherEncrypt cipher.Block
@@ -65,9 +68,9 @@ func NewSS2022Core(conf *ciphers.CipherConf2022, pskList [][]byte, uPSK []byte) 
 		}
 	}
 
-	// Determine if multi-PSK with EIH is supported.
-	// Both AES (with block cipher) and Chacha (with EIH support) are supported.
-	hasMultiPSK := len(pskList) > 1 && (conf.NewBlockCipher != nil || conf.IdentityHeaderBlockSize > 0)
+	// EIH is defined for AES ciphers. Chacha remains available for single-PSK
+	// connections, but multi-PSK chacha has no interoperable wire format.
+	hasMultiPSK := len(pskList) > 1
 
 	core := &SS2022Core{
 		cipherConf:         conf,

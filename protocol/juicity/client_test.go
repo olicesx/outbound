@@ -213,20 +213,39 @@ func TestGetQuicConnDialFailureDoesNotDeadlock(t *testing.T) {
 		t.Fatal("getQuicConn deadlocked on transport dial failure")
 	}
 
+	// A per-attempt dial failure (here: the caller context was cancelled)
+	// must stay retryable: the shared client is not detached, its context
+	// is not cancelled, and the next attempt dials again instead of failing
+	// fast with ErrClientClosed.
 	select {
 	case <-detached:
-	case <-time.After(time.Second):
-		t.Fatal("expected failed dial to detach the client")
+		t.Fatal("failed dial must not detach the client")
+	default:
 	}
-
 	select {
 	case <-clientCtx.Done():
+		t.Fatal("failed dial must not cancel the client context")
 	default:
-		t.Fatal("expected failed dial to cancel the client context")
 	}
 
 	if _, err := udpConn.WriteToUDP([]byte("x"), raddr); err == nil {
 		t.Fatal("expected failed dial path to close the underlay UDP socket")
+	}
+
+	errCh2 := make(chan error, 1)
+	go func() {
+		_, err := client.getQuicConn(context.Background(), nil, func(context.Context, netproxy.Dialer) (*quic.Transport, net.Addr, error) {
+			return nil, nil, errors.New("second dial also fails")
+		})
+		errCh2 <- err
+	}()
+	select {
+	case err := <-errCh2:
+		if err == nil {
+			t.Fatal("expected second getQuicConn attempt to fail")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second getQuicConn attempt deadlocked")
 	}
 }
 

@@ -27,16 +27,23 @@ func NewAuthAES128MD5() IProtocol {
 		hashDigest: common.MD5Sum,
 		packID:     1,
 		recvInfo: recvInfo{
-			recvID: 1,
-			buffer: new(swBytes.Buffer),
+			recvID:       1,
+			buffer:       new(swBytes.Buffer),
+			encodeBuffer: new(swBytes.Buffer),
 		},
 	}
 	return a
 }
 
+// recvInfo holds the per-direction scratch state shared by the auth_aes128_*
+// and auth_chain_* protocol implementations. Encode runs under the conn's
+// writeMu while Decode runs under readMu, so each direction must keep its own
+// buffer; a single buffer would be a data race on full-duplex relays.
 type recvInfo struct {
 	recvID uint32
 	buffer *swBytes.Buffer
+	// encodeBuffer is the write-direction counterpart of buffer.
+	encodeBuffer *swBytes.Buffer
 }
 
 type authAES128 struct {
@@ -216,7 +223,7 @@ func (a *authAES128) DecodePkt(in []byte) (out pool.Bytes, err error) {
 }
 
 func (a *authAES128) Encode(plainData []byte) (outData []byte, err error) {
-	a.buffer.Reset()
+	a.encodeBuffer.Reset()
 	dataLength := len(plainData)
 	offset := 0
 	if dataLength > 0 && !a.hasSentHeader {
@@ -225,20 +232,20 @@ func (a *authAES128) Encode(plainData []byte) (outData []byte, err error) {
 			authLength = 1200
 		}
 		a.hasSentHeader = true
-		_, _ = a.buffer.Write(a.packAuthData(plainData[:authLength]))
+		_, _ = a.encodeBuffer.Write(a.packAuthData(plainData[:authLength]))
 		dataLength -= authLength
 		offset += authLength
 	}
 	const blockSize = 4096
 	for dataLength > blockSize {
-		_, _ = a.buffer.Write(a.packData(plainData[offset : offset+blockSize]))
+		_, _ = a.encodeBuffer.Write(a.packData(plainData[offset : offset+blockSize]))
 		dataLength -= blockSize
 		offset += blockSize
 	}
 	if dataLength > 0 {
-		_, _ = a.buffer.Write(a.packData(plainData[offset:]))
+		_, _ = a.encodeBuffer.Write(a.packData(plainData[offset:]))
 	}
-	return a.buffer.Bytes(), nil
+	return a.encodeBuffer.Bytes(), nil
 }
 
 func (a *authAES128) Decode(plainData []byte) ([]byte, int, error) {

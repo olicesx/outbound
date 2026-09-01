@@ -16,8 +16,9 @@ func NewAuthAES128SHA1() IProtocol {
 		hashDigest: common.SHA1Sum,
 		packID:     1,
 		recvInfo: recvInfo{
-			recvID: 1,
-			buffer: bytes.NewBuffer(nil),
+			recvID:       1,
+			buffer:       bytes.NewBuffer(nil),
+			encodeBuffer: bytes.NewBuffer(nil),
 		},
 	}
 	return a

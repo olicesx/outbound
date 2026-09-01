@@ -108,7 +108,7 @@ func ReadAddrInfo(data io.Reader) (*AddressInfo, error) {
 	case AddressTypeIPv4:
 		ip := pool.Get(4)
 		defer pool.Put(ip)
-		if _, err := data.Read(ip); err != nil {
+		if _, err := io.ReadFull(data, ip); err != nil {
 			return nil, fmt.Errorf("failed to read IP: %w", err)
 		}
 		info.IP = netip.AddrFrom4([4]byte(ip))
@@ -118,7 +118,7 @@ func ReadAddrInfo(data io.Reader) (*AddressInfo, error) {
 	case AddressTypeIPv6:
 		ip := pool.Get(16)
 		defer pool.Put(ip)
-		if _, err := data.Read(ip); err != nil {
+		if _, err := io.ReadFull(data, ip); err != nil {
 			return nil, fmt.Errorf("failed to read IP: %w", err)
 		}
 		info.IP = netip.AddrFrom16([16]byte(ip))
@@ -132,7 +132,7 @@ func ReadAddrInfo(data io.Reader) (*AddressInfo, error) {
 		}
 		domain := pool.Get(int(domainLen))
 		defer pool.Put(domain)
-		if _, err := data.Read(domain); err != nil {
+		if _, err := io.ReadFull(data, domain); err != nil {
 			return nil, fmt.Errorf("failed to read domain: %w", err)
 		}
 		info.Hostname = string(domain)

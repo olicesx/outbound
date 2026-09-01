@@ -47,6 +47,12 @@ func parseSocksUdpPayload(data []byte) (payload []byte, from netip.AddrPort, err
 	if len(data) < 3 {
 		return nil, netip.AddrPort{}, errors.New("not enough size to get addr")
 	}
+	if data[2] != 0 {
+		// FRAG != 0 means a fragmented datagram; we never fragment and the
+		// payload of a fragment is not a self-contained datagram, so reject
+		// instead of misparsing the shifted address header.
+		return nil, netip.AddrPort{}, errors.New("fragmented SOCKS UDP datagrams are not supported")
+	}
 	tgtAddr := socks.SplitAddr(data[3:])
 	if tgtAddr == nil {
 		return nil, netip.AddrPort{}, errors.New("can not get target addr")

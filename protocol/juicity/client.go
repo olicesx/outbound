@@ -110,15 +110,12 @@ func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, di
 	}
 	quicConn, err := transport.Dial(ctx, addr, t.TlsConfig, t.QuicConfig)
 	if err != nil {
-		select {
-		case <-t.Ctx.Done():
-		default:
-			t.Cancel()
-		}
-		if t.detachCallback != nil {
-			go t.detachCallback()
-			t.detachCallback = nil
-		}
+		// A failed dial is attempt-scoped: the caller context may have been
+		// cancelled (a routine dial timeout) or the handshake hit a transient
+		// failure. Poisoning the shared client (t.Cancel + detach) here would
+		// permanently kill the node for every user over one failed attempt —
+		// the neighboring failure paths below only tear down this transport,
+		// and the next getQuicConn call dials again.
 		_ = transport.Close()
 		if transport.Conn != nil {
 			_ = transport.Conn.Close()

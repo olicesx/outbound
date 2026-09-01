@@ -299,6 +299,38 @@ func TestConnBufferedPrefixFallbackKeepsPayload(t *testing.T) {
 	}
 }
 
+func TestConnRejectsOversizedSingleWriteAfterHTTPRequestLine(t *testing.T) {
+	dialer := &recordingDialer{conn: &recordingConn{}}
+	conn := NewConn(context.Background(), dialer, &HttpProxy{Addr: "proxy.example:8080"}, "example.com:80", "tcp")
+
+	b := append([]byte("GET / HTTP/1.1\r\nHost: example.com\r\n"), bytes.Repeat([]byte("X-Test: value\r\n"), 500000)...)
+	n, err := conn.Write(b)
+	if err == nil {
+		t.Fatal("Write() error = nil, want oversized header error")
+	}
+	if n != 0 {
+		t.Fatalf("Write() wrote %d bytes after rejecting oversized headers", n)
+	}
+	if got := conn.pendingFirstWrite.Len(); got != 0 {
+		t.Fatalf("pendingFirstWrite retained %d bytes after rejection", got)
+	}
+	if dialer.calls != 0 {
+		t.Fatalf("dialer calls = %d, want 0", dialer.calls)
+	}
+}
+
+func TestConnDeadlineAfterFailedHandshakeReturnsEOF(t *testing.T) {
+	parent := &deadlineRecordingDialer{}
+	conn := NewConn(context.Background(), parent, &HttpProxy{Addr: "proxy.example:8080"}, "example.com:80", "tcp")
+
+	if _, err := conn.Write([]byte("payload")); err == nil {
+		t.Fatal("initial Write() error = nil, want handshake failure")
+	}
+	if err := conn.SetDeadline(time.Now()); err != io.EOF {
+		t.Fatalf("SetDeadline() error = %v, want io.EOF after failed handshake", err)
+	}
+}
+
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

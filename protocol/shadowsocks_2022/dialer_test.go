@@ -91,8 +91,8 @@ func TestNewDialer_Chacha20MultiPSK(t *testing.T) {
 		Password:     strings.Join([]string{pskBase64(32, 0x11), pskBase64(32, 0x12)}, ":"),
 		ProxyAddress: "127.0.0.1:443",
 	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "multi-PSK EIH requires an AES cipher") {
+		t.Fatalf("expected chacha multi-PSK rejection, got %v", err)
 	}
 }
 
@@ -119,35 +119,6 @@ func TestNewDialer_ValidMultiPSK(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestNewDialer_Chacha20MultiPSKHasEIH(t *testing.T) {
-	// Test that chacha multi-PSK creates EIH components
-	netproxyDialer, err := NewDialer(nopDialer{}, protocol.Header{
-		Cipher:       "2022-blake3-chacha20-poly1305",
-		Password:     strings.Join([]string{pskBase64(32, 0x11), pskBase64(32, 0x12), pskBase64(32, 0x13)}, ":"),
-		ProxyAddress: "127.0.0.1:443",
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	d := netproxyDialer.(*Dialer)
-
-	// Verify EIH is enabled
-	if !d.core.HasMultiPSK() {
-		t.Fatal("expected HasMultiPSK to be true for multi-PSK chacha")
-	}
-
-	// Verify EIH length: 3 PSKs = 2 EIH blocks * 16 bytes = 32 bytes
-	expectedEIHLen := 2 * 16
-	if d.core.IdentityHeaderLen() != expectedEIHLen {
-		t.Fatalf("expected EIH length %d, got %d", expectedEIHLen, d.core.IdentityHeaderLen())
-	}
-
-	// Verify IsUsingBlockCipher returns false for chacha
-	if d.core.IsUsingBlockCipher() {
-		t.Fatal("expected IsUsingBlockCipher to be false for chacha")
 	}
 }
 

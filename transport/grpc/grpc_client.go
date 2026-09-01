@@ -184,6 +184,9 @@ func (c *ClientConn) Read(p []byte) (n int, err error) {
 
 	c.muReading.Lock()
 	defer c.muReading.Unlock()
+	// Refresh after acquiring the read lock so deadline changes made while
+	// this operation waited for another reader apply to the pending I/O.
+	ctxRead = c.readCtx()
 	if c.buf != nil {
 		n = copy(p, c.buf[c.offset:])
 		c.offset += n
@@ -231,6 +234,9 @@ func (c *ClientConn) Write(p []byte) (n int, err error) {
 
 	c.muWriting.Lock()
 	defer c.muWriting.Unlock()
+	// Refresh after acquiring the write lock so deadline changes made while
+	// this operation waited for another writer apply to the pending I/O.
+	ctxWrite = c.writeCtx()
 	// set 1 to avoid channel leak
 	sendDone := make(chan error, 1)
 	// pass channel to the function to avoid closure leak

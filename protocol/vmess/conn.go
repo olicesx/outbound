@@ -80,6 +80,9 @@ func NewConn(conn netproxy.Conn, metadata Metadata, dialTgt string, cmdKey []byt
 	}
 	if metadata.IsClient {
 		if err = c.WriteReqHeader(); err != nil {
+			// NewConn owns conn from here on; close it on every failure or
+			// the dialed underlay leaks.
+			_ = c.Conn.Close()
 			return nil, err
 		}
 	}
@@ -535,6 +538,12 @@ func (c *Conn) readChunk() ([]byte, error) {
 	// terminal signal
 	if size == uint16(c.readBodyCipher.Overhead())+padding {
 		return nil, io.EOF
+	}
+	// The unmasked size is server-controlled while the padding is negotiated
+	// locally; a chunk smaller than its own padding would slice negatively
+	// below, so reject the frame instead of panicking.
+	if int(size) < int(padding) {
+		return nil, fmt.Errorf("vmess: chunk size %d is smaller than its padding %d", size, padding)
 	}
 	frame := c.borrowReadOpenFrame(int(size))
 	if _, err = io.ReadFull(c.Conn, frame); err != nil {

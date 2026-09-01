@@ -58,6 +58,9 @@ func NewConn(conn netproxy.Conn, metadata Metadata, cmdKey []byte) (c *Conn, err
 	if metadata.Network == "udp" {
 		proxyAddrIp, err := net.ResolveUDPAddr("udp", net.JoinHostPort(c.metadata.Hostname, strconv.Itoa(int(c.metadata.Port))))
 		if err != nil {
+			// NewConn owns conn from here on; close it on every failure or
+			// the dialed underlay leaks.
+			_ = conn.Close()
 			return nil, err
 		}
 		c.cachedProxyAddrIpIP = proxyAddrIp.AddrPort()
@@ -77,6 +80,7 @@ func NewConn(conn netproxy.Conn, metadata Metadata, cmdKey []byte) (c *Conn, err
 			Flow: metadata.Flow,
 		})
 		if err != nil {
+			_ = conn.Close()
 			return nil, err
 		}
 	}

@@ -227,15 +227,29 @@ func PutPacketAddr(src []byte, addr netip.AddrPort) error {
 	return nil
 }
 
+// ReadPacketAddr parses a packet address block laid out as one skipped byte,
+// a 2-byte port, a 1-byte IP type and a 4- or 16-byte IP. The block comes
+// from the server with an attacker-controlled length; every slice below must
+// be bounds-checked against what was actually received.
 func ReadPacketAddr(p []byte) (addr netip.AddrPort, err error) {
+	const ipv4Len, ipv6Len = 4, 16
+	if len(p) < 1+2+1+ipv4Len {
+		return netip.AddrPort{}, io.ErrUnexpectedEOF
+	}
 	p = p[1:]
 	port := binary.BigEndian.Uint16(p[0:2])
 	ipType := p[2]
 	ip := p[3:]
 	if ipType == 1 {
-		ip = ip[:4]
+		if len(ip) < ipv4Len {
+			return netip.AddrPort{}, io.ErrUnexpectedEOF
+		}
+		ip = ip[:ipv4Len]
 	} else {
-		ip = ip[:16]
+		if len(ip) < ipv6Len {
+			return netip.AddrPort{}, io.ErrUnexpectedEOF
+		}
+		ip = ip[:ipv6Len]
 	}
 	ipAddr, ok := netip.AddrFromSlice(ip)
 	if !ok {

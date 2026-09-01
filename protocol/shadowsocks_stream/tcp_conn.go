@@ -52,11 +52,17 @@ func (c *TcpConn) Read(b []byte) (n int, err error) {
 		if c.cipher.IV() == nil {
 			c.cipher.SetIV(iv)
 		}
-		if n == c.cipher.InfoIVLen() {
-			//log.Println("here")
-			return 0, nil
+		if n == c.cipher.InfoIVLen() && len(b) > 0 {
+			// The first read may stop exactly at the IV boundary. Returning
+			// (0, nil) here violates the io.Reader contract for non-empty
+			// buffers (many callers treat it as EOF), so keep reading until
+			// at least one payload byte arrives.
+			m, rerr := io.ReadAtLeast(c.Conn, buf[n:], 1)
+			n += m
+			if rerr != nil {
+				return 0, rerr
+			}
 		}
-		//log.Println("there")
 		n = copy(b, buf[c.cipher.InfoIVLen():n])
 		c.cipher.Decrypt(b[:n], b[:n])
 		//log.Println("n2", n)

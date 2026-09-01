@@ -66,8 +66,10 @@ readAgain:
 		return 0, err
 	}
 	if length == 0 {
-		// not enough to postDecrypt
-		return 0, nil
+		// Not enough to postDecrypt yet. Keep reading so callers never see
+		// (0, nil), which many treat as EOF; the next iteration appends fresh
+		// wire bytes to the accumulator before re-decoding.
+		goto readAgain
 	} else {
 		c.underPostdecryptBuf.Next(length)
 	}

@@ -122,6 +122,21 @@ func (s *Socks5) connect(ctx context.Context, conn netproxy.Conn, target string,
 	if buf[1] == 0xff {
 		return addr, errors.New("proxy: SOCKS5 proxy at " + s.addr + " requires authentication")
 	}
+	// The server must choose a method we actually offered. Accepting anything
+	// else (e.g. GSSAPI) would silently proceed without the auth the server
+	// expects.
+	offeredPassword := len(s.user) > 0 && len(s.user) < 256 && len(s.password) < 256
+	methodUnoffered := false
+	switch buf[1] {
+	case socks.AuthNone:
+	case socks.AuthPassword:
+		methodUnoffered = !offeredPassword
+	default:
+		methodUnoffered = true
+	}
+	if methodUnoffered {
+		return addr, errors.New("proxy: SOCKS5 proxy at " + s.addr + " selected an unoffered auth method " + strconv.Itoa(int(buf[1])))
+	}
 
 	if buf[1] == socks.AuthPassword {
 		buf = buf[:0]

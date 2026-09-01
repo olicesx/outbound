@@ -35,6 +35,9 @@ func NewConn(c netproxy.Conn, proto IProtocol) (*Conn, error) {
 }
 
 func (c *Conn) Read(b []byte) (n int, err error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 	// Conn Read: obfs->ss->proto
@@ -45,9 +48,9 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 		}
 		c.readLater = nil
 	}
-readAgain:
 	buf := pool.Get(2048)
 	defer pool.Put(buf)
+readAgain:
 	n, err = c.Conn.Read(buf)
 	if err != nil {
 		return 0, err
@@ -58,9 +61,7 @@ readAgain:
 
 	// append buf to c.underPostdecryptBuf
 	c.underPostdecryptBuf.Write(buf[:n])
-	// and read it to buf immediately
-	buf = c.underPostdecryptBuf.Bytes()
-	postDecryptedData, length, err := c.Protocol.Decode(buf)
+	postDecryptedData, length, err := c.Protocol.Decode(c.underPostdecryptBuf.Bytes())
 	if err != nil {
 		c.underPostdecryptBuf.Reset()
 		return 0, err
@@ -72,6 +73,9 @@ readAgain:
 		goto readAgain
 	} else {
 		c.underPostdecryptBuf.Next(length)
+	}
+	if len(postDecryptedData) == 0 {
+		goto readAgain
 	}
 
 	n = copy(b, postDecryptedData)

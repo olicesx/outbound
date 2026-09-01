@@ -31,28 +31,32 @@ func NewTcpConn(c netproxy.Conn, cipher *ciphers.StreamCipher) *TcpConn {
 }
 
 func (c *TcpConn) Read(b []byte) (n int, err error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
 	c.readMutex.Lock()
 	defer c.readMutex.Unlock()
 	if !c.cipher.DecryptInited() {
+		ivLen := c.cipher.InfoIVLen()
 		buf := b
-		if len(buf) < c.cipher.InfoIVLen() {
-			buf = pool.Get(c.cipher.InfoIVLen() + len(b))
+		if len(buf) <= ivLen {
+			buf = pool.Get(ivLen + len(b))
 			defer pool.Put(buf)
 		}
-		n, err = io.ReadAtLeast(c.Conn, buf, c.cipher.InfoIVLen())
+		n, err = io.ReadAtLeast(c.Conn, buf, ivLen)
 		if err != nil {
-			return 0, fmt.Errorf("invalid ivLen:%v, actual length:%v: %w", c.cipher.InfoIVLen(), n, err)
+			return 0, fmt.Errorf("invalid ivLen:%v, actual length:%v: %w", ivLen, n, err)
 		}
 		//log.Println("n1", n)
-		iv := buf[:c.cipher.InfoIVLen()]
+		iv := buf[:ivLen]
 		if err = c.cipher.InitDecrypt(iv); err != nil {
 			return 0, err
 		}
 
 		if c.cipher.IV() == nil {
-			c.cipher.SetIV(iv)
+			c.cipher.SetIV(append([]byte(nil), iv...))
 		}
-		if n == c.cipher.InfoIVLen() && len(b) > 0 {
+		if n == ivLen {
 			// The first read may stop exactly at the IV boundary. Returning
 			// (0, nil) here violates the io.Reader contract for non-empty
 			// buffers (many callers treat it as EOF), so keep reading until
@@ -63,7 +67,7 @@ func (c *TcpConn) Read(b []byte) (n int, err error) {
 				return 0, rerr
 			}
 		}
-		n = copy(b, buf[c.cipher.InfoIVLen():n])
+		n = copy(b, buf[ivLen:n])
 		c.cipher.Decrypt(b[:n], b[:n])
 		//log.Println("n2", n)
 	} else {

@@ -111,7 +111,14 @@ func (m *Metadata) PackTo(dst []byte) (n int) {
 }
 
 func (m *Metadata) Unpack(r io.Reader) (n int, err error) {
-	buf := pool.Get(256)
+	// The domain branch reads up to 2+255 hostname bytes plus a 2-byte port
+	// (4+maxDomainLen in total); the buffer must cover the full range or a
+	// legal 253..255 byte hostname panics on the slice below.
+	const (
+		maxDomainLen   = 255
+		maxMetadataLen = 4 + maxDomainLen
+	)
+	buf := pool.Get(maxMetadataLen)
 	defer buf.Put()
 	if _, err = io.ReadFull(r, buf[:2]); err != nil {
 		return 0, err
@@ -133,12 +140,15 @@ func (m *Metadata) Unpack(r io.Reader) (n int, err error) {
 		m.Port = binary.BigEndian.Uint16(buf[17:])
 		return 19, nil
 	case protocol.MetadataTypeDomain:
-		if _, err = io.ReadFull(r, buf[2:4+int(buf[1])]); err != nil {
+		// Cast the length to int before the arithmetic: as a byte
+		// expression 2+buf[1] wraps mod 256 (255 -> 1) and panics.
+		domainLen := int(buf[1])
+		if _, err = io.ReadFull(r, buf[2:4+domainLen]); err != nil {
 			return 0, err
 		}
-		m.Hostname = string(buf[2 : 2+buf[1]])
-		m.Port = binary.BigEndian.Uint16(buf[2+buf[1]:])
-		return 4 + int(buf[1]), nil
+		m.Hostname = string(buf[2 : 2+domainLen])
+		m.Port = binary.BigEndian.Uint16(buf[2+domainLen:])
+		return 4 + domainLen, nil
 	case protocol.MetadataTypeMsg:
 		m.Cmd = protocol.MetadataCmd(buf[1])
 		return 2, nil

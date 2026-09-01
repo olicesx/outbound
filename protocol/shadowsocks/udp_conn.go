@@ -174,6 +174,12 @@ func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
 	metadata.Type = mdata.Type
 	metadata.IP = mdata.IP
 
+	if metadata.Type == protocol.MetadataTypeDomain && len(metadata.Hostname) > 255 {
+		// Reject rather than truncate: a silently shortened domain would send
+		// the datagram to the wrong host.
+		return 0, fmt.Errorf("domain name too long: %d", len(metadata.Hostname))
+	}
+
 	// Pre-calculate total size to allocate once
 	// Layout: [salt][metadata][payload][tag]
 	prefixLen := metadataLen(metadata.Type)

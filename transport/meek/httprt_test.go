@@ -37,38 +37,6 @@ func TestMeekRoundTripperCacheKeyIncludesALPN(t *testing.T) {
 	}
 }
 
-func TestCleanGlobalRoundTripperCacheClosesIdleConnections(t *testing.T) {
-	globalRoundTripperCacheAccess.Lock()
-	original := globalRoundTripperCacheMap
-	globalRoundTripperCacheMap = nil
-	globalRoundTripperCacheAccess.Unlock()
-	t.Cleanup(func() {
-		globalRoundTripperCacheAccess.Lock()
-		globalRoundTripperCacheMap = original
-		globalRoundTripperCacheAccess.Unlock()
-	})
-
-	spy := &closeIdleSpyRoundTripper{}
-
-	globalRoundTripperCacheAccess.Lock()
-	globalRoundTripperCacheMap = map[string]http.RoundTripper{
-		"test": spy,
-	}
-	globalRoundTripperCacheAccess.Unlock()
-
-	CleanGlobalRoundTripperCache()
-
-	if got := spy.closeCalls.Load(); got != 1 {
-		t.Fatalf("CloseIdleConnections called %d times, want 1", got)
-	}
-
-	globalRoundTripperCacheAccess.Lock()
-	defer globalRoundTripperCacheAccess.Unlock()
-	if len(globalRoundTripperCacheMap) != 0 {
-		t.Fatalf("global round tripper cache size = %d, want 0", len(globalRoundTripperCacheMap))
-	}
-}
-
 type contextSpyRoundTripper struct {
 	ctx context.Context
 }

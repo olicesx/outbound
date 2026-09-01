@@ -26,8 +26,7 @@ type directPacketConn struct {
 	receiverGeneration uint64
 	cachedDialTgt      atomic.Value // stores netip.AddrPort
 	writeTgtCache      common.LastStringValue[netip.AddrPort]
-	cacheMu            sync.Mutex // protects cacheErr
-	cacheErr           error
+	cacheMu            sync.Mutex // serializes lazy dial-target resolution in resolveTarget
 	resolver           *net.Resolver
 	batchOnce          sync.Once
 	batchWriter        packetBatchWriter
@@ -192,10 +191,8 @@ func (c *directPacketConn) resolveTarget() error {
 	if c.cachedDialTgt.Load() != nil {
 		return nil
 	}
-	c.cacheErr = nil
 	ua, err := resolveUDPAddr(c.resolver, c.dialTgt)
 	if err != nil {
-		c.cacheErr = err
 		return err
 	}
 	// Store the value directly, not a pointer to a stack variable.

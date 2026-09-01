@@ -4,6 +4,8 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"io"
+
+	"github.com/daeuniverse/outbound/pkg/fastrand"
 )
 
 const (
@@ -66,7 +68,11 @@ func GeneratePaddingHeaderResponse() string {
 // randInt returns a random non-negative integer in [0, max).
 func randInt(max int) int {
 	var buf [4]byte
-	_, _ = io.ReadFull(rand.Reader, buf[:])
+	if _, err := io.ReadFull(rand.Reader, buf[:]); err != nil {
+		// The entropy source only fails on a broken system; degrade to the
+		// fast PRNG instead of deterministic zero padding.
+		return fastrand.Intn(max)
+	}
 	return int(binary.BigEndian.Uint32(buf[:])) % max
 }
 

@@ -21,6 +21,12 @@ import (
 
 const Ver5 = 0x5
 
+// uniStreamReadIdleTimeout bounds how long a server-opened uni stream may
+// stall before the relay goroutine gives up. Each uni stream carries exactly
+// one packet command, so this only fires on a wedged or hostile peer; without
+// it such streams would pin uni-stream semaphore slots forever.
+const uniStreamReadIdleTimeout = 30 * time.Second
+
 type ClientOption struct {
 	TlsConfig             *tls.Config
 	QuicConfig            *quic.Config
@@ -183,9 +189,18 @@ func (t *clientImpl) handleUniStream(quicConn quic.Connection) (err error) {
 			// bufio.Reader and routing every field through binary.Read.
 			// A non-Packet command is a spec violation: readPacketFromStream
 			// errors and deferQuicConn forceCloses the tunnel.
+			_ = stream.SetReadDeadline(time.Now().Add(uniStreamReadIdleTimeout))
 			var packet *Packet
 			packet, err = readPacketFromStream(stream)
 			if err != nil {
+				var nErr net.Error
+				if errors.As(err, &nErr) && nErr.Timeout() {
+					// The stream stalled past the idle timeout. Reclaim the
+					// slot without tearing down the tunnel: treat it like a
+					// benign dropped stream (CancelRead runs in the defer),
+					// not like a protocol violation.
+					err = nil
+				}
 				return
 			}
 			if t.udp && t.UdpRelayMode == common.QUIC {

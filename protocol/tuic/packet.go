@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -196,6 +197,11 @@ type quicStreamPacketConn struct {
 	closeOnce sync.Once
 	closeErr  error
 	closed    atomic.Bool
+
+	// deadlineExceeded records that the conn was torn down by its own
+	// deadline timer rather than an explicit Close, so ReadFrom can report a
+	// timeout instead of net.ErrClosed.
+	deadlineExceeded atomic.Bool
 
 	deFraggers sync.Map
 
@@ -486,6 +492,7 @@ func (q *quicStreamPacketConn) SetDeadline(t time.Time) error {
 		q.deadlineTimer = time.AfterFunc(dur, func() {
 			q.muTimer.Lock()
 			defer q.muTimer.Unlock()
+			q.deadlineExceeded.Store(true)
 			_ = q.Close()
 			q.deadlineTimer = nil
 		})
@@ -509,13 +516,20 @@ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, e
 	q.mu.Unlock()
 
 	if incomingPackets == nil {
+		if q.deadlineExceeded.Load() {
+			return 0, netip.AddrPort{}, os.ErrDeadlineExceeded
+		}
 		return 0, netip.AddrPort{}, net.ErrClosed
 	}
 
 	for {
 		packet, closed := incomingPackets.PopFrontBlock()
 		if closed {
-			err = net.ErrClosed
+			if q.deadlineExceeded.Load() {
+				err = os.ErrDeadlineExceeded
+			} else {
+				err = net.ErrClosed
+			}
 			return
 		}
 		if packet.FRAG_TOTAL <= 1 {
@@ -530,7 +544,13 @@ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, e
 		}
 		nowNano := time.Now().UnixNano()
 		q.maybeCleanupDeFraggers(nowNano)
-		bucketAny, _ := q.deFraggers.LoadOrStore(packet.PKT_ID, &deFraggerBucket{})
+		bucketAny, loaded := q.deFraggers.Load(packet.PKT_ID)
+		if !loaded {
+			// First fragment of this packet id: allocate the bucket only now.
+			// Hitting LoadOrStore on every fragment would allocate a bucket
+			// per datagram and throw it away on an existing key.
+			bucketAny, _ = q.deFraggers.LoadOrStore(packet.PKT_ID, &deFraggerBucket{})
+		}
 		bucket := bucketAny.(*deFraggerBucket)
 		if n, addr, assembled, assembledLen := bucket.feed(packet, p, nowNano); assembled {
 			if bucket.len() == 0 {
@@ -604,7 +624,10 @@ func (q *quicStreamPacketConn) deliverPacket(handler netproxy.PacketReceiveHandl
 
 	nowNano := time.Now().UnixNano()
 	q.maybeCleanupDeFraggers(nowNano)
-	bucketAny, _ := q.deFraggers.LoadOrStore(packet.PKT_ID, &deFraggerBucket{})
+	bucketAny, loaded := q.deFraggers.Load(packet.PKT_ID)
+	if !loaded {
+		bucketAny, _ = q.deFraggers.LoadOrStore(packet.PKT_ID, &deFraggerBucket{})
+	}
 	bucket := bucketAny.(*deFraggerBucket)
 	_, _, assembled, assembledLen := bucket.feed(packet, nil, nowNano)
 	if !assembled && assembledLen == 0 {

@@ -45,6 +45,13 @@ const (
 	connLifeClosed
 )
 
+// maxPendingFirstWriteSize bounds the plain-HTTP request sniffing buffer.
+// The buffered bytes come from the proxied client, so without a cap a client
+// streaming bytes without a request terminator grows memory without limit and
+// re-parses the whole buffer on every Write (quadratic CPU). 64 KiB is well
+// above any realistic client request header budget.
+const maxPendingFirstWriteSize = 64 * 1024
+
 type publishResult int
 
 const (
@@ -85,6 +92,12 @@ type Conn struct {
 	muShake            sync.Mutex
 	muFinishShakeFuncs sync.Mutex
 	finishShakeFuncs   []func(conn netproxy.Conn)
+	// finishShakeFuncsApplied is set (under muFinishShakeFuncs) when the
+	// queued closures have been applied. It closes the window between
+	// applyFinishShakeFuncs returning and ctxShakeFinished firing, in which
+	// a concurrent SetXDeadline would otherwise queue a closure that nobody
+	// ever runs while still reporting success.
+	finishShakeFuncsApplied bool
 
 	closeOnce sync.Once
 
@@ -94,8 +107,7 @@ type Conn struct {
 func (c *Conn) SetDeadline(t time.Time) error {
 	c.muFinishShakeFuncs.Lock()
 	defer c.muFinishShakeFuncs.Unlock()
-	select {
-	case <-c.ctxShakeFinished.Done():
+	if c.finishShakeFuncsApplied {
 		conn, h2 := c.currentConn()
 		if conn == nil {
 			return io.EOF
@@ -104,22 +116,20 @@ func (c *Conn) SetDeadline(t time.Time) error {
 			return nil
 		}
 		return conn.SetDeadline(t)
-	default:
-		c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
-			if _, h2 := c.currentConn(); h2 {
-				return
-			}
-			_ = conn.SetDeadline(t)
-		})
-		return nil
 	}
+	c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
+		if _, h2 := c.currentConn(); h2 {
+			return
+		}
+		_ = conn.SetDeadline(t)
+	})
+	return nil
 }
 
 func (c *Conn) SetReadDeadline(t time.Time) error {
 	c.muFinishShakeFuncs.Lock()
 	defer c.muFinishShakeFuncs.Unlock()
-	select {
-	case <-c.ctxShakeFinished.Done():
+	if c.finishShakeFuncsApplied {
 		conn, h2 := c.currentConn()
 		if conn == nil {
 			return io.EOF
@@ -128,22 +138,20 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 			return nil
 		}
 		return conn.SetReadDeadline(t)
-	default:
-		c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
-			if _, h2 := c.currentConn(); h2 {
-				return
-			}
-			_ = conn.SetReadDeadline(t)
-		})
-		return nil
 	}
+	c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
+		if _, h2 := c.currentConn(); h2 {
+			return
+		}
+		_ = conn.SetReadDeadline(t)
+	})
+	return nil
 }
 
 func (c *Conn) SetWriteDeadline(t time.Time) error {
 	c.muFinishShakeFuncs.Lock()
 	defer c.muFinishShakeFuncs.Unlock()
-	select {
-	case <-c.ctxShakeFinished.Done():
+	if c.finishShakeFuncsApplied {
 		conn, h2 := c.currentConn()
 		if conn == nil {
 			return io.EOF
@@ -152,15 +160,14 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 			return nil
 		}
 		return conn.SetWriteDeadline(t)
-	default:
-		c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
-			if _, h2 := c.currentConn(); h2 {
-				return
-			}
-			_ = conn.SetWriteDeadline(t)
-		})
-		return nil
 	}
+	c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
+		if _, h2 := c.currentConn(); h2 {
+			return
+		}
+		_ = conn.SetWriteDeadline(t)
+	})
+	return nil
 }
 
 func NewConn(ctx context.Context, nextDialer netproxy.Dialer, proxy *HttpProxy, addr string, network string) *Conn {
@@ -266,6 +273,7 @@ func (c *Conn) applyFinishShakeFuncs(conn netproxy.Conn) {
 	}
 	c.muFinishShakeFuncs.Lock()
 	defer c.muFinishShakeFuncs.Unlock()
+	c.finishShakeFuncsApplied = true
 	for _, f := range c.finishShakeFuncs {
 		f(conn)
 	}
@@ -305,6 +313,15 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 		}
 
 		firstLine, hasFirstLine := readHTTPFirstLine(handshakeInput)
+		// The sniffing buffer is attacker-influenced (any proxied client can
+		// stream bytes without a terminator), so it must be bounded: without
+		// a cap, memory grows without limit and every Write re-parses the
+		// whole buffer (quadratic CPU). A request that cannot be recognized
+		// within the budget fails the conn instead.
+		if !c.proxy.https && !hasFirstLine && len(handshakeInput) > maxPendingFirstWriteSize {
+			c.pendingFirstWrite.Reset()
+			return 0, fmt.Errorf("http: request line exceeds %d bytes", maxPendingFirstWriteSize)
+		}
 		if !c.proxy.https && !hasFirstLine && isPossibleHTTPRequestLinePrefix(handshakeInput) {
 			if !hadPendingFirstWrite {
 				_, _ = c.pendingFirstWrite.Write(handshakeInput)
@@ -325,12 +342,16 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 
 			req, err = http.ReadRequest(bufio.NewReader(bytes.NewReader(handshakeInput)))
 			if err != nil {
-				if errors.Is(err, io.ErrUnexpectedEOF) {
+				if errors.Is(err, io.ErrUnexpectedEOF) && c.pendingFirstWrite.Len() <= maxPendingFirstWriteSize {
 					// Request more data.
 					if c.pendingFirstWrite.Len() == 0 {
 						_, _ = c.pendingFirstWrite.Write(handshakeInput)
 					}
 					return len(b), nil
+				}
+				if errors.Is(err, io.ErrUnexpectedEOF) {
+					c.pendingFirstWrite.Reset()
+					err = fmt.Errorf("http: request header exceeds %d bytes: %w", maxPendingFirstWriteSize, err)
 				}
 				// Error
 				return 0, err

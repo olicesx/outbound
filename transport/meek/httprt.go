@@ -42,22 +42,6 @@ type httpTripperClient struct {
 	url        string
 }
 
-func CleanGlobalRoundTripperCache() {
-	globalRoundTripperCacheAccess.Lock()
-	cached := make([]http.RoundTripper, 0, len(globalRoundTripperCacheMap))
-	for _, rt := range globalRoundTripperCacheMap {
-		cached = append(cached, rt)
-	}
-	globalRoundTripperCacheMap = make(map[string]http.RoundTripper)
-	globalRoundTripperCacheAccess.Unlock()
-
-	for _, rt := range cached {
-		if closeIdler, ok := rt.(interface{ CloseIdleConnections() }); ok {
-			closeIdler.CloseIdleConnections()
-		}
-	}
-}
-
 func CleanScopedRoundTripperCache(scope string) {
 	if scope == "" {
 		return

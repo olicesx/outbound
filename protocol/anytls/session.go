@@ -10,7 +10,6 @@ import (
 	"net/netip"
 	"os"
 	"runtime/debug"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,7 +41,6 @@ type session struct {
 	padding     *atomic.Pointer[paddingFactory]
 	sendPadding bool
 	pktCounter  atomic.Uint32
-	peerVersion byte
 
 	seq           uint64
 	sid           atomic.Uint32
@@ -294,11 +292,9 @@ func (s *session) run() error {
 					pool.Put(buffer)
 					return err
 				}
-				// check server's version
-				m := stringMapFromBytes(buffer)
-				if v, err := strconv.Atoi(m["v"]); err == nil {
-					s.peerVersion = byte(v)
-				}
+				// The settings payload (a version map) must be drained to
+				// keep the frame stream in sync, but the version itself is
+				// not consumed anywhere yet.
 				pool.Put(buffer)
 			}
 
@@ -415,22 +411,6 @@ drained:
 	case <-timer.C:
 		return false
 	}
-}
-
-func (s *session) writeConn(b []byte) (n int, err error) {
-	return s.writeConnWithDeadline(b, time.Time{})
-}
-
-func (s *session) writeConnWithDeadline(b []byte, deadline time.Time) (n int, err error) {
-	if s.closed.Load() {
-		return 0, net.ErrClosed
-	}
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-	if s.closed.Load() {
-		return 0, net.ErrClosed
-	}
-	return s.writeConnLockedWithDeadline(b, deadline)
 }
 
 // writeConnLockedWithDeadline applies an optional write deadline then writes.

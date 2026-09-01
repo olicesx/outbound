@@ -150,6 +150,9 @@ func (meta *Metadata) BytesFromPool() (b []byte, err error) {
 	case protocol.MetadataTypeDomain:
 		hostname := []byte(meta.Hostname)
 		lenDN := len(hostname)
+		if lenDN > 255 {
+			return nil, fmt.Errorf("domain name too long: %d", lenDN)
+		}
 		b = pool.Get(1 + 1 + lenDN + 2)
 		b[1] = uint8(lenDN)
 		copy(b[2:], hostname)

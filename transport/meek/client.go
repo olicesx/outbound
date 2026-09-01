@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
@@ -59,18 +60,40 @@ type assemblerClientSession struct {
 	readerChan chan []byte
 	ctx        context.Context
 	finish     func()
+
+	// deadlineMu guards deadlineTimer. Deadlines are enforced at session
+	// granularity: firing one calls finish, which closes the session so all
+	// pending and subsequent I/O fail. Per-direction deadlines are not
+	// representable over the polling transport beneath, so all three
+	// Set*Deadline collapse onto the same timer.
+	deadlineMu    sync.Mutex
+	deadlineTimer *time.Timer
+}
+
+func (s *assemblerClientSession) setSessionDeadline(t time.Time) error {
+	s.deadlineMu.Lock()
+	defer s.deadlineMu.Unlock()
+	if s.deadlineTimer != nil {
+		s.deadlineTimer.Stop()
+		s.deadlineTimer = nil
+	}
+	if t.IsZero() {
+		return nil
+	}
+	s.deadlineTimer = time.AfterFunc(time.Until(t), s.finish)
+	return nil
 }
 
 func (s *assemblerClientSession) SetDeadline(t time.Time) error {
-	return nil
+	return s.setSessionDeadline(t)
 }
 
 func (s *assemblerClientSession) SetReadDeadline(t time.Time) error {
-	return nil
+	return s.setSessionDeadline(t)
 }
 
 func (s *assemblerClientSession) SetWriteDeadline(t time.Time) error {
-	return nil
+	return s.setSessionDeadline(t)
 }
 
 func (s *assemblerClientSession) keepRunning() {
@@ -156,7 +179,7 @@ func (s *assemblerClientSession) runOnce() {
 }
 
 func (s *assemblerClientSession) Read(p []byte) (n int, err error) {
-	if s.readBuffer.Len() == 0 {
+	for s.readBuffer.Len() == 0 {
 		select {
 		case <-s.ctx.Done():
 			return 0, s.ctx.Err()
@@ -164,12 +187,9 @@ func (s *assemblerClientSession) Read(p []byte) (n int, err error) {
 			s.readBuffer.Write(data)
 		}
 	}
-	n, err = s.readBuffer.Read(p)
-	if err == io.EOF {
-		s.readBuffer.Reset()
-		return 0, nil
-	}
-	return
+	// The buffer is non-empty here, so this only returns (0, io.EOF) for an
+	// empty p probe; never fabricate (0, nil), which callers read as EOF.
+	return s.readBuffer.Read(p)
 }
 
 func (s *assemblerClientSession) Write(p []byte) (n int, err error) {
@@ -184,6 +204,12 @@ func (s *assemblerClientSession) Write(p []byte) (n int, err error) {
 }
 
 func (s *assemblerClientSession) Close() error {
+	s.deadlineMu.Lock()
+	if s.deadlineTimer != nil {
+		s.deadlineTimer.Stop()
+		s.deadlineTimer = nil
+	}
+	s.deadlineMu.Unlock()
 	s.finish()
 	return nil
 }

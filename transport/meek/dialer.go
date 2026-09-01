@@ -112,7 +112,12 @@ func (m *Dialer) DialContext(ctx context.Context, network, addr string) (c netpr
 		}
 
 		assembler := newAssemblerClient(tripper, clientConfig)
-		session, err := assembler.NewSession(context.Background())
+		// The session outlives this dial: its lifetime is governed by
+		// Conn.Close, not by the dial context (which may be request-scoped
+		// and cancelled right after the handshake). WithoutCancel keeps the
+		// caller's context values (loggers, trace metadata) while decoupling
+		// cancellation, instead of discarding the context entirely.
+		session, err := assembler.NewSession(context.WithoutCancel(ctx))
 		if err != nil {
 			return nil, err
 		}

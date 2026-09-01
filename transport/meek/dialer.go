@@ -94,6 +94,11 @@ func (m *Dialer) DialContext(ctx context.Context, network, addr string) (c netpr
 			nextDialer: m.nextDialer,
 			addr:       addr,
 			url:        m.url,
+			// The TLS block above (sni/serverName/skipVerify/alpn) must
+			// actually reach the round tripper, and it is part of the
+			// transport cache key, so dialers differing only in TLS
+			// options no longer share one cached transport.
+			tlsConfig: m.tlsConfig,
 		}
 
 		clientConfig := &config{

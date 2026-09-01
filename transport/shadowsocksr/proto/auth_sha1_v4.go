@@ -19,7 +19,10 @@ type authSHA1v4 struct {
 	*ServerInfo
 	data          *AuthData
 	hasSentHeader bool
-	buffer        bytes.Buffer
+	// buffer and encodeBuffer are per-direction scratch: Encode runs under
+	// the conn writeMu and Decode under readMu, so they must not share state.
+	buffer       bytes.Buffer
+	encodeBuffer bytes.Buffer
 }
 
 func NewAuthSHA1v4() IProtocol {
@@ -158,7 +161,7 @@ func (a *authSHA1v4) DecodePkt(in []byte) (out pool.Bytes, err error) {
 }
 
 func (a *authSHA1v4) Encode(plainData []byte) (outData []byte, err error) {
-	a.buffer.Reset()
+	a.encodeBuffer.Reset()
 	dataLength := len(plainData)
 	offset := 0
 	if !a.hasSentHeader && dataLength > 0 {
@@ -166,22 +169,22 @@ func (a *authSHA1v4) Encode(plainData []byte) (outData []byte, err error) {
 		if headSize > dataLength {
 			headSize = dataLength
 		}
-		_, _ = a.buffer.Write(a.packAuthData(plainData[:headSize]))
+		_, _ = a.encodeBuffer.Write(a.packAuthData(plainData[:headSize]))
 		offset += headSize
 		dataLength -= headSize
 		a.hasSentHeader = true
 	}
 	const blockSize = 4096
 	for dataLength > blockSize {
-		_, _ = a.buffer.Write(a.packData(plainData[offset : offset+blockSize]))
+		_, _ = a.encodeBuffer.Write(a.packData(plainData[offset : offset+blockSize]))
 		offset += blockSize
 		dataLength -= blockSize
 	}
 	if dataLength > 0 {
-		_, _ = a.buffer.Write(a.packData(plainData[offset:]))
+		_, _ = a.encodeBuffer.Write(a.packData(plainData[offset:]))
 	}
 
-	return a.buffer.Bytes(), nil
+	return a.encodeBuffer.Bytes(), nil
 }
 
 func (a *authSHA1v4) Decode(plainData []byte) (outData []byte, n int, err error) {
@@ -209,6 +212,11 @@ func (a *authSHA1v4) Decode(plainData []byte) (outData []byte, n int, err error)
 				pos += 4
 			} else {
 				pos = int(binary.BigEndian.Uint16(plainData[5:5+2])) + 4
+			}
+			// The padding offset is server-controlled; reject frames whose
+			// offset leaves no payload bytes instead of slicing negatively.
+			if pos > length-4 {
+				return nil, 0, ErrAuthSHA1v4PosOutOfRange
 			}
 			outLength := length - pos - 4
 			_, _ = a.buffer.Write(plainData[pos : pos+outLength])

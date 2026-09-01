@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/outbound/ciphers"
@@ -30,7 +31,11 @@ type authChainA struct {
 	randomClient crypto.Shift128plusContext
 	randomServer crypto.Shift128plusContext
 	recvInfo
-	cipher         *ciphers.StreamCipher
+	cipher *ciphers.StreamCipher
+	// tcpMss mirrors ServerInfo.TcpMss: Decode (under readMu) overwrites it
+	// from the first server chunk while Encode (under writeMu) reads it, so
+	// access must be atomic.
+	tcpMss         atomic.Int64
 	hasSentHeader  bool
 	lastClientHash []byte
 	lastServerHash []byte
@@ -56,8 +61,9 @@ func NewAuthChainA() IProtocol {
 		rnd:        authChainAGetRandLen,
 		rndPkt:     authChainAPktGetRandLen,
 		recvInfo: recvInfo{
-			recvID: 1,
-			buffer: new(swBytes.Buffer),
+			recvID:       1,
+			buffer:       new(swBytes.Buffer),
+			encodeBuffer: new(swBytes.Buffer),
 		},
 	}
 	return a
@@ -83,6 +89,7 @@ func (a *authChainA) initUser() {
 
 func (a *authChainA) InitWithServerInfo(s *ServerInfo) {
 	a.ServerInfo = s
+	a.tcpMss.Store(int64(s.TcpMss))
 	if a.salt == "auth_chain_b" {
 		a.authChainBInitDataSize()
 	}
@@ -284,6 +291,11 @@ func (a *authChainA) DecodePkt(in []byte) (out pool.Bytes, err error) {
 	md5Data := a.hmac(a.Key, in[len(in)-8:len(in)-1])
 
 	randDataLength := a.rndPkt(&a.randomServer, md5Data)
+	// The trailing rand padding plus the 8-byte md5/hmac tail must fit in the
+	// packet; otherwise in[:len(in)-8-randDataLength] would slice negatively.
+	if len(in) < 8+randDataLength {
+		return nil, ErrAuthChainDataLengthError
+	}
 
 	key := common.EVPBytesToKey(base64.StdEncoding.EncodeToString(a.userKey)+base64.StdEncoding.EncodeToString(md5Data), 16)
 	rc4Cipher, err := rc4.NewCipher(key)
@@ -296,7 +308,7 @@ func (a *authChainA) DecodePkt(in []byte) (out pool.Bytes, err error) {
 }
 
 func (a *authChainA) Encode(plainData []byte) (outData []byte, err error) {
-	a.buffer.Reset()
+	a.encodeBuffer.Reset()
 	dataLength := len(plainData)
 	offset := 0
 	if dataLength > 0 && !a.hasSentHeader {
@@ -304,17 +316,17 @@ func (a *authChainA) Encode(plainData []byte) (outData []byte, err error) {
 		if headSize > dataLength {
 			headSize = dataLength
 		}
-		_, _ = a.buffer.Write(a.packAuthData(plainData[:headSize]))
+		_, _ = a.encodeBuffer.Write(a.packAuthData(plainData[:headSize]))
 		offset += headSize
 		dataLength -= headSize
 		a.hasSentHeader = true
 	}
-	var unitSize = a.TcpMss - a.Overhead
+	var unitSize = int(a.tcpMss.Load()) - a.Overhead
 	for dataLength > unitSize {
 		dataLen, randLength := a.packedDataLen(plainData[offset : offset+unitSize])
 		b := make([]byte, dataLen)
 		a.packData(b, plainData[offset:offset+unitSize], randLength)
-		_, _ = a.buffer.Write(b)
+		_, _ = a.encodeBuffer.Write(b)
 		dataLength -= unitSize
 		offset += unitSize
 	}
@@ -322,9 +334,9 @@ func (a *authChainA) Encode(plainData []byte) (outData []byte, err error) {
 		dataLen, randLength := a.packedDataLen(plainData[offset:])
 		b := make([]byte, dataLen)
 		a.packData(b, plainData[offset:], randLength)
-		_, _ = a.buffer.Write(b)
+		_, _ = a.encodeBuffer.Write(b)
 	}
-	return a.buffer.Bytes(), nil
+	return a.encodeBuffer.Bytes(), nil
 }
 
 func (a *authChainA) Decode(plainData []byte) (outData []byte, n int, err error) {
@@ -359,7 +371,12 @@ func (a *authChainA) Decode(plainData []byte) (outData []byte, n int, err error)
 		a.cipher.Decrypt(b, plainData[dataPos:dataPos+dataLen])
 		_, _ = a.buffer.Write(b)
 		if a.recvID == 1 {
-			a.TcpMss = int(binary.LittleEndian.Uint16(a.buffer.Next(2)))
+			// The first server chunk starts with the server TcpMss; a
+			// chunk shorter than that cannot be parsed.
+			if a.buffer.Len() < 2 {
+				return nil, 0, ErrAuthChainDataLengthError
+			}
+			a.tcpMss.Store(int64(binary.LittleEndian.Uint16(a.buffer.Next(2))))
 		}
 		a.lastServerHash = hash
 		a.recvID++

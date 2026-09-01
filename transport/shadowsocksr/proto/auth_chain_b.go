@@ -20,8 +20,9 @@ func NewAuthChainB() IProtocol {
 		rnd:        authChainBGetRandLen,
 		rndPkt:     authChainAPktGetRandLen,
 		recvInfo: recvInfo{
-			recvID: 1,
-			buffer: new(bytes.Buffer),
+			recvID:       1,
+			buffer:       new(bytes.Buffer),
+			encodeBuffer: new(bytes.Buffer),
 		},
 	}
 	return a

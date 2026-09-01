@@ -236,12 +236,28 @@ func TestClientCloseDefersTransportCloseUntilActiveUDPSessionsDrain(t *testing.T
 	if err := udpSession.Close(); err != nil {
 		t.Fatalf("udp session Close() error = %v", err)
 	}
+	// The drain callback is deliberately decoupled (it must never run
+	// synchronously on a call stack that holds c.m, or it self-deadlocks),
+	// so wait for the deferred teardown instead of asserting immediately.
+	// Field reads go through c.m to stay ordered against closeExisting.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c.m.Lock()
+		cleared := c.conn == nil && c.pktConn == nil && c.udpSM == nil
+		c.m.Unlock()
+		if cleared {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if got := conn.closes.Load(); got != 1 {
 		t.Fatalf("QUIC CloseWithError calls after UDP drain = %d, want 1", got)
 	}
 	if got := pktConn.closes.Load(); got != 1 {
 		t.Fatalf("packet conn Close calls after UDP drain = %d, want 1", got)
 	}
+	c.m.Lock()
+	defer c.m.Unlock()
 	if c.conn != nil || c.pktConn != nil || c.udpSM != nil {
 		t.Fatalf("client resources not cleared after UDP drain: conn=%v pktConn=%v udpSM=%v", c.conn, c.pktConn, c.udpSM)
 	}

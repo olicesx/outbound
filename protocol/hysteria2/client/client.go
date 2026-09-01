@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sync"
 	"time"
@@ -228,13 +230,22 @@ func (c *clientImpl) Close() error {
 	}
 	c.closed = true
 	udpSM := c.udpSM
-	if udpSM != nil && !udpSM.closeWhenIdle(c.closeExisting) {
+	if udpSM != nil && !udpSM.closeWhenIdle(c.closeExistingWhenDrained) {
 		c.m.Unlock()
 		return nil
 	}
 	c.closeExistingLocked()
 	c.m.Unlock()
 	return nil
+}
+
+// closeExistingWhenDrained is the udpSessionManager drain callback. It can
+// fire from call stacks that already hold c.m (e.g.
+// handleIfConnectionClosed -> closeExistingLocked -> udpSM.Close ->
+// closeCleanup invoking onIdle), so it must not take c.m synchronously or it
+// self-deadlocks; decoupling with a goroutine lets the holder release first.
+func (c *clientImpl) closeExistingWhenDrained() {
+	go c.closeExisting()
 }
 
 func (c *clientImpl) closeExisting() {
@@ -349,6 +360,12 @@ func (c *clientImpl) UDP(addr string, ctx context.Context) (netproxy.Conn, error
 	udpSMSnapshot := c.udpSM
 	c.m.Unlock()
 
+	// Local input validation: a malformed target address must surface as a
+	// dial error without ever reaching the tunnel-fatal classification (and
+	// without tearing down the shared connection).
+	if _, err := netip.ParseAddrPort(addr); err != nil {
+		return nil, err
+	}
 	if udpSMSnapshot == nil {
 		return nil, coreErrs.DialError{Message: "UDP not enabled"}
 	}
@@ -363,8 +380,28 @@ func (c *clientImpl) UDP(addr string, ctx context.Context) (netproxy.Conn, error
 // PITFALL: sometimes quic-go has "internal errors" that are not net.Error,
 // but we still need to treat them as ClosedError.
 func (c *clientImpl) handleIfConnectionClosed(err error, originConn quic.Connection) {
-	if err == nil {
+	if !tunnelFatalError(err) {
 		return
+	}
+	// Hold the mutex to avoid racing with connect() which may have
+	// already replaced c.conn/c.pktConn with new instances.
+	c.m.Lock()
+	defer c.m.Unlock()
+	// Only close if the connection is still the one that errored.
+	// If connect() already ran, c.conn is a new instance and must not
+	// be closed — doing so would kill the fresh QUIC session.
+	if c.conn == originConn {
+		c.closeExistingLocked()
+	}
+}
+
+// tunnelFatalError reports whether err means the shared QUIC tunnel itself is
+// dead and should be torn down. Stream-, caller- and input-scoped errors must
+// return false: tearing the tunnel down for them kills healthy streams and
+// forces a full re-handshake for everyone.
+func tunnelFatalError(err error) bool {
+	if err == nil {
+		return false
 	}
 
 	// Stream-scoped failures must not tear down the shared tunnel: a RESET
@@ -373,31 +410,36 @@ func (c *clientImpl) handleIfConnectionClosed(err error, originConn quic.Connect
 	// while other streams on the connection stay healthy.
 	var streamErr *quic.StreamError
 	if errors.As(err, &streamErr) {
-		return
+		return false
 	}
 	if outbounderrors.IsStreamExhausted(err) || outbounderrors.IsTemporaryError(err) {
-		return
+		return false
 	}
 
-	shouldClose := false
-	if _, ok := err.(coreErrs.ClosedError); ok {
-		shouldClose = true
-	} else if netErr, ok := err.(net.Error); !ok || !netErr.Temporary() { // nolint:staticcheck
-		shouldClose = true
+	var closedErr coreErrs.ClosedError
+	if errors.As(err, &closedErr) {
+		return true
 	}
-
-	if shouldClose {
-		// Hold the mutex to avoid racing with connect() which may have
-		// already replaced c.conn/c.pktConn with new instances.
-		c.m.Lock()
-		defer c.m.Unlock()
-		// Only close if the connection is still the one that errored.
-		// If connect() already ran, c.conn is a new instance and must not
-		// be closed — doing so would kill the fresh QUIC session.
-		if c.conn == originConn {
-			c.closeExistingLocked()
-		}
+	// A server FIN without a response (protocol.ReadTCPResponse surfaces it
+	// as io.EOF) is a per-stream condition, not a tunnel death.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return false
 	}
+	// Caller-scoped abort: the dial context died, the tunnel did not.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// Local input validation (e.g. a malformed target address) must not
+	// kill the shared connection.
+	var addrErr *net.AddrError
+	if errors.As(err, &addrErr) {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Temporary() { // nolint:staticcheck
+		return false
+	}
+	return true
 }
 
 type tcpConn struct {

@@ -219,7 +219,7 @@ func ParseHysteria2URL(link string) (*Hysteria2, error) {
 	if ech := q.Get("ech"); ech != "" {
 		echConfigList, err = decodeECHConfigList(ech)
 		if err != nil {
-			return nil, fmt.Errorf("%w: ech: %v", dialer.InvalidParameterErr, err)
+			return nil, fmt.Errorf("%w: ech: %w", dialer.InvalidParameterErr, err)
 		}
 	}
 	conf := &Hysteria2{

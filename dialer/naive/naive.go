@@ -55,7 +55,7 @@ func NewNaive(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link strin
 func parseNaiveURL(link string) (*Naive, error) {
 	u, err := url.Parse(link)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", dialer.InvalidParameterErr, err)
+		return nil, fmt.Errorf("%w: %w", dialer.InvalidParameterErr, err)
 	}
 
 	switch u.Scheme {

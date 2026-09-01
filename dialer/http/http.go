@@ -31,7 +31,7 @@ type HTTP struct {
 func NewHTTP(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string) (netproxy.Dialer, *dialer.Property, error) {
 	s, err := ParseHTTPURL(link)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", dialer.InvalidParameterErr, err)
+		return nil, nil, fmt.Errorf("%w: %w", dialer.InvalidParameterErr, err)
 	}
 	return s.Dialer(option, nextDialer)
 }
@@ -39,7 +39,7 @@ func NewHTTP(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string
 func ParseHTTPURL(link string) (data *HTTP, err error) {
 	u, err := url.Parse(link)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", dialer.InvalidParameterErr, err)
+		return nil, fmt.Errorf("%w: %w", dialer.InvalidParameterErr, err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("%w: unsupported scheme %q", dialer.InvalidParameterErr, u.Scheme)

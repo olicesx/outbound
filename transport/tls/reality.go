@@ -452,6 +452,11 @@ func randBetween(left int64, right int64) int64 {
 	if left >= right {
 		return left
 	}
-	bigInt, _ := rand.Int(rand.Reader, big.NewInt(right-left))
+	bigInt, err := rand.Int(rand.Reader, big.NewInt(right-left))
+	if err != nil || bigInt == nil {
+		// Entropy failure must not panic on a nil big.Int; fall back to the
+		// lower bound.
+		return left
+	}
 	return left + bigInt.Int64()
 }

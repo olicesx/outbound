@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 )
@@ -134,6 +135,12 @@ func (c *httpTripperClient) getRoundTripper() http.RoundTripper {
 				}, nil
 			},
 			TLSClientConfig: c.tlsConfig,
+			// The cache is keyed per destination and nothing in this repo
+			// reaps transports, so without an idle timeout every transport
+			// would pin its TLS connections (and their read/write
+			// goroutines) for the process lifetime.
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
 		}
 	}
 	return globalRoundTripperCacheMap[cacheKey]

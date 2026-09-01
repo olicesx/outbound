@@ -34,7 +34,7 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (netprox
 		if err != nil {
 			return nil, fmt.Errorf("[socks5]: dial to %s error: %w", s.addr, err)
 		}
-		if _, err := s.connect(c, addr, socks.CmdConnect); err != nil {
+		if _, err := s.connect(ctx, c, addr, socks.CmdConnect); err != nil {
 			_ = c.Close()
 			return nil, err
 		}
@@ -52,7 +52,7 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (netprox
 
 		// Get the proxy addr we should dial.
 		var uAddr socks.Addr
-		if uAddr, err = s.connect(c, addr, socks.CmdUDPAssociate); err != nil {
+		if uAddr, err = s.connect(ctx, c, addr, socks.CmdUDPAssociate); err != nil {
 			_ = c.Close()
 			return nil, err
 		}
@@ -87,7 +87,17 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (netprox
 // connect takes an existing connection to a socks5 proxy server,
 // and commands the server to extend that connection to target,
 // which must be a canonical address with a host and port.
-func (s *Socks5) connect(conn netproxy.Conn, target string, cmd byte) (addr socks.Addr, err error) {
+func (s *Socks5) connect(ctx context.Context, conn netproxy.Conn, target string, cmd byte) (addr socks.Addr, err error) {
+	// The handshake below is 3-4 blocking round trips; apply the dial
+	// context's deadline to the conn so a stalling server fails the dial
+	// instead of hanging it past ctx cancellation (http got the same
+	// treatment; without it a socks5 greeting stall wedged DialContext).
+	restoreDeadline, err := netproxy.ApplyConnDeadlineFromContext(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	defer restoreDeadline()
+
 	// the size here is just an estimate
 	buf := pool.Get(socks.MaxAddrLen)
 	defer pool.Put(buf)

@@ -31,10 +31,14 @@ func NewConn(conn netproxy.Conn, userUUID []byte) (*Conn, error) {
 	}
 	underlayConn, tlsConn, connType, connPointer, err := visionIntrinsicConn(conn)
 	if err != nil {
+		// NewConn owns conn from here on; close it on every failure or the
+		// vless conn wrapping the dialed underlay leaks.
+		_ = conn.Close()
 		return nil, err
 	}
 	readBuffers, err := visionTLSReadBuffersFor(connType, connPointer)
 	if err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 	c.Conn = underlayConn

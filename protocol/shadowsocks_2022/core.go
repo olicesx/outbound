@@ -157,10 +157,19 @@ func (c *SS2022Core) WriteIdentityHeader(dst []byte, separateHeader []byte) (int
 			offset += eihBlockSize
 		}
 	} else {
-		// Chacha path: use AEAD encryption with fixed nonce
-		// Format: Seal(plaintext=eihHash||padding, nonce=zero, ad=separateHeader)
-		// The EIH block is the ciphertext (which includes the tag)
-		eihNonce := make([]byte, c.cipherConf.NonceLen) // All zeros
+		// Chacha path: use AEAD encryption with a nonce derived from the
+		// separate header (session ID + packet ID).
+		// Format: Seal(plaintext=eihHash||padding, nonce=separateHeader tail, ad=separateHeader)
+		// The EIH block is the ciphertext (which includes the tag).
+		// The packet ID is unique per packet, so deriving the nonce from the
+		// separate header keeps every (key, nonce) pair unique. A fixed
+		// all-zero nonce would reuse the one-time Poly1305 key across all
+		// packets of the dialer and allow EIH tag forgeries.
+		nonceSize := c.identityAEADCiphers[0].NonceSize()
+		if nonceSize > len(separateHeader) {
+			return 0, fmt.Errorf("separate header too short for EIH nonce: %d < %d", len(separateHeader), nonceSize)
+		}
+		eihNonce := separateHeader[len(separateHeader)-nonceSize:]
 		for i := 0; i < len(c.pskList)-1; i++ {
 			maxDstLen := c.identityAEADCiphers[i].NonceSize() + len(c.pskHash[i+1]) + c.identityAEADCiphers[i].Overhead()
 			if offset+maxDstLen > len(dst) {

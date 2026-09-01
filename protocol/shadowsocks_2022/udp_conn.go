@@ -502,10 +502,12 @@ func (c *UdpConn) decodeBlockPacket(buf []byte, now time.Time) ([]byte, netip.Ad
 	var sessionID [8]byte
 	copy(sessionID[:], buf[:8])
 	packetID := binary.BigEndian.Uint64(buf[8:16])
-	if !c.checkAndUpdateReplay(sessionID, packetID, now) {
-		return nil, netip.AddrPort{}, protocol.ErrReplayAttack
-	}
 
+	// Authenticate before committing anti-replay state (the same order the
+	// chacha path below uses): the separate header carries no integrity of
+	// its own, so committing the replay window first would let anyone who
+	// knows a session ID push the window forward and permanently reject the
+	// victim's later legitimate packets.
 	payload := buf[16:]
 	sessionCipher, err := c.decryptCipherFor(sessionID)
 	if err != nil {
@@ -514,6 +516,9 @@ func (c *UdpConn) decodeBlockPacket(buf []byte, now time.Time) ([]byte, netip.Ad
 	payload, err = sessionCipher.Open(payload[:0], buf[4:16], payload, nil)
 	if err != nil {
 		return nil, netip.AddrPort{}, err
+	}
+	if !c.checkAndUpdateReplay(sessionID, packetID, now) {
+		return nil, netip.AddrPort{}, protocol.ErrReplayAttack
 	}
 	return c.decodePacketPayload(buf, payload, now)
 }

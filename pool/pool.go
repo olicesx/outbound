@@ -35,6 +35,11 @@ func init() {
 }
 
 func GetBiggerClosestN(need int) (n int) {
+	if need <= 0 {
+		// bits.Len32(0) is 0, which would make the power-of-two check below
+		// shift by a negative count and panic; clamp to the smallest bucket.
+		return minsizePower
+	}
 	n = bits.Len32(uint32(need))
 	// bits.Len32 returns the number of bits needed to represent the number.
 	// For a power of 2, it returns exponent+1, so we subtract 1.

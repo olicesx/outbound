@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -26,9 +25,17 @@ type HTTPObfs struct {
 	offset        int
 	firstRequest  bool
 	firstResponse bool
-	wMu           sync.Mutex
-	rMu           sync.Mutex
+	// headerBuf accumulates response-header bytes that arrived without the
+	// "\r\n\r\n" terminator yet (the header may straddle TCP segments).
+	// Guarded by rMu.
+	headerBuf []byte
+	wMu       sync.Mutex
+	rMu       sync.Mutex
 }
+
+// maxResponseHeaderSize bounds headerBuf: the peer controls how many bytes
+// it can send without a terminator.
+const maxResponseHeaderSize = 8 * 1024
 
 func (ho *HTTPObfs) Read(b []byte) (int, error) {
 	ho.rMu.Lock()
@@ -44,29 +51,52 @@ func (ho *HTTPObfs) Read(b []byte) (int, error) {
 	}
 
 	if ho.firstResponse {
+		n, err := ho.readFirstResponse(b)
+		if err != nil || n > 0 {
+			return n, err
+		}
+		// The header was consumed but carried no body bytes; fall through
+		// to the raw read instead of returning (0, nil).
+	}
+	return ho.Conn.Read(b)
+}
+
+// readFirstResponse reads until the response header terminator is seen and
+// delivers whatever body bytes followed it. A single Read that does not yet
+// contain "\r\n\r\n" is NOT end of stream — the header may straddle TCP
+// segments — so bytes are accumulated and the JOINED buffer is searched.
+func (ho *HTTPObfs) readFirstResponse(b []byte) (int, error) {
+	for {
 		buf := pool.Get(1 << 15)
 		n, err := ho.Conn.Read(buf)
 		if err != nil {
 			pool.Put(buf)
+			ho.headerBuf = nil
 			return 0, err
 		}
-		idx := bytes.Index(buf[:n], []byte("\r\n\r\n"))
-		if idx == -1 {
+		if len(ho.headerBuf)+n > maxResponseHeaderSize {
 			pool.Put(buf)
-			return 0, io.EOF
+			ho.headerBuf = nil
+			return 0, fmt.Errorf("simple-obfs http: response header exceeds %d bytes", maxResponseHeaderSize)
+		}
+		ho.headerBuf = append(ho.headerBuf, buf[:n]...)
+		pool.Put(buf)
+		idx := bytes.Index(ho.headerBuf, []byte("\r\n\r\n"))
+		if idx == -1 {
+			continue
 		}
 		ho.firstResponse = false
-		length := n - (idx + 4)
-		n = copy(b, buf[idx+4:n])
-		if length > n {
-			ho.buf = buf[:idx+4+length]
-			ho.offset = idx + 4 + n
-		} else {
-			pool.Put(buf)
+		body := ho.headerBuf[idx+4:]
+		m := copy(b, body)
+		if len(body) > m {
+			rest := pool.Get(len(body) - m)
+			copy(rest, body[m:])
+			ho.buf = rest
+			ho.offset = 0
 		}
-		return n, nil
+		ho.headerBuf = nil
+		return m, nil
 	}
-	return ho.Conn.Read(b)
 }
 
 func (ho *HTTPObfs) Write(b []byte) (int, error) {

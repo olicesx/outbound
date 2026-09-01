@@ -138,7 +138,10 @@ func (d *directDialer) tryRetry(err error, addr string, callback func()) {
 
 	// addr is domain
 	if err != nil {
-		if err == outbounderrors.ErrDNSTimeout {
+		// The resolver surfaces *net.DNSError/*net.OpError, never the bare
+		// sentinel; an identity comparison here would never fire and the
+		// fallback-DNS retry would silently rot away.
+		if outbounderrors.IsDNSTimeout(err) {
 			callback()
 		}
 	}

@@ -57,6 +57,13 @@ func NewTls(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string)
 		utlsImitate:     utlsImitate,
 		serverName:      query.Get("sni"),
 	}
+	if t.tlsImplentation == "utls" {
+		// Fail an unknown fingerprint at construction time instead of on
+		// every dial, after the underlay connection was already established.
+		if _, err := nameToUtlsClientHelloID(utlsImitate); err != nil {
+			return nil, nil, fmt.Errorf("NewTls: %w", err)
+		}
+	}
 	if t.serverName == "" {
 		t.serverName = u.Hostname()
 	}
@@ -138,6 +145,8 @@ func (s *Tls) DialContext(ctx context.Context, network, addr string) (c netproxy
 		case "utls":
 			clientHelloID, err := nameToUtlsClientHelloID(s.utlsImitate)
 			if err != nil {
+				// rc was dialed above and is owned by this call.
+				_ = rc.Close()
 				return nil, err
 			}
 
@@ -148,6 +157,7 @@ func (s *Tls) DialContext(ctx context.Context, network, addr string) (c netproxy
 			}, uTLSConfigFromTLSConfig(s.tlsConfig), *clientHelloID)
 
 		default:
+			_ = rc.Close()
 			return nil, fmt.Errorf("unknown tls implementation: %v", s.tlsImplentation)
 		}
 

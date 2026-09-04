@@ -9,6 +9,29 @@ type UnderlyingConnProvider interface {
 	UnderlyingConn() net.Conn
 }
 
+// WriteCloser is the optional half-close surface. dae's relay type-asserts
+// the same method; TLS-wrapped conns typically do not implement it.
+type WriteCloser interface {
+	CloseWrite() error
+}
+
+// ForwardCloseWrite half-closes c. Protocol wrappers that implement
+// WriteCloser are preferred; otherwise a *net.TCPConn is unwrapped via
+// UnderlyingConnProvider. crypto/tls.Conn is not a WriteCloser and is not
+// peeled to TCP, so TLS-wrapped chains no-op.
+func ForwardCloseWrite(c Conn) error {
+	if c == nil {
+		return nil
+	}
+	if wc, ok := c.(WriteCloser); ok {
+		return wc.CloseWrite()
+	}
+	if tcp, ok := UnwrapTCPConn(c); ok {
+		return tcp.CloseWrite()
+	}
+	return nil
+}
+
 const unwrapTCPConnMaxDepth = 8
 
 // UnwrapTCPConn resolves a concrete *net.TCPConn from a possibly wrapped

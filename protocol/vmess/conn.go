@@ -66,6 +66,7 @@ type Conn struct {
 	readOpenFrame []byte
 
 	writeSealFrame []byte
+	writeClosed    bool
 }
 
 func NewConn(conn netproxy.Conn, metadata Metadata, dialTgt string, cmdKey []byte) (c *Conn, err error) {
@@ -87,6 +88,14 @@ func NewConn(conn netproxy.Conn, metadata Metadata, dialTgt string, cmdKey []byt
 		}
 	}
 	return c, nil
+}
+
+func (c *Conn) CloseWrite() error {
+	if c.metadata.Network == "udp" || c.metadata.IsPacketAddr() {
+		return nil
+	}
+	_, err := c.write(nil)
+	return err
 }
 
 func (c *Conn) Close() error {
@@ -275,6 +284,9 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 func (c *Conn) write(b []byte) (n int, err error) {
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
+	if c.writeClosed {
+		return 0, net.ErrClosed
+	}
 	var encRespHeader []byte
 	c.initWrite.Do(func() {
 		if !c.metadata.IsClient {
@@ -309,6 +321,7 @@ func (c *Conn) write(b []byte) (n int, err error) {
 		return 0, err
 	}
 	if len(b) == 0 {
+		c.writeClosed = true
 		data := c.sealFromPool(nil)
 		_, err = c.Conn.Write(data)
 		return 0, err
@@ -469,11 +482,9 @@ func (c *Conn) read(b []byte) (n int, err error) {
 	if c.indexToRead < len(c.leftToRead) {
 		n = copy(b, c.leftToRead[c.indexToRead:])
 		if c.metadata.Network == "udp" {
-			// One datagram per ReadFrom: leftover stream-chunk tails are
-			// not a second UDP packet.
 			c.leftToRead = nil
 			c.indexToRead = 0
-			return n, nil
+			return 0, io.ErrShortBuffer
 		}
 		c.indexToRead += n
 		if c.indexToRead >= len(c.leftToRead) {
@@ -490,14 +501,14 @@ func (c *Conn) read(b []byte) (n int, err error) {
 	n = copy(b, chunk)
 	if n < len(chunk) {
 		if c.metadata.Network == "udp" {
-			// One datagram per ReadFrom: drop the remainder of this chunk
-			// instead of exposing it as a later packet.
+			// Do not deliver a truncated datagram; dae skips io.ErrShortBuffer
+			// without retiring the UDP endpoint.
 			c.leftToRead = nil
 			c.indexToRead = 0
-		} else {
-			c.leftToRead = chunk
-			c.indexToRead = n
+			return 0, io.ErrShortBuffer
 		}
+		c.leftToRead = chunk
+		c.indexToRead = n
 	}
 	return n, nil
 }

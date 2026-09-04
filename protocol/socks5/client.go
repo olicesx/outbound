@@ -71,10 +71,13 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (netprox
 
 		conn, err := s.dialer.DialContext(ctx, network, uAddress)
 		if err != nil {
+			_ = c.Close()
 			return nil, fmt.Errorf("[socks5] dialudp to %s error: %w", uAddress, err)
 		}
 		pc, ok := conn.(netproxy.PacketConn)
 		if !ok {
+			_ = conn.Close()
+			_ = c.Close()
 			return nil, fmt.Errorf("[socks5] forwarder is not transport.PacketConn")
 		}
 

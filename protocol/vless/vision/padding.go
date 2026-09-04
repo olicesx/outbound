@@ -32,6 +32,9 @@ func ApplyPaddingFromPool(p []byte, command byte, userUUID []byte, longPadding b
 
 	prefix = pool.Get(len(userUUID) + 1 + 2 + 2)
 	suffix = pool.Get(int(paddingLen))
+	if paddingLen > 0 {
+		_, _ = fastrand.Read(suffix)
+	}
 	start := 0
 	if userUUID != nil {
 		copy(prefix, userUUID[:])

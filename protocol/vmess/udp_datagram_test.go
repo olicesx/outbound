@@ -80,11 +80,11 @@ func TestReadFromDoesNotSplitLeftoverAsSecondDatagram(t *testing.T) {
 	c.initRead.Do(func() {})
 	first := make([]byte, 4)
 	n, _, err := c.ReadFrom(first)
-	if err != nil {
-		t.Fatalf("first ReadFrom: %v", err)
+	if err != io.ErrShortBuffer {
+		t.Fatalf("first ReadFrom err = %v, want ErrShortBuffer", err)
 	}
-	if n != 4 || string(first) != "abcd" {
-		t.Fatalf("first datagram = %q", first[:n])
+	if n != 0 {
+		t.Fatalf("truncated datagram delivered: n=%d %q", n, first[:n])
 	}
 	second := make([]byte, 16)
 	n, _, err = c.ReadFrom(second)

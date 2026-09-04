@@ -75,6 +75,10 @@ func (c *Conn) Close() error {
 	return c.Conn.Close()
 }
 
+func (c *Conn) CloseWrite() error {
+	return netproxy.ForwardCloseWrite(c.Conn)
+}
+
 func (c *Conn) reqHeaderFromPool() (buf []byte) {
 	reqLen := c.metadata.Len()
 	buf = pool.Get(56 + 2 + 1 + reqLen + 2)

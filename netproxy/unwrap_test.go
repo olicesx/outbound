@@ -1,6 +1,7 @@
 package netproxy
 
 import (
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -124,5 +125,64 @@ func TestUnwrapTCPConn_CycleGuard(t *testing.T) {
 func TestUnwrapTCPConn_Nil(t *testing.T) {
 	if _, ok := UnwrapTCPConn(nil); ok {
 		t.Fatal("expected nil to fail unwrap")
+	}
+}
+
+type testCloseWriteWrapper struct {
+	Conn
+}
+
+func (w *testCloseWriteWrapper) CloseWrite() error {
+	return ForwardCloseWrite(w.Conn)
+}
+
+func TestForwardCloseWriteTCP(t *testing.T) {
+	client, server := tcpPair(t)
+	if err := ForwardCloseWrite(client); err != nil {
+		t.Fatalf("ForwardCloseWrite: %v", err)
+	}
+	buf := make([]byte, 1)
+	n, err := server.Read(buf)
+	if n != 0 || err != io.EOF {
+		t.Fatalf("peer Read = %d, %v, want EOF", n, err)
+	}
+}
+
+func TestForwardCloseWriteViaWrapper(t *testing.T) {
+	client, server := tcpPair(t)
+	w := &testCloseWriteWrapper{Conn: client}
+	if err := w.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
+	}
+	buf := make([]byte, 1)
+	n, err := server.Read(buf)
+	if n != 0 || err != io.EOF {
+		t.Fatalf("peer Read = %d, %v, want EOF", n, err)
+	}
+}
+
+func TestForwardCloseWriteBufferedReaderConn(t *testing.T) {
+	client, server := tcpPair(t)
+	wrapped := NewBufferedReaderConn(client, 0)
+	if err := ForwardCloseWrite(wrapped); err != nil {
+		t.Fatalf("ForwardCloseWrite: %v", err)
+	}
+	buf := make([]byte, 1)
+	n, err := server.Read(buf)
+	if n != 0 || err != io.EOF {
+		t.Fatalf("peer Read = %d, %v, want EOF", n, err)
+	}
+}
+
+func TestForwardCloseWriteProtocolOverBufferedTCP(t *testing.T) {
+	client, server := tcpPair(t)
+	w := &testCloseWriteWrapper{Conn: NewBufferedReaderConn(client, 0)}
+	if err := w.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
+	}
+	buf := make([]byte, 1)
+	n, err := server.Read(buf)
+	if n != 0 || err != io.EOF {
+		t.Fatalf("peer Read = %d, %v, want EOF", n, err)
 	}
 }

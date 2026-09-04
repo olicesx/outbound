@@ -60,7 +60,12 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (netprox
 		// Wrap with a buffered reader so io.ReadFull on chunk headers and
 		// payloads does not each hit the kernel. See BufferedReaderConn docs.
 		conn = netproxy.NewBufferedReaderConn(conn, 0)
-		return NewTCPConn(conn, mdata, d.key, nil)
+		c, err := NewTCPConn(conn, mdata, d.key, nil)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return c, nil
 	case "udp":
 		mdata, err := protocol.ParseMetadata(addr)
 		if err != nil {

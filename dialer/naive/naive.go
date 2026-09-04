@@ -191,6 +191,7 @@ func (d *naiveDialer) dialTCP(ctx context.Context, magicNetwork string, target s
 		return nil, err
 	}
 
+	closeCtx, closeCancel := context.WithCancel(context.Background())
 	return &naiveConn{
 		dialer:            d,
 		h2Conn:            h2Conn,
@@ -199,6 +200,8 @@ func (d *naiveDialer) dialTCP(ctx context.Context, magicNetwork string, target s
 		target:            target,
 		handshakeDeadline: netproxy.CaptureDeadline(ctx),
 		handshakeDone:     make(chan struct{}),
+		closeCtx:          closeCtx,
+		closeCancel:       closeCancel,
 	}, nil
 }
 
@@ -295,36 +298,71 @@ type naiveConn struct {
 	stream            *naiveH2Stream
 	closed            bool
 	closeOnce         sync.Once
+	closeCtx          context.Context
+	closeCancel       context.CancelFunc
+	requestCancel     context.CancelFunc
 }
 
 func (c *naiveConn) newHandshakeContext() (context.Context, context.CancelFunc) {
 	return netproxy.NewDialTimeoutContextWithCapturedDeadline(c.handshakeDeadline)
 }
 
-func (c *naiveConn) handshake(ctx context.Context, firstWrite []byte) (conn *naiveH2Stream, n int, err error) {
+func (c *naiveConn) handshake(handshakeCtx context.Context, firstWrite []byte) (conn *naiveH2Stream, n int, requestCancel context.CancelFunc, err error) {
+	if c.closeCtx == nil {
+		c.closeCtx, c.closeCancel = context.WithCancel(context.Background())
+	}
 	for attempt := 0; attempt < 2; attempt++ {
-		req, pw, reqErr := c.dialer.newConnectRequest(ctx, c.target)
+		// Bind CONNECT to the conn lifetime, not the handshake budget.
+		// Cancelling the handshake ctx after RoundTrip would RST_STREAM(CANCEL)
+		// a published stream (see protocol/http connectHttp2).
+		requestCtx, cancelRequest := context.WithCancel(c.closeCtx)
+		req, pw, reqErr := c.dialer.newConnectRequest(requestCtx, c.target)
 		if reqErr != nil {
-			return nil, 0, reqErr
+			cancelRequest()
+			return nil, 0, nil, reqErr
+		}
+
+		var stopWatch func() bool
+		if handshakeCtx != nil {
+			stopWatch = context.AfterFunc(handshakeCtx, cancelRequest)
 		}
 
 		resp, roundTripErr := c.h2Conn.RoundTrip(req)
+		handshakeCancelled := stopWatch != nil && !stopWatch()
 		if roundTripErr != nil {
+			cancelRequest()
 			_ = pw.CloseWithError(roundTripErr)
+			if handshakeCancelled {
+				if handshakeCtx.Err() != nil {
+					return nil, 0, nil, handshakeCtx.Err()
+				}
+				return nil, 0, nil, fmt.Errorf("naive CONNECT: %w", roundTripErr)
+			}
 			if attempt == 0 && shouldRetryNaiveRoundTrip(roundTripErr) {
-				if refreshErr := c.refreshClientConn(ctx); refreshErr == nil {
+				if refreshErr := c.refreshClientConn(handshakeCtx); refreshErr == nil {
 					continue
 				} else {
-					return nil, 0, fmt.Errorf("naive CONNECT retry failed after %v: %w", roundTripErr, refreshErr)
+					return nil, 0, nil, fmt.Errorf("naive CONNECT retry failed after %v: %w", roundTripErr, refreshErr)
 				}
 			}
-			return nil, 0, fmt.Errorf("naive CONNECT: %w", roundTripErr)
+			return nil, 0, nil, fmt.Errorf("naive CONNECT: %w", roundTripErr)
+		}
+
+		if handshakeCancelled {
+			cancelRequest()
+			_ = pw.Close()
+			_ = resp.Body.Close()
+			if handshakeCtx.Err() != nil {
+				return nil, 0, nil, handshakeCtx.Err()
+			}
+			return nil, 0, nil, fmt.Errorf("naive CONNECT: handshake cancelled")
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			cancelRequest()
 			_ = pw.Close()
 			_ = resp.Body.Close()
-			return nil, 0, fmt.Errorf("naive CONNECT failed: %v", resp.Status)
+			return nil, 0, nil, fmt.Errorf("naive CONNECT failed: %v", resp.Status)
 		}
 
 		paddingSupported := resp.Header.Get(paddingHeaderKey) != ""
@@ -338,15 +376,16 @@ func (c *naiveConn) handshake(ctx context.Context, firstWrite []byte) (conn *nai
 		if len(firstWrite) > 0 {
 			n, err = stream.Write(firstWrite)
 			if err != nil {
+				cancelRequest()
 				_ = stream.Close()
-				return nil, n, err
+				return nil, n, nil, err
 			}
 		}
 
-		return stream, n, nil
+		return stream, n, cancelRequest, nil
 	}
 
-	return nil, 0, fmt.Errorf("naive CONNECT: exhausted retries")
+	return nil, 0, nil, fmt.Errorf("naive CONNECT: exhausted retries")
 }
 
 func (c *naiveConn) refreshClientConn(ctx context.Context) error {
@@ -390,18 +429,26 @@ func (c *naiveConn) ensureHandshake(firstWrite []byte) (stream *naiveH2Stream, f
 		c.stateMu.Unlock()
 
 		handshakeCtx, cancel := c.newHandshakeContext()
-		stream, firstWriteN, err = c.handshake(handshakeCtx, firstWrite)
+		var requestCancel context.CancelFunc
+		stream, firstWriteN, requestCancel, err = c.handshake(handshakeCtx, firstWrite)
 		cancel()
 
 		c.stateMu.Lock()
-		if c.closed && stream != nil {
-			_ = stream.Close()
-			stream = nil
+		if c.closed {
+			if stream != nil {
+				_ = stream.Close()
+				stream = nil
+			}
+			if requestCancel != nil {
+				requestCancel()
+				requestCancel = nil
+			}
 			if err == nil {
 				err = net.ErrClosed
 			}
 		}
 		c.stream = stream
+		c.requestCancel = requestCancel
 		c.handshakeErr = err
 		close(done)
 		c.stateMu.Unlock()
@@ -451,10 +498,18 @@ func (c *naiveConn) Close() error {
 		c.stateMu.Lock()
 		c.closed = true
 		stream := c.stream
+		requestCancel := c.requestCancel
+		c.requestCancel = nil
 		c.stateMu.Unlock()
 
 		if stream != nil {
 			err = stream.Close()
+		}
+		if requestCancel != nil {
+			requestCancel()
+		}
+		if c.closeCancel != nil {
+			c.closeCancel()
 		}
 	})
 	return err

@@ -349,8 +349,14 @@ func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
 	if !c.checkContextAndSetWriteDeadline() {
 		return 0, io.EOF
 	}
-	_, err = c.Write(packet)
-	return len(b), err
+	n, err := c.Write(packet)
+	if err != nil {
+		return 0, err
+	}
+	if n < len(packet) {
+		return 0, io.ErrShortWrite
+	}
+	return len(b), nil
 }
 
 func (c *UdpConn) writeToChacha(b []byte, addr string) (int, error) {
@@ -415,8 +421,14 @@ func (c *UdpConn) writeToChacha(b []byte, addr string) (int, error) {
 	if !c.checkContextAndSetWriteDeadline() {
 		return 0, io.EOF
 	}
-	_, err = c.Write(packet)
-	return len(b), err
+	n, err := c.Write(packet)
+	if err != nil {
+		return 0, err
+	}
+	if n < len(packet) {
+		return 0, io.ErrShortWrite
+	}
+	return len(b), nil
 }
 
 func (c *UdpConn) targetAddrInfo(addr string) (socks5.AddressInfo, error) {

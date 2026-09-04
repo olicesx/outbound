@@ -23,6 +23,10 @@ type TcpConn struct {
 	writeMutex  sync.Mutex
 }
 
+func (c *TcpConn) CloseWrite() error {
+	return netproxy.ForwardCloseWrite(c.Conn)
+}
+
 func NewTcpConn(c netproxy.Conn, cipher *ciphers.StreamCipher) *TcpConn {
 	return &TcpConn{
 		Conn:   c,
@@ -115,6 +119,11 @@ func (c *TcpConn) Write(b []byte) (n int, err error) {
 		}); ok {
 			innerConn.SetAddrLen(lenToWrite)
 		}
+	} else {
+		buf := pool.Get(len(b))
+		defer pool.Put(buf)
+		copy(buf, b)
+		b = buf
 	}
 	c.cipher.Encrypt(b[ivLen:], b[ivLen:])
 	if _, err = iout.WriteFull(c.Conn, b); err != nil {

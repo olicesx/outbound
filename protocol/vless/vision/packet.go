@@ -108,7 +108,7 @@ func (c *PacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) 
 			if _, discardErr := io.CopyN(io.Discard, c.Conn, int64(length)); discardErr != nil {
 				return 0, netip.AddrPort{}, discardErr
 			}
-			return 0, netip.AddrPort{}, fmt.Errorf("buffer too small")
+			return 0, netip.AddrPort{}, io.ErrShortBuffer
 		}
 
 		n, err = io.ReadFull(c.Conn, p[:length])

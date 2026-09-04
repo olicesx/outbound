@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 
@@ -106,13 +107,28 @@ func (c *conn) Read(p []byte) (int, error) {
 	defer c.readMu.Unlock()
 
 	if !c.headerRead {
+		if err := discardResponseHeader(c.reader); err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				return 0, err
+			}
+			var to interface{ Timeout() bool }
+			if errors.As(err, &to) && to.Timeout() {
+				return 0, err
+			}
+			c.headerRead = true
+			c.readErr = err
+			return 0, err
+		}
 		c.headerRead = true
-		c.readErr = discardResponseHeader(c.reader)
 	}
 	if c.readErr != nil {
 		return 0, c.readErr
 	}
 	return c.reader.Read(p)
+}
+
+func (c *conn) CloseWrite() error {
+	return netproxy.ForwardCloseWrite(c.Conn)
 }
 
 func (c *conn) Write(p []byte) (int, error) {

@@ -33,10 +33,11 @@ type stream struct {
 	readMutex  sync.Mutex
 	enqueueMu  sync.RWMutex
 
-	closed   atomic.Bool
-	closeCh  chan struct{}
-	closeMu  sync.Mutex
-	closeErr error
+	closed      atomic.Bool
+	writeClosed atomic.Bool
+	closeCh     chan struct{}
+	closeMu     sync.Mutex
+	closeErr    error
 
 	readDeadline    atomic.Int64
 	writeDeadline   atomic.Int64
@@ -83,7 +84,7 @@ func (c *stream) enqueue(chunk pool.PB) error {
 }
 
 func (c *stream) Write(b []byte) (n int, err error) {
-	if c.closed.Load() {
+	if c.closed.Load() || c.writeClosed.Load() {
 		return 0, net.ErrClosed
 	}
 	if len(b) == 0 {
@@ -91,7 +92,7 @@ func (c *stream) Write(b []byte) (n int, err error) {
 	}
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
-	if c.closed.Load() {
+	if c.closed.Load() || c.writeClosed.Load() {
 		return 0, net.ErrClosed
 	}
 
@@ -200,6 +201,23 @@ func (c *stream) Close() error {
 	return c.closeLocal(true, net.ErrClosed)
 }
 
+func (c *stream) CloseWrite() error {
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	if !c.writeClosed.CompareAndSwap(false, true) {
+		return nil
+	}
+	c.writeMutex.Lock()
+	defer c.writeMutex.Unlock()
+	if c.session.closed.Load() {
+		return net.ErrClosed
+	}
+	frame := newFrame(cmdFIN, c.id)
+	_, err := writeFrame(c.session, frame)
+	return err
+}
+
 func (c *stream) closeLocal(sendFIN bool, err error) error {
 	c.closeMu.Lock()
 	if !c.closed.CompareAndSwap(false, true) {
@@ -237,7 +255,7 @@ drainLoop:
 	// prevent the underlying connection from being closed.
 	if sendFIN {
 		c.writeMutex.Lock()
-		if !c.session.closed.Load() {
+		if c.writeClosed.CompareAndSwap(false, true) && !c.session.closed.Load() {
 			frame := newFrame(cmdFIN, c.id)
 			_, _ = writeFrame(c.session, frame)
 		}

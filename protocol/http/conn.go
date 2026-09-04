@@ -711,6 +711,20 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 	return conn.Read(b)
 }
 
+func (c *Conn) CloseWrite() error {
+	conn, h2 := c.currentConn()
+	if conn == nil {
+		return nil
+	}
+	if h2 {
+		if wc, ok := conn.(netproxy.WriteCloser); ok {
+			return wc.CloseWrite()
+		}
+		return nil
+	}
+	return netproxy.ForwardCloseWrite(conn)
+}
+
 func (c *Conn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
@@ -757,6 +771,10 @@ func (p *prefixedConn) Read(b []byte) (n int, err error) {
 	return p.Conn.Read(b)
 }
 
+func (p *prefixedConn) CloseWrite() error {
+	return netproxy.ForwardCloseWrite(p.Conn)
+}
+
 type http2Conn struct {
 	net.Conn
 	in        *io.PipeWriter
@@ -772,6 +790,13 @@ func (h *http2Conn) Read(p []byte) (n int, err error) {
 
 func (h *http2Conn) Write(p []byte) (n int, err error) {
 	return h.in.Write(p)
+}
+
+func (h *http2Conn) CloseWrite() error {
+	if h.in == nil {
+		return nil
+	}
+	return h.in.Close()
 }
 
 func (h *http2Conn) Close() error {

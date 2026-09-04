@@ -14,6 +14,7 @@ import (
 	"github.com/daeuniverse/outbound/ciphers"
 	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/common/iout"
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/shadowsocks"
@@ -95,6 +96,10 @@ func (c *TCPConn) getContext() context.Context {
 		return c.ctx
 	}
 	return context.Background()
+}
+
+func (c *TCPConn) CloseWrite() error {
+	return netproxy.ForwardCloseWrite(c.Conn)
 }
 
 func (c *TCPConn) Close() error {

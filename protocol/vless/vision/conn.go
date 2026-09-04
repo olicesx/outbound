@@ -98,6 +98,18 @@ func (vc *Conn) Read(b []byte) (int, error) {
 	return vc.read(b)
 }
 
+func (vc *Conn) CloseWrite() error {
+	vc.muWrite.Lock()
+	defer vc.muWrite.Unlock()
+	if vc.toWriteDirect {
+		if tcp, ok := vc.Conn.(*net.TCPConn); ok {
+			return tcp.CloseWrite()
+		}
+		return nil
+	}
+	return netproxy.ForwardCloseWrite(vc.overlayConn)
+}
+
 func isTCPConnUnixConn(conn any) bool {
 	if _, ok := conn.(*net.TCPConn); ok {
 		return true

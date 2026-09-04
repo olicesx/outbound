@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestConnWritesOneRequestHeaderAndStripsOneResponseHeader(t *testing.T) {
@@ -81,6 +82,32 @@ func TestConnRejectsOversizedResponseHeader(t *testing.T) {
 	_, err := client.Read(make([]byte, 1))
 	if !errors.Is(err, errResponseHeaderTooLarge) {
 		t.Fatalf("Read() error = %v, want errResponseHeaderTooLarge", err)
+	}
+}
+
+func TestConnReadDeadlineDoesNotStickHeaderError(t *testing.T) {
+	clientRaw, server := net.Pipe()
+	defer server.Close()
+	client := newConn(clientRaw, defaultHost, "/")
+	defer client.Close()
+
+	_ = client.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	_, err := client.Read(make([]byte, 4))
+	if err == nil {
+		t.Fatal("expected read deadline")
+	}
+
+	_ = client.SetReadDeadline(time.Time{})
+	go func() {
+		_, _ = io.WriteString(server, "HTTP/1.1 200 OK\r\n\r\nbody")
+	}()
+	buf := make([]byte, 4)
+	n, err := client.Read(buf)
+	if err != nil {
+		t.Fatalf("Read after clearing deadline: %v (sticky header error?)", err)
+	}
+	if string(buf[:n]) != "body" {
+		t.Fatalf("Read() = %q, want body", buf[:n])
 	}
 }
 

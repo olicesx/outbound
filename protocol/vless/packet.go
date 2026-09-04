@@ -2,7 +2,6 @@ package vless
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
 	"net/netip"
 
@@ -24,7 +23,7 @@ func (c *Conn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 		if _, discardErr := io.CopyN(io.Discard, &netproxy.ReadWrapper{ReadFunc: c.read}, int64(length)); discardErr != nil {
 			return 0, netip.AddrPort{}, discardErr
 		}
-		return 0, netip.AddrPort{}, fmt.Errorf("buf size is not enough")
+		return 0, netip.AddrPort{}, io.ErrShortBuffer
 	}
 	n, err = io.ReadFull(&netproxy.ReadWrapper{ReadFunc: c.read}, p[:length])
 	return n, addr, err

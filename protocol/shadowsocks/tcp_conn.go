@@ -121,6 +121,10 @@ func NewTCPConn(conn netproxy.Conn, metadata protocol.Metadata, masterKey []byte
 	return &c, nil
 }
 
+func (c *TCPConn) CloseWrite() error {
+	return netproxy.ForwardCloseWrite(c.Conn)
+}
+
 func (c *TCPConn) Close() error {
 	err := c.Conn.Close()
 

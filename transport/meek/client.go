@@ -17,6 +17,8 @@ type assemblerClient struct {
 	config *config
 }
 
+const maxFailedPolls = 8
+
 func newAssemblerClient(tripper Tripper, config *config) *assemblerClient {
 	return &assemblerClient{
 		tripper: tripper,
@@ -141,12 +143,18 @@ func (s *assemblerClientSession) runOnce() {
 		if len(data) != 0 {
 			pollConnection = false
 		}
+		failedPolls := 0
 		for {
 			ctx, cancel := netproxy.NewDialTimeoutContextFrom(s.ctx)
 			resp, err := s.tripper.RoundTrip(ctx, Request{Data: data, ConnectionTag: s.sessionID})
 			cancel()
 			if err != nil {
-				if ctx.Err() != nil {
+				if s.ctx.Err() != nil {
+					return
+				}
+				failedPolls++
+				if failedPolls >= maxFailedPolls {
+					s.finish()
 					return
 				}
 				time.Sleep(time.Millisecond * time.Duration(s.assembler.config.FailedRetryIntervalMs))
@@ -182,7 +190,7 @@ func (s *assemblerClientSession) Read(p []byte) (n int, err error) {
 	for s.readBuffer.Len() == 0 {
 		select {
 		case <-s.ctx.Done():
-			return 0, s.ctx.Err()
+			return 0, io.EOF
 		case data := <-s.readerChan:
 			s.readBuffer.Write(data)
 		}

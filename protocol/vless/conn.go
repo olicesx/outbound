@@ -91,6 +91,10 @@ func (c *Conn) IntrinsicConn() netproxy.Conn {
 	return c.Conn
 }
 
+func (c *Conn) CloseWrite() error {
+	return netproxy.ForwardCloseWrite(c.Conn)
+}
+
 // reqHeader builds the request header into a small pooled buffer. The payload
 // is written separately via net.Buffers so a large payload cannot inflate this
 // buffer past the pool's largest bucket (the same cliff anytls hit).

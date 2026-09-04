@@ -141,12 +141,20 @@ func (b *BufferedReaderConn) IntrinsicConn() Conn {
 }
 
 // UnderlyingConn returns the wrapped Conn for callers (e.g. dae's relay
-// unwrap path) that need direct access to the raw socket.
+// unwrap path) that need direct access to the raw socket. Do not fall back
+// to b.Conn itself: splicing through a bufio.Reader would skip unread bytes.
 func (b *BufferedReaderConn) UnderlyingConn() net.Conn {
 	if u, ok := b.Conn.(interface{ UnderlyingConn() net.Conn }); ok {
 		return u.UnderlyingConn()
 	}
 	return nil
+}
+
+// CloseWrite forwards half-close to the inner conn. WriteCloser is not on
+// the Conn interface, so embedding does not promote it; without this method
+// protocol CloseWrite adapters stop at the buffered layer on plain TCP.
+func (b *BufferedReaderConn) CloseWrite() error {
+	return ForwardCloseWrite(b.Conn)
 }
 
 // readerOf adapts a netproxy.Conn to an io.Reader for bufio by stripping the

@@ -32,6 +32,10 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 	return c.reader.Read(p)
 }
 
+func (c *bufferedConn) CloseWrite() error {
+	return netproxy.ForwardCloseWrite(c.Conn)
+}
+
 func (t *Dialer) UnwrapDialer() netproxy.Dialer {
 	return t.nextDialer
 }

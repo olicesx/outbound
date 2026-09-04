@@ -98,6 +98,7 @@ type ClientConn struct {
 	// goroutine whose buffered(1) result channel nobody drains anymore).
 	recvCh   chan RecvResp
 	pumpOnce sync.Once
+	recvErr  error
 
 	deadlineMu    sync.Mutex
 	readDeadline  *time.Timer
@@ -184,6 +185,9 @@ func (c *ClientConn) Read(p []byte) (n int, err error) {
 
 	c.muReading.Lock()
 	defer c.muReading.Unlock()
+	if c.recvErr != nil {
+		return 0, c.recvErr
+	}
 	// Refresh after acquiring the read lock so deadline changes made while
 	// this operation waited for another reader apply to the pending I/O.
 	ctxRead = c.readCtx()
@@ -207,6 +211,7 @@ func (c *ClientConn) Read(p []byte) (n int, err error) {
 			if code := status.Code(err); code == codes.Unavailable || status.Code(err) == codes.OutOfRange {
 				err = io.EOF
 			}
+			c.recvErr = err
 			return 0, err
 		}
 		n = copy(p, recvResp.hunk.Data)
@@ -430,12 +435,23 @@ func (d *Dialer) DialContext(ctx context.Context, network string, address string
 	if serviceName == "" {
 		serviceName = "GunService"
 	}
-	// ctx is the lifetime of the tun
+	// Stream lifetime is independent of the dial ctx (dae cancels dial ctx
+	// after Dial returns). Honor the caller ctx only while Tun is opening.
 	ctxStream, streamCloser := context.WithCancel(context.Background())
+	stopWatch := context.AfterFunc(ctx, streamCloser)
 	tun, err := clientX.TunCustomName(ctxStream, serviceName)
 	if err != nil {
+		_ = stopWatch()
 		streamCloser()
 		return nil, err
+	}
+	if !stopWatch() {
+		streamCloser()
+		_ = tun.CloseSend()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, context.Canceled
 	}
 	return NewClientConn(tun, streamCloser), nil
 }

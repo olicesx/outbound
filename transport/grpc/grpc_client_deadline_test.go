@@ -38,6 +38,35 @@ func newStubTun(recvCh chan *proto.Hunk) *stubTun {
 	return &stubTun{recvCh: recvCh, done: make(chan struct{})}
 }
 
+func TestReadMemoizesRecvError(t *testing.T) {
+	tun := &errOnceTun{err: io.ErrUnexpectedEOF}
+	c := NewClientConn(tun, func() {})
+	defer func() { _ = c.Close() }()
+
+	buf := make([]byte, 8)
+	_, err := c.Read(buf)
+	if err == nil {
+		t.Fatal("first Read expected error")
+	}
+	start := time.Now()
+	_, err2 := c.Read(buf)
+	if time.Since(start) > 200*time.Millisecond {
+		t.Fatal("second Read blocked after terminal recv error")
+	}
+	if err2 == nil {
+		t.Fatal("second Read expected memoized error")
+	}
+}
+
+type errOnceTun struct {
+	grpc.ClientStream
+	err error
+}
+
+func (s *errOnceTun) Recv() (*proto.Hunk, error) { return nil, s.err }
+func (s *errOnceTun) Send(*proto.Hunk) error     { return nil }
+func (s *errOnceTun) CloseSend() error           { return nil }
+
 func TestPendingReadUsesExtendedDeadline(t *testing.T) {
 	tun := newStubTun(make(chan *proto.Hunk, 1))
 	c := NewClientConn(tun, func() { _ = tun.CloseSend() })

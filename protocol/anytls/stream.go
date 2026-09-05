@@ -142,8 +142,16 @@ func (c *stream) nextChunkLocked() (pool.PB, error) {
 			return chunk, nil
 		default:
 		}
-		if err := c.closedError(); err != nil {
-			return nil, err
+		if c.closed.Load() {
+			// A close may race an enqueue admitted before the close signal.
+			c.enqueueMu.Lock()
+			c.enqueueMu.Unlock()
+			select {
+			case chunk := <-c.inbound:
+				return chunk, nil
+			default:
+				return nil, c.closedError()
+			}
 		}
 
 		deadline := unixNanoToTime(c.readDeadline.Load())
@@ -159,12 +167,7 @@ func (c *stream) nextChunkLocked() (pool.PB, error) {
 				return chunk, nil
 			case <-c.closeCh:
 				stopTimer(timer)
-				select {
-				case chunk := <-c.inbound:
-					return chunk, nil
-				default:
-				}
-				return nil, c.closedError()
+				continue
 			case <-c.deadlineChanged:
 				stopTimer(timer)
 				continue
@@ -177,7 +180,7 @@ func (c *stream) nextChunkLocked() (pool.PB, error) {
 		case chunk := <-c.inbound:
 			return chunk, nil
 		case <-c.closeCh:
-			return nil, c.closedError()
+			continue
 		case <-c.deadlineChanged:
 			continue
 		}
@@ -194,7 +197,9 @@ func stopTimer(timer *time.Timer) {
 }
 
 func (c *stream) remoteClose() error {
-	return c.closeLocal(false, io.EOF)
+	c.markClosed(io.EOF)
+	c.removeStream(c.id)
+	return nil
 }
 
 func (c *stream) Close() error {
@@ -218,26 +223,32 @@ func (c *stream) CloseWrite() error {
 	return err
 }
 
-func (c *stream) closeLocal(sendFIN bool, err error) error {
+// markClosed stops new I/O but leaves received buffers owned by the reader.
+// Only local Close discards unread data; remote and session closes allow draining.
+func (c *stream) markClosed(err error) bool {
 	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
 	if !c.closed.CompareAndSwap(false, true) {
-		c.closeMu.Unlock()
-		return nil
+		return false
 	}
 	c.closeErr = err
 	close(c.closeCh)
-	c.closeMu.Unlock()
+	return true
+}
 
-	// Closing closeCh releases blocked enqueues. The write lock then ensures
-	// every admitted enqueue finishes before the inbound queue is drained.
+func (c *stream) closeLocal(sendFIN bool, err error) error {
+	firstClose := c.markClosed(err)
+
+	// Closing closeCh releases blocked enqueues. Wait for every admitted
+	// enqueue before taking readMutex, which readers hold while draining.
 	c.enqueueMu.Lock()
+	c.enqueueMu.Unlock()
 	c.readMutex.Lock()
 	if c.readBufPB != nil {
 		pool.Put(c.readBufPB)
 		c.readBufPB = nil
 		c.readBuf = nil
 	}
-	c.readMutex.Unlock()
 
 drainLoop:
 	for {
@@ -248,12 +259,12 @@ drainLoop:
 			break drainLoop
 		}
 	}
-	c.enqueueMu.Unlock()
+	c.readMutex.Unlock()
 
 	// A locally generated FIN must follow every write that started before Close.
 	// Session and remote closes skip this lock so a blocked transport write cannot
 	// prevent the underlying connection from being closed.
-	if sendFIN {
+	if sendFIN && firstClose {
 		c.writeMutex.Lock()
 		if c.writeClosed.CompareAndSwap(false, true) && !c.session.closed.Load() {
 			frame := newFrame(cmdFIN, c.id)

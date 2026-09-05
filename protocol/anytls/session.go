@@ -327,7 +327,7 @@ func (s *session) Close() error {
 		s.activeStreams.Store(0)
 		s.streamLock.Unlock()
 		for _, stream := range streams {
-			_ = stream.closeLocal(false, net.ErrClosed)
+			stream.markClosed(net.ErrClosed)
 		}
 		_ = s.conn.Close()
 		s.connLock.Lock()

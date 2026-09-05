@@ -226,6 +226,9 @@ func ParseSSURL(u string) (data *Shadowsocks, err error) {
 			return v, nil
 		}
 		// Decode base64 and unmarshal to VmessInfo
+		if len(content) < len("ss://") {
+			return nil, fmt.Errorf("%w: unrecognized ss address", dialer.InvalidParameterErr)
+		}
 		t := content[5:]
 		var l, r string
 		if ind := strings.Index(t, "#"); ind > -1 {

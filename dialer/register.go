@@ -23,9 +23,17 @@ import (
 // Chain cleanup excludes the borrowed base and closes each distinct owned result once.
 type FromLinkCreator func(gOption *ExtraOption, nextDialer netproxy.Dialer, link string) (dialer netproxy.Dialer, property *Property, err error)
 
-var fromLinkCreators = make(map[string]FromLinkCreator)
+var (
+	fromLinkCreatorsMu sync.RWMutex
+	fromLinkCreators   = make(map[string]FromLinkCreator)
+)
 
+// FromLinkRegister installs a link-scheme constructor. Registration
+// typically happens in init(), but the map is guarded so runtime
+// registration (plugin-style node sources) cannot race the lookup below.
 func FromLinkRegister(name string, creator FromLinkCreator) {
+	fromLinkCreatorsMu.Lock()
+	defer fromLinkCreatorsMu.Unlock()
 	fromLinkCreators[name] = creator
 }
 
@@ -56,7 +64,9 @@ func NewNetproxyDialerFromLink(d netproxy.Dialer, gOption *ExtraOption, link str
 		if err != nil {
 			return nil, nil, err
 		}
+		fromLinkCreatorsMu.RLock()
 		creator, ok := fromLinkCreators[scheme]
+		fromLinkCreatorsMu.RUnlock()
 		if !ok {
 			return nil, nil, fmt.Errorf("unexpected link type: %v", scheme)
 		}

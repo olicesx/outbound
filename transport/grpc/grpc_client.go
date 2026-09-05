@@ -270,30 +270,46 @@ func (c *ClientConn) Write(p []byte) (n int, err error) {
 	}
 }
 
-// armDeadline replaces the timer in slot with one that cancels the matching
-// context half at t. Callers must hold deadlineMu.
-func (c *ClientConn) armDeadline(slot **time.Timer, t time.Time, done <-chan struct{}, cancel context.CancelFunc) {
+// setDeadlineLocked updates one direction while preserving the context used by
+// pending I/O. Only an expired context needs replacing. Caller holds deadlineMu.
+func (c *ClientConn) setDeadlineLocked(slot **time.Timer, ctx *context.Context, cancel *func(), t time.Time) {
 	if *slot != nil {
 		(*slot).Stop()
+		*slot = nil
 	}
-	*slot = time.AfterFunc(time.Until(t), func() {
+	if !t.IsZero() && !t.After(time.Now()) {
+		(*cancel)()
+		return
+	}
+	if (*ctx).Err() != nil {
+		*ctx, *cancel = context.WithCancel(context.Background())
+	}
+	if t.IsZero() {
+		return
+	}
+	cancelDeadline := *cancel
+	var timer *time.Timer
+	timer = time.AfterFunc(time.Until(t), func() {
 		c.deadlineMu.Lock()
 		defer c.deadlineMu.Unlock()
-		select {
-		case <-done:
-		default:
-			cancel()
+		// Stop does not wait for a callback already blocked on deadlineMu.
+		// The slot identity prevents that old epoch from cancelling new I/O.
+		if *slot == timer {
+			cancelDeadline()
 		}
 	})
+	*slot = timer
 }
 
 func (c *ClientConn) Close() error {
 	c.deadlineMu.Lock()
 	if c.readDeadline != nil {
 		c.readDeadline.Stop()
+		c.readDeadline = nil
 	}
 	if c.writeDeadline != nil {
 		c.writeDeadline.Stop()
+		c.writeDeadline = nil
 	}
 	c.deadlineMu.Unlock()
 	select {
@@ -304,6 +320,7 @@ func (c *ClientConn) Close() error {
 	c.closer()
 	return nil
 }
+
 func (c *ClientConn) CloseWrite() error {
 	return c.tun.CloseSend()
 }
@@ -311,99 +328,22 @@ func (c *ClientConn) CloseWrite() error {
 func (c *ClientConn) SetDeadline(t time.Time) error {
 	c.deadlineMu.Lock()
 	defer c.deadlineMu.Unlock()
-	if now := time.Now(); t.After(now) {
-		// refresh the deadline if the deadline has been exceeded
-		select {
-		case <-c.ctxRead.Done():
-			c.ctxRead, c.cancelRead = context.WithCancel(context.Background())
-
-		default:
-		}
-		select {
-		case <-c.ctxWrite.Done():
-			c.ctxWrite, c.cancelWrite = context.WithCancel(context.Background())
-		default:
-		}
-		// reset the deadline timers
-		c.armDeadline(&c.readDeadline, t, c.ctxRead.Done(), c.cancelRead)
-		c.armDeadline(&c.writeDeadline, t, c.ctxWrite.Done(), c.cancelWrite)
-	} else {
-		select {
-		case <-c.ctxRead.Done():
-		default:
-			c.cancelRead()
-		}
-		select {
-		case <-c.ctxWrite.Done():
-		default:
-			c.cancelWrite()
-		}
-	}
+	c.setDeadlineLocked(&c.readDeadline, &c.ctxRead, &c.cancelRead, t)
+	c.setDeadlineLocked(&c.writeDeadline, &c.ctxWrite, &c.cancelWrite, t)
 	return nil
 }
 
 func (c *ClientConn) SetReadDeadline(t time.Time) error {
 	c.deadlineMu.Lock()
 	defer c.deadlineMu.Unlock()
-	if now := time.Now(); t.After(now) {
-		// refresh the deadline if the deadline has been exceeded
-		select {
-		case <-c.ctxRead.Done():
-			c.ctxRead, c.cancelRead = context.WithCancel(context.Background())
-		default:
-		}
-		// reset the deadline timer
-		if c.readDeadline != nil {
-			c.readDeadline.Stop()
-		}
-		c.readDeadline = time.AfterFunc(t.Sub(now), func() {
-			c.deadlineMu.Lock()
-			defer c.deadlineMu.Unlock()
-			select {
-			case <-c.ctxRead.Done():
-			default:
-				c.cancelRead()
-			}
-		})
-	} else {
-		select {
-		case <-c.ctxRead.Done():
-		default:
-			c.cancelRead()
-		}
-	}
+	c.setDeadlineLocked(&c.readDeadline, &c.ctxRead, &c.cancelRead, t)
 	return nil
 }
 
 func (c *ClientConn) SetWriteDeadline(t time.Time) error {
 	c.deadlineMu.Lock()
 	defer c.deadlineMu.Unlock()
-	if now := time.Now(); t.After(now) {
-		// refresh the deadline if the deadline has been exceeded
-		select {
-		case <-c.ctxWrite.Done():
-			c.ctxWrite, c.cancelWrite = context.WithCancel(context.Background())
-		default:
-		}
-		if c.writeDeadline != nil {
-			c.writeDeadline.Stop()
-		}
-		c.writeDeadline = time.AfterFunc(t.Sub(now), func() {
-			c.deadlineMu.Lock()
-			defer c.deadlineMu.Unlock()
-			select {
-			case <-c.ctxWrite.Done():
-			default:
-				c.cancelWrite()
-			}
-		})
-	} else {
-		select {
-		case <-c.ctxWrite.Done():
-		default:
-			c.cancelWrite()
-		}
-	}
+	c.setDeadlineLocked(&c.writeDeadline, &c.ctxWrite, &c.cancelWrite, t)
 	return nil
 }
 

@@ -6,13 +6,21 @@
 package dialer
 
 import (
+	"context"
+	stderrors "errors"
 	"fmt"
+	"io"
+	"net"
+	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
+// FromLinkCreator constructs a dialer from a link and may return nextDialer unchanged.
+// Chain cleanup excludes the borrowed base and closes each distinct owned result once.
 type FromLinkCreator func(gOption *ExtraOption, nextDialer netproxy.Dialer, link string) (dialer netproxy.Dialer, property *Property, err error)
 
 var fromLinkCreators = make(map[string]FromLinkCreator)
@@ -31,7 +39,18 @@ func NewNetproxyDialerFromLink(d netproxy.Dialer, gOption *ExtraOption, link str
 		Protocol: "",
 		Link:     linklike,
 	}
+	base := d
+	var owned []io.Closer
+	var ownsIntermediate, transferred bool
+	defer func() {
+		if !transferred {
+			_ = closeDialerLayers(owned)
+		}
+	}()
 	for i := len(links) - 1; i >= 0; i-- {
+		if i == 0 {
+			ownsIntermediate = len(owned) > 0
+		}
 		link := strings.TrimSpace(links[i])
 		scheme, err := linkScheme(link)
 		if err != nil {
@@ -45,6 +64,9 @@ func NewNetproxyDialerFromLink(d netproxy.Dialer, gOption *ExtraOption, link str
 		d, _property, err = creator(gOption, d, link)
 		if err != nil {
 			return nil, nil, fmt.Errorf("create %v: %w", link, err)
+		}
+		if closer, ok := d.(io.Closer); ok && !knownChainDialer(d, base, owned) {
+			owned = append(owned, closer)
 		}
 		if p.Name == "" {
 			p.Name = _property.Name
@@ -65,7 +87,116 @@ func NewNetproxyDialerFromLink(d netproxy.Dialer, gOption *ExtraOption, link str
 	if overwrittenName != "" {
 		p.Name = overwrittenName
 	}
+	if ownsIntermediate {
+		// Wrap only after construction: creators may require concrete types in
+		// their internal transport chain. Single links keep their original type.
+		d = wrapOwnedChain(&ownedChainDialer{Dialer: d, owned: owned})
+	}
+	transferred = true
 	return d, p, nil
+}
+
+// knownChainDialer uses the comparable identity of the library's pointer dialers.
+// Guard custom value types so interface comparisons cannot panic.
+func knownChainDialer(d, base netproxy.Dialer, owned []io.Closer) bool {
+	if !reflect.ValueOf(d).Comparable() {
+		return false
+	}
+	if d == base {
+		return true
+	}
+	for _, previous := range owned {
+		if any(d) == any(previous) {
+			return true
+		}
+	}
+	return false
+}
+
+// ownedChainDialer owns only constructor results, never the borrowed base.
+type ownedChainDialer struct {
+	netproxy.Dialer
+	owned     []io.Closer
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (d *ownedChainDialer) Close() error {
+	d.closeOnce.Do(func() { d.closeErr = closeDialerLayers(d.owned) })
+	return d.closeErr
+}
+
+func closeDialerLayers(owned []io.Closer) error {
+	var err error
+	for i := len(owned) - 1; i >= 0; i-- {
+		err = stderrors.Join(err, owned[i].Close())
+	}
+	return err
+}
+
+type chainIPLookupDialer interface {
+	LookupIPAddr(context.Context, string, string) ([]net.IPAddr, error)
+}
+
+// chainUnwrapTop satisfies netproxy.DialerUnwrapper by exposing the wrapped
+// original top itself, following the standard wrapper contract. The original
+// top keeps its own deeper unwrap results reachable from that hop.
+type chainUnwrapTop struct{ top netproxy.Dialer }
+
+func (u chainUnwrapTop) UnwrapDialer() netproxy.Dialer { return u.top }
+
+// Preserve only the optional interfaces the original top actually implements.
+// Unwrap exposes the original top; namespace and lookup embed the original
+// providers so their results are forwarded unchanged.
+func wrapOwnedChain(chain *ownedChainDialer) netproxy.Dialer {
+	_, hasUnwrap := chain.Dialer.(netproxy.DialerUnwrapper)
+	u := chainUnwrapTop{top: chain.Dialer}
+	n, hasNamespace := chain.Dialer.(netproxy.TransportCacheNamespaceProvider)
+	l, hasLookup := chain.Dialer.(chainIPLookupDialer)
+	switch {
+	case hasUnwrap && hasNamespace && hasLookup:
+		return &struct {
+			*ownedChainDialer
+			netproxy.DialerUnwrapper
+			netproxy.TransportCacheNamespaceProvider
+			chainIPLookupDialer
+		}{chain, u, n, l}
+	case hasUnwrap && hasNamespace:
+		return &struct {
+			*ownedChainDialer
+			netproxy.DialerUnwrapper
+			netproxy.TransportCacheNamespaceProvider
+		}{chain, u, n}
+	case hasUnwrap && hasLookup:
+		return &struct {
+			*ownedChainDialer
+			netproxy.DialerUnwrapper
+			chainIPLookupDialer
+		}{chain, u, l}
+	case hasNamespace && hasLookup:
+		return &struct {
+			*ownedChainDialer
+			netproxy.TransportCacheNamespaceProvider
+			chainIPLookupDialer
+		}{chain, n, l}
+	case hasUnwrap:
+		return &struct {
+			*ownedChainDialer
+			netproxy.DialerUnwrapper
+		}{chain, u}
+	case hasNamespace:
+		return &struct {
+			*ownedChainDialer
+			netproxy.TransportCacheNamespaceProvider
+		}{chain, n}
+	case hasLookup:
+		return &struct {
+			*ownedChainDialer
+			chainIPLookupDialer
+		}{chain, l}
+	default:
+		return chain
+	}
 }
 
 func linkScheme(link string) (string, error) {

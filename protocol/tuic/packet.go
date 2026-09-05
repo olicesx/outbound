@@ -475,28 +475,34 @@ func (q *quicStreamPacketConn) maybeCleanupDeFraggers(nowNano int64) {
 func (q *quicStreamPacketConn) SetDeadline(t time.Time) error {
 	q.muTimer.Lock()
 	defer q.muTimer.Unlock()
+	// Always re-arm with a fresh timer instead of Reset: Reset cannot
+	// retract a callback that already fired and is waiting on muTimer.
+	if q.deadlineTimer != nil {
+		q.deadlineTimer.Stop()
+		q.deadlineTimer = nil
+	}
 	if t.IsZero() {
 		// A zero time clears the deadline per the net.Conn contract;
 		// time.Until would yield a hugely negative duration and fire the
 		// close callback immediately.
-		if q.deadlineTimer != nil {
-			q.deadlineTimer.Stop()
-			q.deadlineTimer = nil
-		}
 		return nil
 	}
-	dur := time.Until(t)
-	if q.deadlineTimer != nil {
-		q.deadlineTimer.Reset(dur)
-	} else {
-		q.deadlineTimer = time.AfterFunc(dur, func() {
-			q.muTimer.Lock()
-			defer q.muTimer.Unlock()
-			q.deadlineExceeded.Store(true)
-			_ = q.Close()
-			q.deadlineTimer = nil
-		})
-	}
+	var timer *time.Timer
+	timer = time.AfterFunc(time.Until(t), func() {
+		q.muTimer.Lock()
+		// Only act when this timer is still the armed deadline: a fired
+		// callback racing a newer SetDeadline must not tear down an
+		// association whose deadline was just pushed out.
+		if q.deadlineTimer != timer {
+			q.muTimer.Unlock()
+			return
+		}
+		q.deadlineTimer = nil
+		q.muTimer.Unlock()
+		q.deadlineExceeded.Store(true)
+		_ = q.Close()
+	})
+	q.deadlineTimer = timer
 	return nil
 }
 

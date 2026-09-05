@@ -30,8 +30,10 @@ type TLSObfs struct {
 }
 
 func (to *TLSObfs) read(b []byte, discardN int) (int, error) {
-	var buf [3]byte
-	discard := buf[:discardN]
+	// The discard must be sized at runtime: discardN is 3 for regular
+	// records but 105 for the first server hello, so a fixed-size array
+	// would panic on the slice below.
+	discard := make([]byte, discardN)
 	if _, err := io.ReadFull(to.Conn, discard); err != nil {
 		return 0, err
 	}
@@ -43,6 +45,13 @@ func (to *TLSObfs) read(b []byte, discardN int) (int, error) {
 	}
 
 	length := int(binary.BigEndian.Uint16(sizeBuf))
+	if length == 0 {
+		// A zero-length record makes no progress; returning (0, nil)
+		// here would spin relay loops until the peer sends real data.
+		// Skip it and read the next record instead: the hello discard
+		// only applies to the very first record.
+		return to.readNext(b)
+	}
 	if length > len(b) {
 		n, err := to.Conn.Read(b)
 		if err != nil {
@@ -53,6 +62,31 @@ func (to *TLSObfs) read(b []byte, discardN int) (int, error) {
 	}
 
 	return io.ReadFull(to.Conn, b[:length])
+}
+
+// readNext reads a regular record after the first hello was consumed.
+func (to *TLSObfs) readNext(b []byte) (int, error) {
+	var hdr [5]byte // type + ver (discard) + uint16 size
+	for {
+		if _, err := io.ReadFull(to.Conn, hdr[:]); err != nil {
+			return 0, err
+		}
+		length := int(binary.BigEndian.Uint16(hdr[3:]))
+		if length == 0 {
+			// Zero-length records make no progress; skipping them keeps
+			// relay loops from spinning on a (0, nil) return.
+			continue
+		}
+		if length > len(b) {
+			n, err := to.Conn.Read(b)
+			if err != nil {
+				return n, err
+			}
+			to.remain = length - n
+			return n, nil
+		}
+		return io.ReadFull(to.Conn, b[:length])
+	}
 }
 
 func (to *TLSObfs) Read(b []byte) (int, error) {

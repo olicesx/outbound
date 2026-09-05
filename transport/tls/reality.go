@@ -291,9 +291,11 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 					_ = c.Close()
 					return nil, errors.New("nil ecdheKey")
 				}
-				_ = c.Close() // this attempt's underlay is orphaned by the retry
+				// retryHandshake sits after the dial: the retry re-wraps
+				// the same live underlay below, so it must stay open.
+				// Only the terminal exit above owns the close.
 				retry++
-				goto retryHandshake // retry
+				goto retryHandshake // rebuild the hello with a fresh key share
 			}
 			// logrus.Println("OH YEAH", retry)
 			uConn.AuthKey, _ = ecdheKey.ECDH(x.publicKey)
@@ -378,19 +380,27 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 							req.Header.Set("Referer", firstURL)
 						}
 						req.AddCookie(&http.Cookie{Name: "padding", Value: strings.Repeat("0", int(randBetween(x.spiderY[0], x.spiderY[1])))})
-						if resp, err = client.Do(req); err != nil {
+						// Bound each request: the spider shares the process
+						// lifetime, and a backdrop that accepts and stalls
+						// would otherwise park this goroutine (and the uConn
+						// it holds) forever.
+						reqCtx, cancelReq := context.WithTimeout(context.Background(), spiderRequestTimeout)
+						if resp, err = client.Do(req.WithContext(reqCtx)); err != nil {
+							cancelReq()
 							break
 						}
 						req.Header.Set("Referer", req.URL.String())
 						if body, err = io.ReadAll(io.LimitReader(resp.Body, 1<<20)); err != nil {
 							_ = resp.Body.Close()
+							cancelReq()
 							break
 						}
 						_ = resp.Body.Close()
+						cancelReq()
 						maps.Lock()
 						for _, m := range href.FindAllSubmatch(body, -1) {
 							m[1] = bytes.TrimPrefix(m[1], prefix)
-							if !bytes.Contains(m[1], dot) {
+							if !bytes.Contains(m[1], dot) && len(paths) < maxSpiderPaths {
 								paths[string(m[1])] = true
 							}
 						}
@@ -435,6 +445,16 @@ var maps struct {
 	sync.Mutex
 	maps map[string]map[string]bool
 }
+
+const (
+	// spiderRequestTimeout bounds each spider backdrop request: the spider
+	// goroutines share the process lifetime and are never cancelled, so an
+	// unbounded request would park them (and the uConn they hold) forever.
+	spiderRequestTimeout = 30 * time.Second
+	// maxSpiderPaths bounds the harvested-path set per serverName; the peer
+	// controls how many hrefs it can feed the harvester.
+	maxSpiderPaths = 4096
+)
 
 func getPathLocked(paths map[string]bool) string {
 	stopAt := int(randBetween(0, int64(len(paths)-1)))

@@ -120,6 +120,14 @@ func (u *udpConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 			releaseUDPMessage(dfMsg)
 			return 0, netip.AddrPort{}, err
 		}
+		if len(dfMsg.Data) > len(p) {
+			// The datagram is consumed either way; a short caller buffer
+			// must surface as ErrShortBuffer, not as a silently truncated
+			// packet.
+			n := copy(p, dfMsg.Data)
+			releaseUDPMessage(dfMsg)
+			return n, from, io.ErrShortBuffer
+		}
 		n := copy(p, dfMsg.Data)
 		releaseUDPMessage(dfMsg)
 		return n, from, nil
@@ -312,12 +320,22 @@ func (u *udpConn) SetDeadline(t time.Time) error {
 	if t.IsZero() {
 		return nil
 	}
-	u.timer = time.AfterFunc(time.Until(t), func() {
+	var timer *time.Timer
+	timer = time.AfterFunc(time.Until(t), func() {
 		u.muTimer.Lock()
+		// Stop cannot retract a callback that is already running: only act
+		// when this timer is still the armed deadline, or a newer
+		// SetDeadline would see the session closed (and its own timer
+		// orphaned) under it.
+		if u.timer != timer {
+			u.muTimer.Unlock()
+			return
+		}
 		u.timer = nil
 		u.muTimer.Unlock()
 		_ = u.Close()
 	})
+	u.timer = timer
 	return nil
 }
 

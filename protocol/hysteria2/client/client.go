@@ -293,9 +293,13 @@ func (c *clientImpl) TCP(addr string, ctx context.Context) (netproxy.Conn, error
 		c.handleIfConnectionClosed(err, connSnapshot)
 		return nil, err
 	}
+	var dialDeadline time.Time
 	if deadline, ok := ctx.Deadline(); ok {
+		dialDeadline = deadline
 		_ = stream.SetDeadline(deadline)
-		defer func() { _ = stream.SetDeadline(time.Time{}) }()
+		if !c.config.FastOpen {
+			defer func() { _ = stream.SetDeadline(time.Time{}) }()
+		}
 	}
 	// Send request
 	err = protocol.WriteTCPRequest(stream, addr)
@@ -307,12 +311,14 @@ func (c *clientImpl) TCP(addr string, ctx context.Context) (netproxy.Conn, error
 	if c.config.FastOpen {
 		// Don't wait for the response when fast open is enabled.
 		// Return the connection immediately, defer the response handling
-		// to the first Read() call.
+		// to the first Read() call, which re-arms the dial deadline:
+		// clearing it here would leave that read unbounded.
 		return &tcpConn{
 			Orig:             stream,
 			PseudoLocalAddr:  connSnapshot.LocalAddr(),
 			PseudoRemoteAddr: connSnapshot.RemoteAddr(),
 			Established:      false,
+			dialDeadline:     dialDeadline,
 		}, nil
 	}
 	// Read response
@@ -448,6 +454,10 @@ type tcpConn struct {
 	PseudoRemoteAddr net.Addr
 	Established      bool
 
+	// dialDeadline is the dial ctx deadline, kept armed across the
+	// fast-open return so the deferred response read stays bounded.
+	dialDeadline time.Time
+
 	// Fast-open mode defers the response read to the first Read. The once
 	// guarantees exactly one ReadTCPResponse even if callers race the first
 	// reads, so every reader observes the same handshake outcome.
@@ -457,6 +467,10 @@ type tcpConn struct {
 
 func (c *tcpConn) readFastOpenResponse() error {
 	c.establishOnce.Do(func() {
+		if !c.dialDeadline.IsZero() {
+			_ = c.Orig.SetDeadline(c.dialDeadline)
+			defer func() { _ = c.Orig.SetDeadline(time.Time{}) }()
+		}
 		ok, msg, err := protocol.ReadTCPResponse(c.Orig)
 		if err != nil {
 			c.respErr = err

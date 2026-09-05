@@ -37,6 +37,9 @@ type directPacketReceiverEntry struct {
 	fd      int
 	handler netproxy.PacketReceiveHandler
 	active  atomic.Bool
+	// pending queues datagrams fetched from the socket. The loop goroutine
+	// is the only producer and consumer, so the slice is reused.
+	pending []*netproxy.ReceivedPacket
 }
 
 var defaultPacketReceiverRegistry = &packetReceiverRegistry{}
@@ -152,6 +155,12 @@ func (r *packetReceiverRegistry) loop(epollFD int) {
 			continue
 		}
 		if err != nil {
+			// Non-EINTR failures on a valid epoll fd are unrecoverable
+			// kernel conditions. A dead wait loop would silently
+			// blackhole every socket registered after it: tear the
+			// registry down so the next registration starts a fresh
+			// loop, and surface the failure to registered endpoints.
+			r.fail(epollFD, err)
 			return
 		}
 		for i := 0; i < n; i++ {
@@ -166,7 +175,50 @@ func (r *packetReceiverRegistry) loop(epollFD int) {
 	}
 }
 
+// fail retires a registry whose wait loop hit an unrecoverable error:
+// registered endpoints are told the receiver is gone, and the next
+// registration starts a fresh loop instead of feeding a dead epoll set.
+func (r *packetReceiverRegistry) fail(epollFD int, cause error) {
+	r.mu.Lock()
+	if !r.started || r.epollFD != epollFD {
+		// Already replaced or torn down by another path.
+		r.mu.Unlock()
+		return
+	}
+	_ = unix.Close(epollFD)
+	r.started = false
+	r.epollFD = -1
+	failed := r.entries
+	r.entries = make(map[int]*directPacketReceiverEntry)
+	r.mu.Unlock()
+
+	errPacket := fmt.Errorf("direct packet receiver: %w", cause)
+	for _, entry := range failed {
+		if entry.active.Swap(false) {
+			packet := netproxy.NewReceivedPacket(nil, netip.AddrPort{}, errPacket, nil)
+			if !entry.handler(packet) {
+				packet.Release()
+			}
+		}
+	}
+}
+
+// drain fetches queued datagrams and delivers them to the handler.
 func (r *packetReceiverRegistry) drain(entry *directPacketReceiverEntry) {
+	r.fetch(entry)
+	entry.deliver()
+}
+
+// fetch drains up to directPacketReceiverBatchSize datagrams into the
+// entry's pending queue. The read lock is held across the recvfrom
+// syscalls: unregister takes the write lock before the socket is closed
+// downstream, so an in-flight recvfrom can never race fd close and
+// number reuse. The socket is non-blocking, so the lock never covers a
+// blocking syscall.
+func (r *packetReceiverRegistry) fetch(entry *directPacketReceiverEntry) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	entry.pending = entry.pending[:0]
 	for range directPacketReceiverBatchSize {
 		if !entry.active.Load() {
 			return
@@ -180,7 +232,7 @@ func (r *packetReceiverRegistry) drain(entry *directPacketReceiverEntry) {
 				}
 				return
 			}
-			r.deliverError(entry, err)
+			entry.pending = append(entry.pending, netproxy.NewReceivedPacket(nil, netip.AddrPort{}, err, nil))
 			return
 		}
 		bufSize := directPacketReceiverSmallBufferSize
@@ -200,33 +252,33 @@ func (r *packetReceiverRegistry) drain(entry *directPacketReceiverEntry) {
 				}
 				return
 			}
-			r.deliverError(entry, err)
+			entry.pending = append(entry.pending, netproxy.NewReceivedPacket(nil, netip.AddrPort{}, err, nil))
 			return
 		}
 
 		from, ok := directPacketReceiverAddrPort(sockaddr)
 		if !ok {
 			pool.Put(buf)
-			r.deliverError(entry, fmt.Errorf("unsupported direct UDP peer address %T", sockaddr))
+			entry.pending = append(entry.pending, netproxy.NewReceivedPacket(nil, netip.AddrPort{}, fmt.Errorf("unsupported direct UDP peer address %T", sockaddr), nil))
 			return
 		}
 		packet := netproxy.NewReceivedPacket(buf[:n], from, nil, func() {
 			pool.Put(buf)
 		})
-		if !entry.active.Load() || !entry.handler(packet) {
-			packet.Release()
-		}
+		entry.pending = append(entry.pending, packet)
 	}
 }
 
-func (r *packetReceiverRegistry) deliverError(entry *directPacketReceiverEntry, err error) {
-	if !entry.active.Load() {
-		return
+// deliver hands fetched datagrams to the handler outside the registry
+// lock: the handler may synchronously stop the entry, which needs the
+// write lock.
+func (e *directPacketReceiverEntry) deliver() {
+	for _, packet := range e.pending {
+		if !e.active.Load() || !e.handler(packet) {
+			packet.Release()
+		}
 	}
-	packet := netproxy.NewReceivedPacket(nil, netip.AddrPort{}, err, nil)
-	if !entry.handler(packet) {
-		packet.Release()
-	}
+	e.pending = e.pending[:0]
 }
 
 func directPacketReceiverFD(conn *directPacketConn) (int, error) {

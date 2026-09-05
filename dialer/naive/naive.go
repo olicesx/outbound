@@ -308,9 +308,8 @@ func (c *naiveConn) newHandshakeContext() (context.Context, context.CancelFunc) 
 }
 
 func (c *naiveConn) handshake(handshakeCtx context.Context, firstWrite []byte) (conn *naiveH2Stream, n int, requestCancel context.CancelFunc, err error) {
-	if c.closeCtx == nil {
-		c.closeCtx, c.closeCancel = context.WithCancel(context.Background())
-	}
+	// closeCtx/closeCancel are always populated by dialTCP at construction;
+	// a lazy init here would race unsynchronized with Close's read.
 	for attempt := 0; attempt < 2; attempt++ {
 		// Bind CONNECT to the conn lifetime, not the handshake budget.
 		// Cancelling the handshake ctx after RoundTrip would RST_STREAM(CANCEL)
@@ -414,6 +413,12 @@ func shouldRetryNaiveRoundTrip(err error) bool {
 	}
 
 	errMsg := strings.ToLower(err.Error())
+	// x/net reports a GOAWAY that arrives before the stream was reserved
+	// (graceful server shutdown) as an unexported errors.New sentinel, not
+	// as a typed GoAwayError. x/net itself classifies it as retryable.
+	if strings.Contains(errMsg, "graceful shutdown goaway") {
+		return true
+	}
 	return strings.Contains(errMsg, "client conn not usable")
 }
 
@@ -645,9 +650,10 @@ func (p *naiveH2ConnPool) registerConn(magicNetwork string, rawConn netproxy.Con
 
 func (p *naiveH2ConnPool) GetClientConn(_ *http.Request, _ string) (*http2.ClientConn, error) {
 	// Always erroring is intentional: callers use pooled conns directly via
-	// GetConn and never ask the transport to pick one. Consequence: the
-	// transport's own IdleConnTimeout path never fires for these conns —
-	// idle raw conns are only reclaimed when the peer GoAways (MarkDead).
+	// GetConn and never ask the transport to pick one. Idle reclamation
+	// still works: x/net arms its IdleConnTimeout timer on every
+	// newClientConn, so an idle pooled conn is closed by onIdleTimeout →
+	// cleanup, which calls MarkDead and removes it from this pool.
 	return nil, fmt.Errorf("naiveH2ConnPool: use cached client connections directly")
 }
 

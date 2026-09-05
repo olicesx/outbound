@@ -45,6 +45,7 @@ type Conn struct {
 	writeNonceGenerator   BytesGenerator
 	writeChunkSizeParser  ChunkSizeEncoder
 	writePaddingGenerator PaddingLengthGenerator
+	writeInitErr          error
 
 	readBodyCipher       cipher.AEAD
 	readNonceGenerator   BytesGenerator
@@ -294,9 +295,11 @@ func (c *Conn) write(b []byte) (n int, err error) {
 			defer pool.Put(header)
 			encRespHeader, err = c.EncryptRespHeaderFromPool(header)
 			if err != nil {
+				c.writeInitErr = err
 				return
 			}
 			if c.writeBodyCipher, err = c.NewAEAD(c.responseBodyKey[:]); err != nil {
+				c.writeInitErr = err
 				return
 			}
 			if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
@@ -316,6 +319,11 @@ func (c *Conn) write(b []byte) (n int, err error) {
 	})
 	if len(encRespHeader) != 0 {
 		defer pool.Put(encRespHeader)
+	}
+	if err == nil {
+		// The once has already run: a failed init must surface on every
+		// call, or later writes proceed with nil cipher state and panic.
+		err = c.writeInitErr
 	}
 	if err != nil {
 		return 0, err

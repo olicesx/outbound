@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 )
 
 type SessionStatus = byte
@@ -41,6 +42,9 @@ type Conn struct {
 	status [2]byte
 	otb    []byte
 	remain int
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (m *Conn) Read(b []byte) (int, error) {
@@ -130,14 +134,20 @@ func (m *Conn) Write(b []byte) (int, error) {
 }
 
 func (m *Conn) Close() error {
-	_, err := m.Conn.Write([]byte{0x0, 0x4, m.id[0], m.id[1], SessionStatusEnd, OptionNone})
-	// The underlay must close even when the END frame could not be
-	// delivered; returning early here leaked the raw connection.
-	closeErr := m.Conn.Close()
-	if err != nil {
-		return err
-	}
-	return closeErr
+	// Defensive closes must be idempotent: a second Close would otherwise
+	// write an END frame into a dead conn and surface net.ErrClosed.
+	m.closeOnce.Do(func() {
+		_, err := m.Conn.Write([]byte{0x0, 0x4, m.id[0], m.id[1], SessionStatusEnd, OptionNone})
+		// The underlay must close even when the END frame could not be
+		// delivered; returning early here leaked the raw connection.
+		closeErr := m.Conn.Close()
+		if err != nil {
+			m.closeErr = err
+		} else {
+			m.closeErr = closeErr
+		}
+	})
+	return m.closeErr
 }
 
 func NewConn(conn net.Conn, option MuxOption) *Conn {

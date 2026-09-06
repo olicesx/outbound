@@ -53,11 +53,35 @@ type clientImpl struct {
 	// under it in forceClose; atomicity keeps those entry checks race-free.
 	closed atomic.Bool
 
+	// done is the client-owned retirement signal: forceClose closes it
+	// exactly once, immediately, while the QUIC transport itself is still
+	// kept for its close grace period. Associations capture it so logical
+	// retirement unblocks writes/readers without waiting for transport I/O
+	// to fail. Built via newClientImpl; a nil done (bare struct literals in
+	// tests) degrades to the old transport-context-only behavior.
+	done chan struct{}
+
 	udpIncomingPacketsMap sync.Map
 
 	streamSem chan struct{}
 
 	onClose func()
+}
+
+// newClientImpl builds a TUIC client around option with its lifecycle state
+// initialized: udp selects the UDP relay setup and streamSemSize bounds the
+// concurrent uni-stream slots (0 = unbounded). The returned client owns a
+// done channel that forceClose closes exactly once.
+func newClientImpl(option *ClientOption, udp bool, streamSemSize int) *clientImpl {
+	t := &clientImpl{
+		ClientOption: option,
+		udp:          udp,
+		done:         make(chan struct{}),
+	}
+	if streamSemSize > 0 {
+		t.streamSem = make(chan struct{}, streamSemSize)
+	}
+	return t
 }
 
 func (t *clientImpl) acquireUniStreamSlot(ctx context.Context) error {
@@ -86,7 +110,16 @@ func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, di
 }
 
 func (t *clientImpl) getQuicConnLocked(ctx context.Context, dialer netproxy.Dialer, dialFn common.DialFunc) (quic.Connection, error) {
+	if t.closed.Load() {
+		return nil, common.ErrClientClosed
+	}
 	if t.quicConn != nil {
+		// Cached branch: reusing the tunnel never consults ctx, so a
+		// canceled caller must be rejected here instead of being handed a
+		// session on an already-dead request.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return t.quicConn, nil
 	}
 	transport, addr, err := dialFn(ctx, dialer)
@@ -304,6 +337,11 @@ func (t *clientImpl) deferQuicConn(quicConn quic.Connection, err error) {
 	}
 }
 
+// forceCloseGracePeriod bounds how long the QUIC transport and underlay
+// stay alive after the client is logically retired. A package var so tests
+// can shrink the window.
+var forceCloseGracePeriod = 10 * time.Second
+
 func (t *clientImpl) forceClose(quicConn quic.Connection, err error) {
 	t.connMutex.Lock()
 	if t.closed.Load() {
@@ -311,42 +349,49 @@ func (t *clientImpl) forceClose(quicConn quic.Connection, err error) {
 		return
 	}
 	t.closed.Store(true)
+	// Publish retirement exactly once, immediately: TransportDone consumers
+	// and WriteTo see it while the transport close below still waits out
+	// its grace period.
+	if t.done != nil {
+		close(t.done)
+	}
 	if t.onClose != nil {
 		go t.onClose()
 		t.onClose = nil
 	}
 	t.connMutex.Unlock()
 	// Tear the association queues down immediately: polling ReadFrom
-	// callers must not stay blocked in PopFrontBlock for the whole 10s
-	// grace period after the transport is already dead. The QUIC and
-	// underlay closes below still get their grace period.
+	// callers must not stay blocked in PopFrontBlock for the whole grace
+	// period after the transport is already dead. This runs outside
+	// connMutex and drains/releases each queue via Packets.Close.
 	t.udpIncomingPacketsMap.Range(func(key, value any) bool {
 		_ = value.(*Packets).Close()
 		t.udpIncomingPacketsMap.Delete(key)
 		return true
 	})
-	// Give 10s for closing.
-	time.AfterFunc(10*time.Second, func() {
+	// Give the transport its grace period. The timer only captures and
+	// detaches the shared resources under connMutex; the actual
+	// CloseWithError / underConn.Close calls do real I/O and therefore run
+	// outside the lock.
+	time.AfterFunc(forceCloseGracePeriod, func() {
 		t.connMutex.Lock()
-		defer t.connMutex.Unlock()
-		if quicConn == nil {
-			quicConn = t.quicConn
+		qc := quicConn
+		if qc == nil {
+			qc = t.quicConn
 		}
-		if quicConn != nil {
-			if quicConn == t.quicConn {
-				t.quicConn = nil
-			}
-		}
+		t.quicConn = nil
+		underConn := t.underConn
+		t.underConn = nil
+		t.connMutex.Unlock()
 		errStr := ""
 		if err != nil {
 			errStr = err.Error()
 		}
-		if quicConn != nil {
-			_ = quicConn.CloseWithError(ProtocolError, errStr)
+		if qc != nil {
+			_ = qc.CloseWithError(ProtocolError, errStr)
 		}
-		if t.underConn != nil {
-			_ = t.underConn.Close()
-			t.underConn = nil
+		if underConn != nil {
+			_ = underConn.Close()
 		}
 	})
 }
@@ -441,6 +486,11 @@ func (t *clientImpl) ListenPacketWithDialer(ctx context.Context, metadata *proto
 	if err != nil {
 		return nil, err
 	}
+	// Post-lock re-check before the association is published: a caller
+	// canceled while the cache lookup ran must not own an association slot.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	var connId uint16
 	incomingPackets := NewPackets()
@@ -458,6 +508,7 @@ func (t *clientImpl) ListenPacketWithDialer(ctx context.Context, metadata *proto
 		udpRelayMode:          t.UdpRelayMode,
 		maxUdpRelayPacketSize: t.MaxUdpRelayPacketSize,
 		deferQuicConnFn:       t.deferQuicConn,
+		done:                  t.done,
 		closeDeferFn: func() {
 			t.udpIncomingPacketsMap.CompareAndDelete(connId, incomingPackets)
 		},

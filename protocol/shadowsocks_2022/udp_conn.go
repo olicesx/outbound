@@ -453,6 +453,15 @@ func (c *UdpConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) 
 	return netproxy.RegisterMappedPacketReceiver(receiver, handler, c.mapReceivedPacket)
 }
 
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped conn: the exported
+// SetWriteDeadline is the promoted delegate of the embedded net.Conn, so the
+// semantics — and the declaration — belong to that conn. A plain UDP socket
+// reports false; a marker-bearing wrapper in its place reports true.
+func (c *UdpConn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.Conn)
+}
+
 func (c *UdpConn) mapReceivedPacket(packet *netproxy.ReceivedPacket) (*netproxy.ReceivedPacket, bool) {
 	if packet.Err != nil {
 		return packet, true

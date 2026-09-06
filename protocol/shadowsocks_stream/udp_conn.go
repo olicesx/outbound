@@ -83,6 +83,15 @@ func NewUdpConn(c netproxy.PacketConn, cipher *ciphers.StreamCipher, defaultAddr
 	}
 }
 
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped transport: SetWriteDeadline is
+// delegated to the underlying PacketConn unchanged, so the semantics — and
+// the declaration — belong to that transport, not to this wrapper. The
+// UdpTransportConn dialer wrapper embeds *UdpConn and inherits this forward.
+func (c *UdpConn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.PacketConn)
+}
+
 func (c *UdpConn) Cipher() *ciphers.StreamCipher {
 	return c.cipher
 }

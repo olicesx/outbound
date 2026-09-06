@@ -187,6 +187,12 @@ type quicStreamPacketConn struct {
 	deferQuicConnFn func(quicConn quic.Connection, err error)
 	closeDeferFn    func()
 
+	// done is the owning client's retirement channel (nil for bare test
+	// literals): once closed, this association is logically retired and
+	// WriteTo must fail immediately, even while the QUIC transport is kept
+	// for its close grace period.
+	done <-chan struct{}
+
 	// writeMu serializes datagram assembly and send on this association's
 	// private scratch buffer (writeScratch), the same per-flow lock shape
 	// as hysteria2/juicity. The shared pool LIFO costs a global mutex round
@@ -666,10 +672,12 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error)
 	if q.closed.Load() {
 		return 0, net.ErrClosed
 	}
-	if q.deferQuicConnFn != nil {
-		defer func() {
-			q.deferQuicConnFn(q.quicConn, err)
-		}()
+	// Logical retirement of the owning client blocks writes immediately,
+	// without waiting for the retired transport to surface an I/O error.
+	select {
+	case <-q.done:
+		return 0, net.ErrClosed
+	default:
 	}
 	q.writeMu.Lock()
 	defer q.writeMu.Unlock()
@@ -682,9 +690,18 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error)
 		q.writeScratch = buf
 	}
 	buf.Reset()
+	// Parse the destination before installing the shared-tunnel error
+	// defer: a local address-parse failure belongs to this association
+	// only and must never retire the shared client via deferQuicConnFn.
+	// The parse and the address cache stay under writeMu.
 	address, err := q.addressForAddr(addr)
 	if err != nil {
 		return 0, err
+	}
+	if q.deferQuicConnFn != nil {
+		defer func() {
+			q.deferQuicConnFn(q.quicConn, err)
+		}()
 	}
 	pktId := uint16(fastrand.Uint32())
 	packet := NewPacket(q.connId, pktId, 1, 0, uint16(len(p)), address, p, Ver5)
@@ -754,15 +771,29 @@ func (conn *quicStreamPacketConn) Write(b []byte) (n int, err error) {
 	return conn.WriteTo(b, conn.target)
 }
 
-var _ netproxy.PacketConn = (*quicStreamPacketConn)(nil)
-var _ netproxy.PacketReceiver = (*quicStreamPacketConn)(nil)
+var (
+	_ netproxy.PacketConn     = (*quicStreamPacketConn)(nil)
+	_ netproxy.PacketReceiver = (*quicStreamPacketConn)(nil)
+)
 
 // TransportDone implements netproxy.TransportLifecycle.
 // The returned channel is closed when the QUIC transport backing this
-// UDP session is permanently dead.
+// UDP session is permanently dead. With a lifecycle-capable owner the
+// channel is the client's done signal, so logical retirement (force-close)
+// is reported immediately instead of after the transport grace period.
 func (q *quicStreamPacketConn) TransportDone() <-chan struct{} {
+	if q.done != nil {
+		return q.done
+	}
 	if q.quicConn == nil {
 		return make(chan struct{})
 	}
 	return q.quicConn.Context().Done()
+}
+
+// WriteDeadlineClosesSession reports that a fired write deadline ends the
+// whole UDP session: SetDeadline tears down this association on expiry, so
+// deadline callers must treat it as session-fatal, not a per-write failure.
+func (q *quicStreamPacketConn) WriteDeadlineClosesSession() bool {
+	return true
 }

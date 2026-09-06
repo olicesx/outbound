@@ -79,6 +79,15 @@ func (c *Conn) CloseWrite() error {
 	return netproxy.ForwardCloseWrite(c.Conn)
 }
 
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped stream conn: SetWriteDeadline is
+// delegated to the underlying netproxy.Conn unchanged, so the semantics —
+// and the declaration — belong to that conn. The UDP PacketConn embeds
+// *Conn and inherits this forward.
+func (c *Conn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.Conn)
+}
+
 func (c *Conn) reqHeaderFromPool() (buf []byte) {
 	reqLen := c.metadata.Len()
 	buf = pool.Get(56 + 2 + 1 + reqLen + 2)

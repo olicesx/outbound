@@ -32,6 +32,16 @@ func NewPacketConn(c netproxy.PacketConn, proto IProtocol, tgt string) (*PacketC
 	}, nil
 }
 
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped transport: SetWriteDeadline is
+// delegated to the underlying PacketConn unchanged, so the semantics — and
+// the declaration — belong to that transport, not to this wrapper.
+// Production wraps shadowsocks_stream.DialUdpTransport here, whose own
+// forward would otherwise be erased by this outer layer.
+func (c *PacketConn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.PacketConn)
+}
+
 func (c *PacketConn) InnerCipher() *ciphers.StreamCipher {
 	switch innerConn := c.PacketConn.(type) {
 	case *shadowsocks_stream.UdpConn:

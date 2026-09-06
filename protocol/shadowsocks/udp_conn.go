@@ -56,6 +56,14 @@ func (c *UdpConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) 
 	return netproxy.RegisterMappedPacketReceiver(receiver, handler, c.mapReceivedPacket)
 }
 
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped transport: SetWriteDeadline is
+// delegated to the underlying PacketConn unchanged, so the semantics — and
+// the declaration — belong to that transport, not to this wrapper.
+func (c *UdpConn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.PacketConn)
+}
+
 func (c *UdpConn) mapReceivedPacket(packet *netproxy.ReceivedPacket) (*netproxy.ReceivedPacket, bool) {
 	if packet.Err != nil {
 		return packet, true
@@ -121,8 +129,7 @@ func splitDecryptedUdp(plain []byte) (payload []byte, from netip.AddrPort, err e
 	return plain[sizeMetadata:], netip.AddrPortFrom(mdata.IP, mdata.Port), nil
 }
 
-func NewUdpConn(conn netproxy.PacketConn, proxyAddress string, metadata protocol.Metadata, masterKey []byte, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
-	conf := ciphers.AeadCiphersConf[metadata.Cipher]
+func NewUdpConn(conn netproxy.PacketConn, proxyAddress string, metadata protocol.Metadata, masterKey []byte, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {	conf := ciphers.AeadCiphersConf[metadata.Cipher]
 	if conf.NewCipher == nil {
 		return nil, fmt.Errorf("invalid CipherConf")
 	}

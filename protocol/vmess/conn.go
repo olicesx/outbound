@@ -114,6 +114,15 @@ func (c *Conn) Close() error {
 	return err
 }
 
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped stream conn: SetWriteDeadline is
+// delegated to the underlying netproxy.Conn unchanged, so the semantics —
+// and the declaration — belong to that conn (vmess UDP rides ReadFrom/Write
+// on this conn).
+func (c *Conn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.Conn)
+}
+
 func (c *Conn) dialTargetAddrPort() (netip.AddrPort, error) {
 	c.dialTgtMu.Lock()
 	defer c.dialTgtMu.Unlock()

@@ -52,31 +52,27 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	}
 	return &Dialer{
 		clientRing: newClientRing(func(capabilityCallback func(n int64)) *clientImpl {
-			return &clientImpl{
-				ClientOption: &ClientOption{
-					TlsConfig: header.TlsConfig,
-					QuicConfig: &quic.Config{
-						InitialStreamReceiveWindow:     common.InitialStreamReceiveWindow,
-						MaxStreamReceiveWindow:         common.MaxStreamReceiveWindow,
-						InitialConnectionReceiveWindow: common.InitialConnectionReceiveWindow,
-						MaxConnectionReceiveWindow:     common.MaxConnectionReceiveWindow,
-						KeepAlivePeriod:                3 * time.Second,
-						DisablePathMTUDiscovery:        false,
-						EnableDatagrams:                true,
-						HandshakeIdleTimeout:           8 * time.Second,
-						CapabilityCallback:             capabilityCallback,
-					},
-					Uuid:                  id,
-					Password:              header.Password,
-					UdpRelayMode:          udpRelayMode,
-					CongestionController:  header.Feature1.(string),
-					ReduceRtt:             true, // 0-RTT cuts cold-start RTT
-					CWND:                  cwnd,
-					MaxUdpRelayPacketSize: maxDatagramFrameSize,
+			return newClientImpl(&ClientOption{
+				TlsConfig: header.TlsConfig,
+				QuicConfig: &quic.Config{
+					InitialStreamReceiveWindow:     common.InitialStreamReceiveWindow,
+					MaxStreamReceiveWindow:         common.MaxStreamReceiveWindow,
+					InitialConnectionReceiveWindow: common.InitialConnectionReceiveWindow,
+					MaxConnectionReceiveWindow:     common.MaxConnectionReceiveWindow,
+					KeepAlivePeriod:                3 * time.Second,
+					DisablePathMTUDiscovery:        false,
+					EnableDatagrams:                true,
+					HandshakeIdleTimeout:           8 * time.Second,
+					CapabilityCallback:             capabilityCallback,
 				},
-				udp:       true,
-				streamSem: make(chan struct{}, 64),
-			}
+				Uuid:                  id,
+				Password:              header.Password,
+				UdpRelayMode:          udpRelayMode,
+				CongestionController:  header.Feature1.(string),
+				ReduceRtt:             true, // 0-RTT cuts cold-start RTT
+				CWND:                  cwnd,
+				MaxUdpRelayPacketSize: maxDatagramFrameSize,
+			}, true, 64)
 		}, 10),
 		proxyAddress: header.ProxyAddress,
 		proxyUDPAddr: proxyUDPAddr,

@@ -154,6 +154,18 @@ func (c *TransportPacketConn) SetWriteDeadline(t time.Time) error {
 	return c.Conn.SetWriteDeadline(t)
 }
 
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the QUIC transport's underlay conn, which is
+// exactly where SetWriteDeadline lands. The plain stream PacketConn keeps
+// its own write-abort quic-stream deadline semantics and deliberately does
+// not forward anything.
+func (c *TransportPacketConn) WriteDeadlineClosesSession() bool {
+	if c.Transport == nil || c.Conn == nil {
+		return false
+	}
+	return netproxy.WriteDeadlineClosesSession(c.Conn)
+}
+
 func (c *TransportPacketConn) borrowWriteBuffer(size int) []byte {
 	if size <= maxReusablePacketWriteBufferSize {
 		if cap(c.writeBuf) < size {

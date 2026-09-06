@@ -211,6 +211,15 @@ func (conn *fakeNetPacketConn) TransportDone() <-chan struct{} {
 	return lifecycle.TransportDone()
 }
 
+// WriteDeadlineClosesSession forwards the optional destructive
+// write-deadline declaration of the wrapped PacketConn through the net.Conn
+// compatibility wrapper. Without this, a session-closing inner conn (e.g.
+// TUIC) is invisible to deadline-arming callers behind the wrapper, because
+// a dynamic interface embedding does not promote unknown methods.
+func (conn *fakeNetPacketConn) WriteDeadlineClosesSession() bool {
+	return WriteDeadlineClosesSession(conn.PacketConn)
+}
+
 // RegisterPacketReceiver forwards the optional transport-owned delivery
 // boundary through the net.Conn compatibility wrapper.
 func (conn *fakeNetPacketConn) RegisterPacketReceiver(handler PacketReceiveHandler) (func(), bool) {

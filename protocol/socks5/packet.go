@@ -239,6 +239,14 @@ func (pc *PktConn) TransportDone() <-chan struct{} {
 	return pc.done
 }
 
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped transport: SetWriteDeadline is
+// delegated to the underlying PacketConn unchanged, so the semantics — and
+// the declaration — belong to that transport, not to this wrapper.
+func (pc *PktConn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(pc.PacketConn)
+}
+
 // Close .
 func (pc *PktConn) Close() error {
 	pc.closeOnce.Do(func() {

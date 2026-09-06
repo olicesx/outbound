@@ -12,6 +12,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/daeuniverse/outbound/netproxy"
 )
 
 const udpBufferSize = 2048 // QUIC packets are at most 1500 bytes long, so 2k should be more than enough
@@ -122,6 +124,15 @@ func (c *obfsPacketConn) SetReadDeadline(t time.Time) error {
 
 func (c *obfsPacketConn) SetWriteDeadline(t time.Time) error {
 	return c.Conn.SetWriteDeadline(t)
+}
+
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped conn: SetWriteDeadline is
+// delegated to the underlying PacketConn unchanged, so the semantics — and
+// the declaration — belong to that conn. obfsPacketConnUDP embeds this type
+// and inherits the forward.
+func (c *obfsPacketConn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.Conn)
 }
 
 // UDP-specific methods below

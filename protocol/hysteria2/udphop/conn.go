@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/olicesx/quic-go"
 	"golang.org/x/net/ipv4"
 )
@@ -589,6 +590,19 @@ func (u *udpHopPacketConn) SetWriteDeadline(t time.Time) error {
 		_ = u.prevConn.SetWriteDeadline(t)
 	}
 	return u.currentConn.SetWriteDeadline(t)
+}
+
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the underlay conns: SetWriteDeadline arms
+// them all, so the declaration is true if any armed underlay declares a
+// session-closing deadline.
+func (u *udpHopPacketConn) WriteDeadlineClosesSession() bool {
+	u.connMutex.RLock()
+	defer u.connMutex.RUnlock()
+	if netproxy.WriteDeadlineClosesSession(u.currentConn) {
+		return true
+	}
+	return u.prevConn != nil && netproxy.WriteDeadlineClosesSession(u.prevConn)
 }
 
 // UDP-specific methods below

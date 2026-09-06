@@ -31,7 +31,7 @@ func newClientRing(newClient func(capabilityCallback func(n int64)) *clientImpl,
 }
 
 func (r *clientRing) DialContextWithDialer(ctx context.Context, metadata *protocol.Metadata, dialer netproxy.Dialer, dialFn common.DialFunc) (conn netproxy.Conn, err error) {
-	err = r.ring.TryNext(func(node *clientring.Node[*clientImpl]) error {
+	err = r.ring.TryNextContext(ctx, func(node *clientring.Node[*clientImpl]) error {
 		if capability := node.Capability(); capability != -1 && capability <= r.reserved {
 			return common.ErrHoldOn
 		}
@@ -42,7 +42,7 @@ func (r *clientRing) DialContextWithDialer(ctx context.Context, metadata *protoc
 }
 
 func (r *clientRing) ListenPacketWithDialer(ctx context.Context, metadata *protocol.Metadata, dialer netproxy.Dialer, dialFn common.DialFunc) (conn netproxy.PacketConn, err error) {
-	err = r.ring.TryNext(func(node *clientring.Node[*clientImpl]) error {
+	err = r.ring.TryNextContext(ctx, func(node *clientring.Node[*clientImpl]) error {
 		if capability := node.Capability(); capability != -1 && capability <= r.reserved {
 			return common.ErrHoldOn
 		}

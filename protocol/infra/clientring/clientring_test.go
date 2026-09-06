@@ -2,6 +2,7 @@ package clientring
 
 import (
 	"container/list"
+	"context"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -75,10 +76,11 @@ func TestGetNewRefusesWhenClosed(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	// Acquire cannot fail with a Background context; release must run.
+	_ = r.sem.Acquire(context.Background(), 1)
+	defer r.sem.Release(1)
 	var current *list.Element
-	err := r.tryNext(&current, func(*Node[*fakeClient]) error { return nil })
+	err := r.tryNext(context.Background(), &current, func(*Node[*fakeClient]) error { return nil })
 	if !errors.Is(err, outbounderrors.ErrClientClosed) {
 		t.Fatalf("tryNext/getNew after Close: %v, want ErrClientClosed", err)
 	}

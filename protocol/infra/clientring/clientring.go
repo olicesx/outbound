@@ -6,11 +6,12 @@ package clientring
 
 import (
 	"container/list"
+	"context"
 	"errors"
-	"sync"
 	"sync/atomic"
 
 	outbounderrors "github.com/daeuniverse/outbound/common/errors"
+	"golang.org/x/sync/semaphore"
 )
 
 // IsFailoverError reports whether err is one of the conditions the ring
@@ -44,8 +45,14 @@ func (n *Node[T]) Capability() int64 {
 // Ring is the shared failover ring. The protocol-specific dial bodies are
 // supplied as attempt callbacks, so only client construction, close, and
 // close-registration differ per protocol.
+//
+// Every state operation (attempts, Len, passiveRemove, Close) holds the
+// same single semaphore permit, so attempts serialize exactly as they did
+// under the former mutex. A context-aware waiter blocked on the permit,
+// however, returns as soon as its context is done instead of waiting for
+// the holder to finish.
 type Ring[T any] struct {
-	mu         sync.Mutex
+	sem        *semaphore.Weighted
 	closed     bool
 	ring       *list.List
 	current    *list.Element
@@ -65,6 +72,7 @@ func New[T any](
 	reserved int64,
 ) *Ring[T] {
 	return &Ring[T]{
+		sem:        semaphore.NewWeighted(1),
 		ring:       list.New().Init(),
 		newClient:  newClient,
 		setOnClose: setOnClose,
@@ -75,21 +83,33 @@ func New[T any](
 
 // TryNext runs one dial attempt against the current client, walking the ring
 // on failover-class errors and inserting a fresh client when every existing
-// one failed. The ring lock is held across attempts, matching the original
+// one failed. The ring permit is held across attempts, matching the original
 // per-protocol rings (dials on one ring serialize).
 func (r *Ring[T]) TryNext(f func(node *Node[T]) error) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	return r.TryNextContext(context.Background(), f)
+}
+
+// TryNextContext cancels the permit wait and stops further attempts when ctx
+// ends. The callback is responsible for observing ctx during an active dial;
+// a successful callback result is returned unchanged.
+func (r *Ring[T]) TryNextContext(ctx context.Context, f func(node *Node[T]) error) error {
+	if err := r.sem.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer r.sem.Release(1)
 	if r.closed {
 		return outbounderrors.ErrClientClosed
 	}
 	newCurrent := r.current
-	err := r.tryNext(&newCurrent, f)
+	err := r.tryNext(ctx, &newCurrent, f)
 	r.current = newCurrent
 	return err
 }
 
-func (r *Ring[T]) tryNext(current **list.Element, f func(*Node[T]) error) (err error) {
+func (r *Ring[T]) tryNext(ctx context.Context, current **list.Element, f func(*Node[T]) error) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var node *Node[T]
 	if *current == nil {
 		goto getNew
@@ -99,6 +119,11 @@ func (r *Ring[T]) tryNext(current **list.Element, f func(*Node[T]) error) (err e
 	if err == nil {
 		// OK.
 		return nil
+	}
+	if ctx.Err() != nil {
+		// The caller gave up during this attempt: not a failover
+		// condition, stop the walk here.
+		return err
 	}
 
 	// Expected error: fail over to the next client.
@@ -117,9 +142,12 @@ func (r *Ring[T]) tryNext(current **list.Element, f func(*Node[T]) error) (err e
 		return err
 	}
 
-	return r.tryNext(current, f)
+	return r.tryNext(ctx, current, f)
 
 getNew:
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if r.closed {
 		return outbounderrors.ErrClientClosed
 	}
@@ -149,8 +177,10 @@ func (r *Ring[T]) insertAfterCurrent(node *Node[T]) (elem *list.Element) {
 }
 
 func (r *Ring[T]) passiveRemove(elem *list.Element) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	if err := r.sem.Acquire(context.Background(), 1); err != nil {
+		return
+	}
+	defer r.sem.Release(1)
 	if elem.Value == nil {
 		// Removed.
 		return
@@ -164,14 +194,18 @@ func (r *Ring[T]) passiveRemove(elem *list.Element) {
 
 // Len returns the number of clients currently held in the ring.
 func (r *Ring[T]) Len() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	if err := r.sem.Acquire(context.Background(), 1); err != nil {
+		return 0
+	}
+	defer r.sem.Release(1)
 	return r.ring.Len()
 }
 
 // Close tears down every client in the ring.
 func (r *Ring[T]) Close() error {
-	r.mu.Lock()
+	if err := r.sem.Acquire(context.Background(), 1); err != nil {
+		return err
+	}
 	r.closed = true
 	clients := make([]T, 0, r.ring.Len())
 	for elem := r.ring.Front(); elem != nil; {
@@ -184,7 +218,7 @@ func (r *Ring[T]) Close() error {
 		elem = next
 	}
 	r.current = nil
-	r.mu.Unlock()
+	r.sem.Release(1)
 
 	for _, cli := range clients {
 		_ = r.close(cli)

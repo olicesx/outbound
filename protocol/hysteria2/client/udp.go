@@ -94,6 +94,16 @@ func (u *udpConn) TransportDone() <-chan struct{} {
 	return u.transportDone
 }
 
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior.
+// SetWriteDeadline delegates to SetDeadline, which arms a session-wide
+// timer whose expiry closes the whole udpConn — every UDP flow multiplexed
+// on it — instead of aborting only one blocked write. A merely-full datagram
+// queue is congestion, so deadline-arming callers (e.g. dae's UdpEndpoint)
+// must skip arming here and absorb the backpressure as dropped datagrams.
+func (u *udpConn) WriteDeadlineClosesSession() bool {
+	return true
+}
+
 func (u *udpConn) Read(b []byte) (n int, err error) {
 	msg, _, err := u.ReadFrom(b)
 	return msg, err

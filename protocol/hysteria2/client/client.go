@@ -311,8 +311,8 @@ func (c *clientImpl) TCP(addr string, ctx context.Context) (netproxy.Conn, error
 	if c.config.FastOpen {
 		// Don't wait for the response when fast open is enabled.
 		// Return the connection immediately, defer the response handling
-		// to the first Read() call, which re-arms the dial deadline:
-		// clearing it here would leave that read unbounded.
+		// to the first Read() call. Keep the dial deadline armed until
+		// the response is consumed, independently of caller deadlines.
 		return &tcpConn{
 			Orig:             stream,
 			PseudoLocalAddr:  connSnapshot.LocalAddr(),
@@ -454,9 +454,12 @@ type tcpConn struct {
 	PseudoRemoteAddr net.Addr
 	Established      bool
 
-	// dialDeadline is the dial ctx deadline, kept armed across the
-	// fast-open return so the deferred response read stays bounded.
-	dialDeadline time.Time
+	// deadlineMu serializes caller deadline changes with handshake cleanup.
+	// Until the response is consumed, the dial deadline caps both directions.
+	deadlineMu    sync.Mutex
+	dialDeadline  time.Time
+	readDeadline  time.Time
+	writeDeadline time.Time
 
 	// Fast-open mode defers the response read to the first Read. The once
 	// guarantees exactly one ReadTCPResponse even if callers race the first
@@ -467,10 +470,15 @@ type tcpConn struct {
 
 func (c *tcpConn) readFastOpenResponse() error {
 	c.establishOnce.Do(func() {
-		if !c.dialDeadline.IsZero() {
-			_ = c.Orig.SetDeadline(c.dialDeadline)
-			defer func() { _ = c.Orig.SetDeadline(time.Time{}) }()
-		}
+		defer func() {
+			c.deadlineMu.Lock()
+			defer c.deadlineMu.Unlock()
+			if !c.dialDeadline.IsZero() {
+				c.dialDeadline = time.Time{}
+				_ = c.Orig.SetReadDeadline(c.readDeadline)
+				_ = c.Orig.SetWriteDeadline(c.writeDeadline)
+			}
+		}()
 		ok, msg, err := protocol.ReadTCPResponse(c.Orig)
 		if err != nil {
 			c.respErr = err
@@ -489,7 +497,6 @@ func (c *tcpConn) Read(b []byte) (n int, err error) {
 		if err = c.readFastOpenResponse(); err != nil {
 			return 0, err
 		}
-		c.Established = true
 	}
 	return c.Orig.Read(b)
 }
@@ -521,16 +528,34 @@ func (c *tcpConn) RemoteAddr() net.Addr {
 	return c.PseudoRemoteAddr
 }
 
+// handshakeDeadline returns the earlier nonzero deadline. Caller deadlines
+// cannot extend or disable the dial timeout while the response is pending.
+func (c *tcpConn) handshakeDeadline(t time.Time) time.Time {
+	if !c.dialDeadline.IsZero() && (t.IsZero() || c.dialDeadline.Before(t)) {
+		return c.dialDeadline
+	}
+	return t
+}
+
 func (c *tcpConn) SetDeadline(t time.Time) error {
-	return c.Orig.SetDeadline(t)
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	c.readDeadline, c.writeDeadline = t, t
+	return c.Orig.SetDeadline(c.handshakeDeadline(t))
 }
 
 func (c *tcpConn) SetReadDeadline(t time.Time) error {
-	return c.Orig.SetReadDeadline(t)
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	c.readDeadline = t
+	return c.Orig.SetReadDeadline(c.handshakeDeadline(t))
 }
 
 func (c *tcpConn) SetWriteDeadline(t time.Time) error {
-	return c.Orig.SetWriteDeadline(t)
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	c.writeDeadline = t
+	return c.Orig.SetWriteDeadline(c.handshakeDeadline(t))
 }
 
 type udpIOImpl struct {

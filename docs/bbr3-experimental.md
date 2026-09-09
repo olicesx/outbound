@@ -187,29 +187,18 @@ hysteria2://<auth>:<password>@<server>:443?upmbps=20&downmbps=100&cc_override=bb
 注意：非法值（例如 `cc_override=bbr4`）会让 dialer 构造失败并报错，不会静默降级——
 这是刻意设计，避免拼写错误被掩盖。hysteria2 同理：`cubic`/`new_reno` 也会在构造时被拒绝。
 
-### ② 代码级：切回分支或 revert 提交
+### ② 代码级：撤销合并提交（特性已合入基线）
 
-本特性在独立分支 `feat/bbr3-experimental` 上，基线为 `origin/perf/complete-optimizations`。
-本特性包含的提交列表：
-
-```bash
-cd /root/olicesx-outbound
-HOME=/root git log --oneline origin/perf/complete-optimizations..feat/bbr3-experimental
-```
+本特性已以**合并提交**合入基线 `perf/complete-optimizations`：合并提交 `319c8e6`，
+两个父提交为 `7a32a56`（基线）与 `934b37c`（特性分支）。回退即撤销该合并：
 
 ```bash
-# 方式 A：切回基线分支
 cd /root/olicesx-outbound
-HOME=/root git checkout perf/complete-optimizations
-
-# 方式 B：反向提交本特性的代码接入提交（保留分支，不重写历史）
-#   500fd38 是 bbr3 接入的首个提交；本特性后续提交（含 juicity/hysteria2 接入）
-#   需一并 revert，或直接采用方式 A。
-cd /root/olicesx-outbound
-HOME=/root git revert 500fd38
+HOME=/root git revert -m 1 319c8e6     # 保留历史，不重写
 ```
 
-如果 dae 用本地 `replace` 指向本仓库，切分支 / revert 后需要重新构建 dae：
+特性分支 `feat/bbr3-experimental` 仍保留，需要时可重新合并。撤销后若 dae 用本地
+`replace` 指向本仓库，重新构建 dae 即可：
 
 ```bash
 cd /root/dae
@@ -218,18 +207,10 @@ HOME=/root go build -tags=$(cat .build_tags) -o dae .
 
 ### ③ 产品侧：把 dae 的 go.mod replace 钉回旧提交
 
-dae 的基线分支（`kdae`）钉的是
-`github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260907140516-07427f11deb3`
-（即 fork 的 `07427f1`）；本特性分支 `feat/bbr3-experimental` 每新增一个提交，其伪版本都会变化，
-合并后请用下面的命令重新解析：
-
-```bash
-cd /root/dae
-HOME=/root GOFLAGS=-mod=mod GOPROXY=direct GOSUMDB=off GOPRIVATE='github.com/olicesx/*' \
-  go list -m -json github.com/olicesx/outbound@feat/bbr3-experimental
-```
-
-回退即恢复旧钉法：
+dae 的基线分支（`kdae`）已钉到合并后的 outbound 提交
+`github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260909102757-319c8e694f48`
+（即 fork `perf/complete-optimizations` 的合并提交 `319c8e6`）。回退即恢复接入前的旧钉法
+（`v0.0.0-sticky-ip.0.20260907140516-07427f11deb3` = fork `07427f1`）：
 
 ```bash
 cd /root/dae
@@ -237,6 +218,14 @@ HOME=/root go mod edit -replace github.com/daeuniverse/outbound=github.com/olice
 HOME=/root go mod edit -require github.com/daeuniverse/outbound@v0.0.0-sticky-ip.0.20260907140516-07427f11deb3
 HOME=/root go mod tidy
 HOME=/root go build -tags=$(cat .build_tags) -o dae .
+```
+
+若日后 outbound 基线又有新提交，用下面的命令重新解析伪版本：
+
+```bash
+cd /root/dae
+HOME=/root GOFLAGS=-mod=mod GOPROXY=direct GOSUMDB=off GOPRIVATE='github.com/olicesx/*' \
+  go list -m -json github.com/olicesx/outbound@perf/complete-optimizations
 ```
 
 语义：三级回退互相独立。① 只改链接（对三个协议都立即生效）；② 只改本地仓库；

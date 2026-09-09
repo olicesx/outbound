@@ -17,6 +17,34 @@ func init() {
 	protocol.Register("tuic", NewDialer)
 }
 
+// supportedCongestionControllers is the allowlist accepted by the client-local
+// cc_override parameter. It lists only the controllers this client can install;
+// an unrecognized value is a configuration error, never a silent BBR fallback.
+var supportedCongestionControllers = map[string]struct{}{
+	"bbr":      {},
+	"cubic":    {},
+	"new_reno": {},
+	"brutal":   {},
+	"bbr3":     {},
+}
+
+// selectCongestionController resolves the congestion controller to install.
+// serverCC is the value echoed by the server during the handshake; override is
+// the optional client-local cc_override value, already normalized (lowercased
+// and trimmed) by the link parser. An empty override returns serverCC unchanged,
+// preserving the pre-override behavior exactly. A non-empty override must be in
+// the allowlist, otherwise an error is returned so a typo fails fast instead of
+// being silently downgraded to BBR.
+func selectCongestionController(serverCC, override string) (string, error) {
+	if override == "" {
+		return serverCC, nil
+	}
+	if _, ok := supportedCongestionControllers[override]; !ok {
+		return "", fmt.Errorf("unsupported cc_override %q: must be one of bbr, cubic, new_reno, brutal, bbr3", override)
+	}
+	return override, nil
+}
+
 type Dialer struct {
 	clientRing *clientRing
 
@@ -46,6 +74,14 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	// (bytes per second) when congestion_control=brutal; 0 lets the
 	// controller fall back to BBR.
 	cwnd := common.CWNDFromFeature(header.Feature2)
+	// Feature1 is the congestion controller echoed by the server. A non-string
+	// value (a caller mistake) must degrade instead of panicking; the override,
+	// when present, takes precedence over whatever the server echoed.
+	serverCC, _ := header.Feature1.(string)
+	cc, err := selectCongestionController(serverCC, header.CongestionOverride)
+	if err != nil {
+		return nil, err
+	}
 	proxyUDPAddr, err := net.ResolveUDPAddr("udp", header.ProxyAddress)
 	if err != nil {
 		return nil, err
@@ -68,7 +104,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 				Uuid:                  id,
 				Password:              header.Password,
 				UdpRelayMode:          udpRelayMode,
-				CongestionController:  header.Feature1.(string),
+				CongestionController:  cc,
 				ReduceRtt:             true, // 0-RTT cuts cold-start RTT
 				CWND:                  cwnd,
 				MaxUdpRelayPacketSize: maxDatagramFrameSize,

@@ -42,6 +42,14 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	if reservedStreamsCapability > 5 {
 		reservedStreamsCapability = 5
 	}
+	// Feature1 is the congestion controller echoed by the server. A non-string
+	// value (a caller mistake) must degrade instead of panicking; the override,
+	// when present, takes precedence over whatever the server echoed.
+	serverCC, _ := header.Feature1.(string)
+	cc, err := common.SelectCongestionController(serverCC, header.CongestionOverride)
+	if err != nil {
+		return nil, err
+	}
 	proxyUDPAddr, err := net.ResolveUDPAddr("udp", header.ProxyAddress)
 	if err != nil {
 		return nil, err
@@ -65,7 +73,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 					},
 					Uuid:                 id,
 					Password:             header.Password,
-					CongestionController: header.Feature1.(string),
+					CongestionController: cc,
 					CWND:                 common.CWNDFromFeature(header.Feature2),
 					Ctx:                  ctx,
 					Cancel:               cancel,

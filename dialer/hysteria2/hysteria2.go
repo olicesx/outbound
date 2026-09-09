@@ -38,6 +38,9 @@ type Hysteria2 struct {
 	MaxTx         uint64
 	MaxRx         uint64
 	ObfsPassword  string
+	// CCOverride is the client-local congestion controller override carried
+	// by the "cc_override" query parameter. It is never sent to the server.
+	CCOverride string
 }
 
 func NewHysteria2(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string) (netproxy.Dialer, *dialer.Property, error) {
@@ -73,6 +76,9 @@ func (s *Hysteria2) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Diale
 		User:         s.User,
 		Password:     s.Password,
 		IsClient:     true,
+		// Client-local cc_override; the hysteria2 auth request carries no
+		// congestion controller, so nothing about this reaches the server.
+		CongestionOverride: s.CCOverride,
 	}
 
 	feature1 := &hysteria2.Feature1{
@@ -234,6 +240,7 @@ func ParseHysteria2URL(link string) (*Hysteria2, error) {
 		MaxTx:         maxTx,
 		MaxRx:         maxRx,
 		ObfsPassword:  obfsPassword,
+		CCOverride:    strings.ToLower(strings.TrimSpace(q.Get("cc_override"))),
 	}
 	conf.Password, _ = u.User.Password()
 	return conf, nil
@@ -268,6 +275,9 @@ func (s *Hysteria2) ExportToURL() string {
 	if s.MaxTx > 0 && s.MaxRx > 0 {
 		q.Set("maxTx", strconv.FormatUint(s.MaxTx, 10))
 		q.Set("maxRx", strconv.FormatUint(s.MaxRx, 10))
+	}
+	if s.CCOverride != "" {
+		q.Set("cc_override", s.CCOverride)
 	}
 	t.RawQuery = q.Encode()
 	return t.String()

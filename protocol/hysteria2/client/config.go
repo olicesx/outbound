@@ -34,6 +34,10 @@ type Config struct {
 	UDPHopInterval  time.Duration
 	FastOpen        bool
 	ObfsPassword    string
+	// CCOverride is the client-local cc_override value (lowercased and
+	// trimmed). It is never sent to the server and is empty by default, which
+	// keeps the historical server-driven congestion controller selection.
+	CCOverride string
 
 	filled bool // whether the fields have been verified and filled
 }

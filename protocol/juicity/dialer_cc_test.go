@@ -1,4 +1,4 @@
-package tuic
+package juicity
 
 import (
 	"crypto/tls"
@@ -49,13 +49,13 @@ func TestNewDialerWiresCongestionOverride(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewDialer: %v", err)
 			}
-			td, ok := d.(*Dialer)
+			jd, ok := d.(*Dialer)
 			if !ok {
 				t.Fatalf("got %T, want *Dialer", d)
 			}
-			defer func() { _ = td.Close() }()
+			defer func() { _ = jd.Close() }()
 
-			cli := td.clientRing.newClient(func(int64) {})
+			cli := jd.clientRing.newClient(func(int64) {})
 			if cli.CongestionController != tc.want {
 				t.Fatalf("CongestionController = %q, want %q", cli.CongestionController, tc.want)
 			}
@@ -73,8 +73,8 @@ func TestNewDialerRejectsUnknownCongestionOverride(t *testing.T) {
 		IsClient:           true,
 	})
 	if err == nil {
-		if td, ok := d.(*Dialer); ok {
-			_ = td.Close()
+		if jd, ok := d.(*Dialer); ok {
+			_ = jd.Close()
 		}
 		t.Fatal("NewDialer with unknown cc_override: want error, got nil")
 	}
@@ -94,13 +94,13 @@ func TestNewDialerNonStringFeature1DoesNotPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDialer: %v", err)
 	}
-	td, ok := d.(*Dialer)
+	jd, ok := d.(*Dialer)
 	if !ok {
 		t.Fatalf("got %T, want *Dialer", d)
 	}
-	defer func() { _ = td.Close() }()
+	defer func() { _ = jd.Close() }()
 
-	cli := td.clientRing.newClient(func(int64) {})
+	cli := jd.clientRing.newClient(func(int64) {})
 	if cli.CongestionController != "" {
 		t.Fatalf("CongestionController = %q, want empty for non-string Feature1", cli.CongestionController)
 	}

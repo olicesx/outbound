@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/dialer"
@@ -35,6 +36,10 @@ type Juicity struct {
 	Cwnd                  int
 	PinnedCertchainSha256 string
 	Protocol              string
+	// CCOverride is the client-local congestion controller override carried
+	// by the "cc_override" query parameter. It is never sent to the server;
+	// CongestionControl still supplies the value echoed in the handshake.
+	CCOverride string
 }
 
 func NewJuicity(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string) (netproxy.Dialer, *dialer.Property, error) {
@@ -77,10 +82,13 @@ func (s *Juicity) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer)
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Feature1:     s.CongestionControl,
 		Feature2:     s.Cwnd,
-		TlsConfig:    tlsConfig,
-		User:         s.User,
-		Password:     s.Password,
-		IsClient:     true,
+		// The override stays client-local: Feature1 above is what the server
+		// echoes back and what unmodified servers understand.
+		CongestionOverride: s.CCOverride,
+		TlsConfig:          tlsConfig,
+		User:               s.User,
+		Password:           s.Password,
+		IsClient:           true,
 	}); err != nil {
 		return nil, nil, err
 	}
@@ -116,6 +124,7 @@ func ParseJuicityURL(u string) (data *Juicity, err error) {
 		CongestionControl:     t.Query().Get("congestion_control"),
 		Cwnd:                  dialer.CwndFromQuery(t),
 		PinnedCertchainSha256: t.Query().Get("pinned_certchain_sha256"),
+		CCOverride:            strings.ToLower(strings.TrimSpace(t.Query().Get("cc_override"))),
 		Protocol:              "juicity",
 	}
 	return data, nil
@@ -138,6 +147,9 @@ func (t *Juicity) ExportToURL() string {
 		common.SetValue(&q, "cwnd", strconv.Itoa(t.Cwnd))
 	}
 	common.SetValue(&q, "pinned_certchain_sha256", t.PinnedCertchainSha256)
+	if t.CCOverride != "" {
+		common.SetValue(&q, "cc_override", t.CCOverride)
+	}
 	u.RawQuery = q.Encode()
 	return u.String()
 }

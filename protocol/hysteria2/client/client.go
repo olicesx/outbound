@@ -37,7 +37,10 @@ type Client interface {
 
 type HandshakeInfo struct {
 	UDPEnabled bool
-	Tx         uint64 // 0 if using BBR
+	// Tx is the congestion target handed to the sender: the brutal target, or
+	// the bbr3 ceiling hint, in bytes per second. It is 0 when no target
+	// applies (BBR, or bbr3 without a configured bandwidth).
+	Tx uint64
 }
 
 func NewClient(config *Config) (Client, error) {
@@ -168,24 +171,31 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 	}
 	// Auth OK
 	authResp := protocol.AuthResponseFromHeader(resp.Header)
-	var actualTx uint64
-	if authResp.RxAuto {
-		// Server asks client to use bandwidth detection,
-		// ignore local bandwidth config and use BBR
+	// resolveCongestion preserves the pre-override behavior when CCOverride is
+	// empty, and fails the connection on an unsupported override instead of
+	// silently falling back to BBR.
+	ccName, actualTx, err := resolveCongestion(
+		c.config.CCOverride,
+		authResp.RxAuto,
+		authResp.Rx,
+		c.config.BandwidthConfig.MaxTx,
+	)
+	if err != nil {
+		if conn != nil {
+			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
+		}
+		_ = pktConn.Close()
+		return nil, coreErrs.ConnectError{Err: err}
+	}
+	switch ccName {
+	case ccBrutal:
+		congestion.UseBrutal(conn, actualTx)
+	case ccBbr3:
+		// actualTx carries the access-link ceiling hint in bytes per second;
+		// zero leaves the sender purely probing.
+		congestion.UseBbr3(conn, actualTx)
+	default:
 		congestion.UseBBR(conn)
-	} else {
-		// actualTx = min(serverRx, clientTx)
-		actualTx = authResp.Rx
-		if actualTx == 0 || actualTx > c.config.BandwidthConfig.MaxTx {
-			// Server doesn't have a limit, or our clientTx is smaller than serverRx
-			actualTx = c.config.BandwidthConfig.MaxTx
-		}
-		if actualTx > 0 {
-			congestion.UseBrutal(conn, actualTx)
-		} else {
-			// We don't know our own bandwidth either, use BBR
-			congestion.UseBBR(conn)
-		}
 	}
 	c.pktConn = pktConn
 	c.conn = conn

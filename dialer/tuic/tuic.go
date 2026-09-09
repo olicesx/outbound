@@ -35,7 +35,16 @@ type Tuic struct {
 	Alpn         []string
 	Protocol     string
 	UdpRelayMode string
+	// CCOverride is the client-local congestion controller override carried
+	// by the "cc_override" query parameter. It is never sent to the server;
+	// CongestionControl still supplies the value echoed in the handshake.
+	CCOverride string
 }
+
+// newProtocolDialer is a test seam: production always calls protocol.NewDialer.
+// It lets a test observe the header Dialer builds, including the client-local
+// congestion controller override that must reach the protocol layer.
+var newProtocolDialer = protocol.NewDialer
 
 func NewTuic(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string) (netproxy.Dialer, *dialer.Property, error) {
 	s, err := ParseTuicURL(link)
@@ -52,10 +61,13 @@ func (s *Tuic) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (n
 	if s.UdpRelayMode == "quic" {
 		flags |= protocol.Flags_Tuic_UdpRelayModeQuic
 	}
-	if d, err = protocol.NewDialer("tuic", d, protocol.Header{
+	if d, err = newProtocolDialer("tuic", d, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Feature1:     s.CongestionControl,
 		Feature2:     s.Cwnd,
+		// The override stays client-local: Feature1 above is what the server
+		// echoes back and what unmodified servers understand.
+		CongestionOverride: s.CCOverride,
 		TlsConfig: &tls.Config{
 			NextProtos:         s.Alpn,
 			MinVersion:         tls.VersionTLS13,
@@ -116,6 +128,7 @@ func ParseTuicURL(u string) (data *Tuic, err error) {
 		Cwnd:              dialer.CwndFromQuery(t),
 		Alpn:              alpn,
 		UdpRelayMode:      strings.ToLower(t.Query().Get("udp_relay_mode")),
+		CCOverride:        strings.ToLower(strings.TrimSpace(t.Query().Get("cc_override"))),
 		Protocol:          "tuic",
 	}
 	return data, nil
@@ -138,6 +151,9 @@ func (t *Tuic) ExportToURL() string {
 	}
 	if t.CongestionControl != "" {
 		common.SetValue(&q, "congestion_control", t.CongestionControl)
+	}
+	if t.CCOverride != "" {
+		common.SetValue(&q, "cc_override", t.CCOverride)
 	}
 	if t.Cwnd > 0 {
 		common.SetValue(&q, "cwnd", strconv.Itoa(t.Cwnd))

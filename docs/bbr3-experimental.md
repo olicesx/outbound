@@ -9,7 +9,8 @@
 ## 1. 这是什么
 
 `bbr3` 是本仓库自带的一个**自制（homemade）拥塞控制器**，放在
-`protocol/tuic/congestion/bbr3/`，只在 TUIC 客户端侧使用。
+`protocol/tuic/congestion/bbr3/`，通过 `cc_override` 在 **TUIC / Juicity / Hysteria2**
+三个 QUIC 协议的客户端侧 opt-in 使用。
 
 - 名字是历史命名：**它不是 BBRv3 的参考实现，也没有做过 BBRv3 一致性验证**。
   Linux 内核版本、gain 常量、PROBE_RTT 目标这类"看起来像 BBRv3"的特征都不能作为
@@ -18,6 +19,8 @@
   行为与参考 BBR 实现存在差异；没有完整的 ECN/恢复模型、Reno 共存逻辑、
   ACK 聚合补偿或随机化探测调度。
 - 默认**不会被选中**：只有通过下面的 `cc_override` 才会生效。
+- 接入面：`cc_override` 覆盖 `tuic`、`juicity`、`hysteria2`；`naive` 的 QUIC 模式未接入
+  （dialer 直接返回 "not supported yet"）。
 - 可选的 `hint`（接入带宽上限）默认只作为**上限**，不是目标速率；
   其"验证授权"门控（`EnableValidatedHint`）默认关闭，且**不推荐开启**（见 §2.3）。
 
@@ -77,24 +80,29 @@
 
 ## 3. 如何启用
 
-在 TUIC 链接上追加 `cc_override=bbr3`：
+`cc_override` 是**客户端本地**参数，三个协议语义一致，按各自链接风格追加即可：
+
+| 项 | 说明 |
+|---|---|
+| `cc_override` | **只在客户端本地生效，不发给服务端**。服务端回显/下发的 CC 都会被本地覆盖。 |
+| 白名单 | `bbr`、`cubic`、`new_reno`、`brutal`、`bbr3`。非法值在构造 dialer 时**直接报错**（fail fast），不会静默回退成 BBR。 |
+| 大小写/空白 | 解析时统一转小写并去空白：`cc_override=BBR3`、`cc_override=%20bbr3%20` 等价于 `cc_override=bbr3`。 |
+| 服务端 | 三个协议都**不需要**服务端支持或改动。 |
+
+> 注意：白名单里的 `cubic`/`new_reno` 目前**没有本地实现**。tuic / juicity 会把它们落到 BBR
+> （与接入前服务端回显 `cubic` 的行为一致）；hysteria2 则在构造 dialer 时直接报错。
+> 需要确定性 BBR 时请显式写 `cc_override=bbr`。
+
+### 3.1 TUIC
 
 ```text
 tuic://<uuid>:<password>@<server>:<port>?congestion_control=bbr&cc_override=bbr3
 ```
 
-要点：
-
-| 项 | 说明 |
-|---|---|
-| `cc_override` | **只在客户端本地生效，不发给服务端**。服务端回显什么都会被本地覆盖。 |
-| `congestion_control` | 仍然按原逻辑发给服务端并回显（`Feature1` 不变）。服务端**无需支持 bbr3**，写 `bbr`/`cubic`/留空都可以。 |
-| 白名单 | `bbr`、`cubic`、`new_reno`、`brutal`、`bbr3`。非法值在构造 dialer 时**直接报错**（fail fast），不会静默回退成 BBR。 |
-| 大小写/空白 | 解析时统一转小写并去空白：`cc_override=BBR3`、`cc_override=%20bbr3%20` 等价于 `cc_override=bbr3`。 |
-| `cwnd` | 对 bbr3 是**接入带宽上限（字节/秒）**，只作上限、不是目标；`0`/不设 = 不设上限、纯探测。 |
-
-**复现上表实验配置**：实验里的 bbr3 臂使用 `hint = 20 Mbps = 2,500,000 字节/秒`、默认参数
-（`EnableValidatedHint=false`、`StrictHintCap=false`）。所以对照测试请显式给出 `cwnd`：
+- `congestion_control` 仍按原逻辑发给服务端并回显（`Feature1` 不变）；服务端**无需支持 bbr3**，写 `bbr`/`cubic`/留空都可以。
+- `cwnd` 对 bbr3 是**接入带宽上限（字节/秒）**，只作上限、不是目标；`0`/不设 = 不设上限、纯探测。
+- **复现 §2.1 实验配置**：实验里的 bbr3 臂使用 `hint = 20 Mbps = 2,500,000 字节/秒`、默认参数
+  （`EnableValidatedHint=false`、`StrictHintCap=false`）。所以对照测试请显式给出 `cwnd`：
 
 ```text
 tuic://<uuid>:<password>@<server>:<port>?congestion_control=bbr&cc_override=bbr3&cwnd=2500000
@@ -103,17 +111,49 @@ tuic://<uuid>:<password>@<server>:<port>?congestion_control=bbr&cc_override=bbr3
 `cwnd` 与 brutal 使用同一单位（字节/秒），换算：`字节/秒 = 接入带宽 Mbps × 1e6 / 8`。
 不设 `cwnd` 时 bbr3 纯探测，**不在上表证据覆盖范围内**。
 
-### 3.1 如何确认 bbr3 真的装上了
+### 3.2 Juicity
+
+```text
+juicity://<uuid>:<password>@<server>:<port>?congestion_control=bbr&cc_override=bbr3&cwnd=2500000
+```
+
+与 tuic 完全同形：`congestion_control` 仍发给服务端，`cc_override` 只在本地生效，
+`cwnd` 是 bbr3 的上限 hint（brutal 语义同 tuic）。tuic 与 juicity 共用同一份白名单与
+fail-fast 语义（`protocol/tuic/common.SelectCongestionController`）。
+
+### 3.3 Hysteria2
+
+```text
+hysteria2://<auth>:<password>@<server>:443?upmbps=20&downmbps=100&cc_override=bbr3
+```
+
+- hysteria2 没有 `cwnd` 参数：bbr3 的 **hint = `BandwidthConfig.MaxTx`**，即 `upmbps`
+  （或 legacy `maxTx`）换算出的字节/秒；`0` = 纯探测。换算同上（`字节/秒 = Mbps × 1e6 / 8`）。
+- `cc_override` **优先于服务端**：即使服务端返回 `RxAuto`（要求客户端做带宽探测），
+  也会安装 bbr3 而不是 BBR。
+- hy2 支持 `bbr`、`brutal`、`bbr3`；`cubic`/`new_reno` 在白名单内但 hy2 无实现，
+  构造 dialer 时**直接报错**，不静默降级。
+- `brutal` 保持接入前语义：`min(serverRx, clientTx)`，无带宽时回退 BBR。
+
+### 3.4 不支持：naive+quic
+
+`naive` 的 QUIC 模式 dialer 直接返回 "not supported yet"，`cc_override` 对它无效。
+
+### 3.5 如何确认 bbr3 真的装上了
 
 `dae validate` **不解析节点链接**（连非法端口都会放行），所以不能靠它验证。运行时把日志级别调到
-`debug`（`global { log_level: debug }`），每条 TUIC 连接安装控制器时会输出一行：
+`debug`（`global { log_level: debug }`），tuic / juicity 的每条连接安装控制器时会输出一行：
 
 ```text
 level=debug msg="installing experimental bbr3 congestion controller" cc=bbr3 hint_bps=2500000
 ```
 
-看不到这行 = 没生效（链接写错、`cc_override` 拼写错误、或走了其他节点）。注意：`cc_override`
-非法值在**首次拨号**时才报错，不会在配置校验阶段暴露，因此拼错时会表现为该节点连接失败。
+看不到这行 = 没生效（链接写错、`cc_override` 拼写错误、或走了其他节点）。
+hysteria2 走的是另一条安装路径（握手时按服务端响应分派），**没有这条日志**；对它请用
+`cc_override=bbr4` 之类的非法值确认 fail-fast 路径（构造 dialer 即报错），再以延迟分布变化判断。
+
+注意：非法 `cc_override` 在**构造 dialer 时**报错（dae 的 `validate` 不解析链接，
+因此不会在配置校验阶段暴露），表现为该节点不可用/连接失败。
 
 ---
 
@@ -121,33 +161,52 @@ level=debug msg="installing experimental bbr3 congestion controller" cc=bbr3 hin
 
 ### ① 链接级：立即生效，无需重编译（首选）
 
-- 去掉 `cc_override=bbr3` → 立刻回到服务端回显的控制器；
-- 或改成 `cc_override=bbr` → 本地强制 BBR，忽略服务端回显。
+- 去掉 `cc_override=bbr3` → 立刻回到服务端回显/下发的控制器；
+- 或改成 `cc_override=bbr` → 本地强制 BBR，忽略服务端。
+
+三个协议各自示例：
 
 ```text
-# 回退到服务端回显
+# TUIC：回退到服务端回显
 tuic://<uuid>:<password>@<server>:<port>?congestion_control=bbr
 
-# 本地强制 BBR
+# TUIC：本地强制 BBR
 tuic://<uuid>:<password>@<server>:<port>?congestion_control=bbr&cc_override=bbr
+
+# Juicity：回退到服务端回显 / 本地强制 BBR
+juicity://<uuid>:<password>@<server>:<port>?congestion_control=bbr
+juicity://<uuid>:<password>@<server>:<port>?congestion_control=bbr&cc_override=bbr
+
+# Hysteria2：回退到服务端驱动（RxAuto→BBR / 带宽→brutal）
+hysteria2://<auth>:<password>@<server>:443?upmbps=20&downmbps=100
+# Hysteria2：本地强制 BBR
+hysteria2://<auth>:<password>@<server>:443?upmbps=20&downmbps=100&cc_override=bbr
 ```
 
 改完重载 dae 配置（或重启 dae 进程）即可，**不需要重新编译**。
 注意：非法值（例如 `cc_override=bbr4`）会让 dialer 构造失败并报错，不会静默降级——
-这是刻意设计，避免拼写错误被掩盖。
+这是刻意设计，避免拼写错误被掩盖。hysteria2 同理：`cubic`/`new_reno` 也会在构造时被拒绝。
 
 ### ② 代码级：切回分支或 revert 提交
 
 本特性在独立分支 `feat/bbr3-experimental` 上，基线为 `origin/perf/complete-optimizations`。
+本特性包含的提交列表：
+
+```bash
+cd /root/olicesx-outbound
+HOME=/root git log --oneline origin/perf/complete-optimizations..feat/bbr3-experimental
+```
 
 ```bash
 # 方式 A：切回基线分支
 cd /root/olicesx-outbound
 HOME=/root git checkout perf/complete-optimizations
 
-# 方式 B：在当前分支上反向提交（保留分支，不重写历史）
+# 方式 B：反向提交本特性的代码接入提交（保留分支，不重写历史）
+#   500fd38 是 bbr3 接入的首个提交；本特性后续提交（含 juicity/hysteria2 接入）
+#   需一并 revert，或直接采用方式 A。
 cd /root/olicesx-outbound
-HOME=/root git revert 500fd38      # feat(tuic): add experimental bbr3 ...（代码接入提交）
+HOME=/root git revert 500fd38
 ```
 
 如果 dae 用本地 `replace` 指向本仓库，切分支 / revert 后需要重新构建 dae：
@@ -161,8 +220,16 @@ HOME=/root go build -tags=$(cat .build_tags) -o dae .
 
 dae 的基线分支（`kdae`）钉的是
 `github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260907140516-07427f11deb3`
-（即 fork 的 `07427f1`）；本特性分支 `feat/bbr3-experimental` 钉的是含 bbr3 的提交
-（当前 `v0.0.0-sticky-ip.0.20260909101419-8ef1d1b9d0a6`）。回退即恢复旧钉法：
+（即 fork 的 `07427f1`）；本特性分支 `feat/bbr3-experimental` 每新增一个提交，其伪版本都会变化，
+合并后请用下面的命令重新解析：
+
+```bash
+cd /root/dae
+HOME=/root GOFLAGS=-mod=mod GOPROXY=direct GOSUMDB=off GOPRIVATE='github.com/olicesx/*' \
+  go list -m -json github.com/olicesx/outbound@feat/bbr3-experimental
+```
+
+回退即恢复旧钉法：
 
 ```bash
 cd /root/dae
@@ -172,22 +239,25 @@ HOME=/root go mod tidy
 HOME=/root go build -tags=$(cat .build_tags) -o dae .
 ```
 
-语义：三级回退互相独立。① 只改链接；② 只改本地仓库；③ 只改产品依赖钉法。
-任意一级都可以单独把 bbr3 从实际链路里移除。
+语义：三级回退互相独立。① 只改链接（对三个协议都立即生效）；② 只改本地仓库；
+③ 只改产品依赖钉法。任意一级都可以单独把 bbr3 从实际链路里移除。
 
 ---
 
 ## 5. 默认值声明
 
-**不设置 `cc_override` 时，行为与接入前完全一致**：
+**不设置 `cc_override` 时，行为与接入前完全一致**（tuic / juicity / hysteria2 三个协议）：
 
 - `header.Feature1`（服务端回显的 CC）仍被原样使用，选择逻辑在 override 为空时
   逐字返回服务端值；
+- hysteria2 的空 override 走 `resolveCongestion`，逐字复现原决策：
+  `RxAuto → BBR`；否则 `actualTx = min(serverRx, clientTx)`，`>0 → brutal(actualTx)`，
+  否则 `BBR`；
 - bbr3 不可能被选中（没有任何默认路径指向它）；
 - `bbr3.DefaultParams()` 未改动，`EnableValidatedHint` 仍为 false；
-- 产品默认值（dae 配置默认、`congestion_control` 默认、`cwnd` 语义）全部未改；
-- 新增字段 `protocol.Header.CongestionOverride` 只被 TUIC dialer 读取，其他协议不受影响
-  （所有 `protocol.Header` 构造均为具名字段）。
+- 产品默认值（dae 配置默认、`congestion_control` 默认、`cwnd`/`upmbps`/`maxTx` 语义）全部未改；
+- 新增字段 `protocol.Header.CongestionOverride` 只被 tuic / juicity / hysteria2 的 dialer 读取，
+  其他协议不受影响（所有 `protocol.Header` 构造均为具名字段）。
 
 ---
 
@@ -202,8 +272,12 @@ HOME=/root go build -tags=$(cat .build_tags) -o dae .
 - 服务端软件与版本（如 sing-box / tuic-server，版本号）：
 - 服务端是否做任何改动（默认：未改动，服务端无需支持 bbr3）：
 - 内核 / 发行版 / 架构：
-- 客户端配置（脱敏后）：`tuic://***:***@<server>:<port>?congestion_control=...&cc_override=...&cwnd=...`
-  （脱敏：uuid、密码、域名、IP 用 `***` 代替）
+- 协议：tuic / juicity / hysteria2
+- 客户端配置（脱敏后）：
+  `tuic://***:***@<server>:<port>?congestion_control=...&cc_override=...&cwnd=...`
+  `juicity://***:***@<server>:<port>?congestion_control=...&cc_override=...&cwnd=...`
+  `hysteria2://***:***@<server>:443?upmbps=...&downmbps=...&cc_override=...`
+  （脱敏：uuid、密码、域名、IP 用 `***` 代替；请保留 `cc_override` 与带宽参数原值）
 
 ### 场景
 - 链路：接入带宽 / 瓶颈带宽 / 单向时延 / 抖动 / 丢包模型（或"真实公网"）/ 队列大小
@@ -236,8 +310,16 @@ HOME=/root go build -tags=$(cat .build_tags) -o dae .
   未覆盖：真实公网、竞争流与公平性、ACK 频率/聚合影响、多连接与 PMTU、长时间尺度。
 - **算法缺口**：自适应丢包基线可能吸收持续拥塞；无完整 ECN/恢复模型；
   无 Reno 共存逻辑；无 ACK 聚合补偿；无随机化探测调度。
+- **协议覆盖**：`cc_override` 已接入 `tuic`、`juicity`、`hysteria2`；
+  `naive` 的 QUIC 模式未接入（dialer 直接返回 "not supported yet"）。
+- **hysteria2 特有限制**：不支持 `cubic`/`new_reno`（构造 dialer 时拒绝）；
+  `cc_override` 会覆盖服务端的 `RxAuto`；bbr3 的 hint 只能来自 `upmbps`/`maxTx`
+  （没有 `cwnd`）；且 hy2 安装路径不打 debug 日志（§3.5）。
+- **证据适用范围**：§2.1 的对照数据来自 ccbench 单流仿真（控制器本体与协议无关），
+  juicity / hysteria2 的接入路径、hint 取值与 fail-fast 语义**只有单测证据**，
+  没有端到端或性能对照证据。
 - **hint 门控**：默认关闭且已证明惰性（§2.3），不推荐开启。
-- **回退面**：① 链接级可秒级回退；② ③ 需要重建 dae。
+- **回退面**：① 链接级可秒级回退（三个协议通用）；② ③ 需要重建 dae。
 
 ## 8. 什么结果会推翻当前结论（falsifier）
 

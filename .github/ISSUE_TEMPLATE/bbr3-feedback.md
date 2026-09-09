@@ -23,12 +23,16 @@ assignees: ''
 
 ## 客户端链路配置（脱敏）
 
+- **协议**：tuic / juicity / hysteria2
+
 ```text
 tuic://***:***@<server>:<port>?congestion_control=...&cc_override=...&cwnd=...
+juicity://***:***@<server>:<port>?congestion_control=...&cc_override=...&cwnd=...
+hysteria2://***:***@<server>:443?upmbps=...&downmbps=...&cc_override=...
 ```
 
 - uuid / 密码 / 域名 / IP 请用 `***` 代替。
-- 请保留 `congestion_control`、`cc_override`、`cwnd` 三个参数的原值。
+- 请保留 `cc_override` 与带宽参数（`cwnd` / `upmbps` / `maxTx`）的原值。
 
 ## 场景
 

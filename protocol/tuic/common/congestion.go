@@ -1,6 +1,8 @@
 package common
 
 import (
+	"fmt"
+
 	"github.com/daeuniverse/outbound/protocol/tuic/congestion"
 	"github.com/olicesx/quic-go"
 	"github.com/sirupsen/logrus"
@@ -32,6 +34,34 @@ func CWNDFromFeature(v interface{}) uint64 {
 		return n
 	}
 	return 0
+}
+
+// supportedCongestionControllers is the allowlist accepted by the client-local
+// cc_override parameter. It lists only the controllers this client can install;
+// an unrecognized value is a configuration error, never a silent BBR fallback.
+var supportedCongestionControllers = map[string]struct{}{
+	"bbr":      {},
+	"cubic":    {},
+	"new_reno": {},
+	"brutal":   {},
+	"bbr3":     {},
+}
+
+// SelectCongestionController resolves the congestion controller to install.
+// serverCC is the value echoed by the server during the handshake; override is
+// the optional client-local cc_override value, already normalized (lowercased
+// and trimmed) by the link parser. An empty override returns serverCC unchanged,
+// preserving the pre-override behavior exactly. A non-empty override must be in
+// the allowlist, otherwise an error is returned so a typo fails fast instead of
+// being silently downgraded to BBR.
+func SelectCongestionController(serverCC, override string) (string, error) {
+	if override == "" {
+		return serverCC, nil
+	}
+	if _, ok := supportedCongestionControllers[override]; !ok {
+		return "", fmt.Errorf("unsupported cc_override %q: must be one of bbr, cubic, new_reno, brutal, bbr3", override)
+	}
+	return override, nil
 }
 
 // SetCongestionController wires the configured congestion controller into

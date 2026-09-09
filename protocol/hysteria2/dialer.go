@@ -64,6 +64,13 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		config.UDPHopInterval = feature.(*Feature1).UDPHopInterval
 		config.ObfsPassword = feature.(*Feature1).ObfsPassword
 	}
+	// The override is client-local and never reaches the server. Validate it
+	// here so a typo fails at dialer construction, like tuic and juicity,
+	// instead of failing every connection at handshake time.
+	config.CCOverride = header.CongestionOverride
+	if err := client.ValidateCongestionOverride(config.CCOverride); err != nil {
+		return nil, err
+	}
 
 	var err error
 	if !isPortHoppingPort(port) {

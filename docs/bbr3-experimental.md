@@ -1,8 +1,10 @@
 # bbr3 实验性拥塞控制：启用、回退与反馈指南
 
-> 状态：**实验性、opt-in、非默认**。本文面向愿意做对照测试的测试者。
+> 状态：**实验性、默认启用（2026-09-09 起）**。本文面向所有用户与测试者。
 > 接入代码：`protocol/tuic/congestion/bbr3/`（自制实现）+ `cc_override` 本地覆盖开关。
-> 行为契约：不设置 `cc_override` 时，行为与接入前**完全一致**。
+> 行为契约：不设置 `cc_override` 时，TUIC / Juicity / Hysteria2 客户端默认安装 bbr3
+> （Hysteria2 会把 min(serverRx, clientTx) 作为 hint 传入；TUIC/Juicity 不传 hint）。
+> 显式参数仍然优先：`cc_override=bbr` 可恢复此前的稳定默认。
 
 ---
 
@@ -18,7 +20,9 @@
 - 它使用简化的 ACK 采样、round 滤波、模式循环、自适应丢包阈值和 inflight 边界，
   行为与参考 BBR 实现存在差异；没有完整的 ECN/恢复模型、Reno 共存逻辑、
   ACK 聚合补偿或随机化探测调度。
-- 默认**不会被选中**：只有通过下面的 `cc_override` 才会生效。
+- ~~默认**不会被选中**：只有通过下面的 `cc_override` 才会生效。~~
+  **2026-09-09 起默认启用**：不设置 `cc_override` 的 TUIC/Juicity/Hysteria2 链接
+  也会安装 bbr3；`cc_override=bbr` 可退回稳定默认（见 §3）。
 - 接入面：`cc_override` 覆盖 `tuic`、`juicity`、`hysteria2`；`naive` 的 QUIC 模式未接入
   （dialer 直接返回 "not supported yet"）。
 - 可选的 `hint`（接入带宽上限）默认只作为**上限**，不是目标速率；

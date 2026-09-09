@@ -3,7 +3,9 @@ package client
 import "testing"
 
 // TestResolveCongestion pins the whole decision table, including the
-// pre-override behavior that an empty override must reproduce exactly.
+// default-on behavior: an empty override now selects bbr3 (the experimental
+// default), with the historical min(serverRx, clientTx) value kept as its
+// access-link ceiling hint.
 func TestResolveCongestion(t *testing.T) {
 	const (
 		mbps5  = uint64(5_000_000)
@@ -21,44 +23,44 @@ func TestResolveCongestion(t *testing.T) {
 		wantErr  bool
 	}{
 		{
-			name:     "empty override with RxAuto uses BBR",
+			name:     "empty override with RxAuto uses bbr3 with min-target hint",
 			rxAuto:   true,
 			serverRx: mbps5,
 			clientTx: mbps10,
-			wantName: ccBBR,
-			wantTx:   0,
-		},
-		{
-			name:     "empty override without RxAuto uses server limit",
-			serverRx: mbps5,
-			clientTx: mbps10,
-			wantName: ccBrutal,
+			wantName: ccBbr3,
 			wantTx:   mbps5,
 		},
 		{
-			name:     "empty override without RxAuto caps at clientTx",
+			name:     "empty override without RxAuto uses bbr3 with server limit hint",
+			serverRx: mbps5,
+			clientTx: mbps10,
+			wantName: ccBbr3,
+			wantTx:   mbps5,
+		},
+		{
+			name:     "empty override without RxAuto hints at clientTx cap",
 			serverRx: mbps20,
 			clientTx: mbps10,
-			wantName: ccBrutal,
+			wantName: ccBbr3,
 			wantTx:   mbps10,
 		},
 		{
-			name:     "empty override without server limit uses clientTx",
+			name:     "empty override without server limit hints at clientTx",
 			serverRx: 0,
 			clientTx: mbps10,
-			wantName: ccBrutal,
+			wantName: ccBbr3,
 			wantTx:   mbps10,
 		},
 		{
-			name:     "empty override without any bandwidth uses BBR",
-			wantName: ccBBR,
+			name:     "empty override without any bandwidth uses bbr3 purely probing",
+			wantName: ccBbr3,
 			wantTx:   0,
 		},
 		{
 			name:     "empty override ignores server limit when clientTx is unset",
 			serverRx: mbps5,
 			clientTx: 0,
-			wantName: ccBBR,
+			wantName: ccBbr3,
 			wantTx:   0,
 		},
 		{

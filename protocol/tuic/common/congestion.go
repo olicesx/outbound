@@ -47,16 +47,23 @@ var supportedCongestionControllers = map[string]struct{}{
 	"bbr3":     {},
 }
 
+// DefaultCongestionController is installed when a link carries no explicit
+// cc_override. bbr3 is the experimental default under active evaluation; set
+// cc_override=bbr on a link to restore the previous stable default.
+const DefaultCongestionController = "bbr3"
+
 // SelectCongestionController resolves the congestion controller to install.
 // serverCC is the value echoed by the server during the handshake; override is
 // the optional client-local cc_override value, already normalized (lowercased
-// and trimmed) by the link parser. An empty override returns serverCC unchanged,
-// preserving the pre-override behavior exactly. A non-empty override must be in
-// the allowlist, otherwise an error is returned so a typo fails fast instead of
-// being silently downgraded to BBR.
+// and trimmed) by the link parser. An empty override selects
+// DefaultCongestionController (bbr3): the experiment runs by default on every
+// QUIC-protocol link, while an explicit override still wins — including
+// cc_override=bbr to restore the previous default. A non-empty override must
+// be in the allowlist, otherwise an error is returned so a typo fails fast
+// instead of being silently downgraded to BBR.
 func SelectCongestionController(serverCC, override string) (string, error) {
 	if override == "" {
-		return serverCC, nil
+		return DefaultCongestionController, nil
 	}
 	if _, ok := supportedCongestionControllers[override]; !ok {
 		return "", fmt.Errorf("unsupported cc_override %q: must be one of bbr, cubic, new_reno, brutal, bbr3", override)

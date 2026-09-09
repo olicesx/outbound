@@ -34,16 +34,16 @@ func TestSelectCongestionController(t *testing.T) {
 		wantErr  bool
 	}{
 		{
-			name:     "empty override keeps server value",
+			name:     "empty override selects the default (bbr3), ignoring server value",
 			serverCC: "bbr",
 			override: "",
-			want:     "bbr",
+			want:     "bbr3",
 		},
 		{
-			name:     "empty override keeps empty server value",
+			name:     "empty override with empty server value still selects the default",
 			serverCC: "",
 			override: "",
-			want:     "",
+			want:     "bbr3",
 		},
 		{
 			name:     "override wins over server value",

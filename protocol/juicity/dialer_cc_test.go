@@ -17,10 +17,10 @@ func TestNewDialerWiresCongestionOverride(t *testing.T) {
 		want     string
 	}{
 		{
-			name:     "no override keeps server value",
+			name:     "no override selects the default (bbr3), ignoring server value",
 			serverCC: "cubic",
 			override: "",
-			want:     "cubic",
+			want:     "bbr3",
 		},
 		{
 			name:     "override replaces server value",
@@ -101,7 +101,7 @@ func TestNewDialerNonStringFeature1DoesNotPanic(t *testing.T) {
 	defer func() { _ = jd.Close() }()
 
 	cli := jd.clientRing.newClient(func(int64) {})
-	if cli.CongestionController != "" {
-		t.Fatalf("CongestionController = %q, want empty for non-string Feature1", cli.CongestionController)
+	if cli.CongestionController != "bbr3" {
+		t.Fatalf("CongestionController = %q, want default %q for non-string Feature1", cli.CongestionController, "bbr3")
 	}
 }

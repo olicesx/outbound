@@ -11,6 +11,12 @@ const (
 	ccBbr3   = "bbr3"
 )
 
+// defaultCongestionController mirrors
+// protocol/tuic/common.DefaultCongestionController: the controller installed
+// when a link carries no explicit cc_override. This package keeps its own
+// allowlist copy, so the default is mirrored here as well.
+const defaultCongestionController = ccBbr3
+
 // ValidateCongestionOverride reports whether override can be installed by this
 // client before any connection is attempted. An empty value is always valid and
 // means "no client override" (server-driven selection). cubic and new_reno are
@@ -32,17 +38,16 @@ func ValidateCongestionOverride(override string) error {
 // table is unit-testable without a QUIC connection.
 //
 // override is the normalized (lowercased, trimmed) cc_override value. An empty
-// override reproduces the historical server-driven behavior exactly:
+// override installs defaultCongestionController (bbr3) — the experimental
+// default — ignoring the historical server-driven table entirely:
 //
-//   - rxAuto: the server asks for bandwidth detection, so BBR is used;
-//   - otherwise actualTx = min(serverRx, clientTx); a positive target selects
-//     Brutal, and zero (no bandwidth known) selects BBR.
+//   - rxAuto: previously BBR, now bbr3 (serverRx is irrelevant to the sender);
+//   - otherwise the min(serverRx, clientTx) Brutal target is computed and
+//     handed to bbr3 as its access-link ceiling hint, so the bandwidth fields
+//     still bound pacing and inflight.
 //
-// A non-empty override takes precedence over the server:
+// A non-empty override keeps the historical semantics:
 //
-//   - bbr3 installs the experimental sender with clientTx (the configured
-//     access-link bandwidth in bytes per second) as its ceiling hint; zero
-//     leaves it purely probing and is never treated as a target;
 //   - bbr forces BBR and reports no target;
 //   - brutal runs the same min(serverRx, clientTx) computation and keeps the
 //     historical BBR fallback when no bandwidth is known;
@@ -56,13 +61,11 @@ func resolveCongestion(override string, rxAuto bool, serverRx, clientTx uint64) 
 	if err := ValidateCongestionOverride(override); err != nil {
 		return "", 0, err
 	}
+	if override == "" {
+		_, tx := brutalTarget(serverRx, clientTx)
+		return defaultCongestionController, tx, nil
+	}
 	switch override {
-	case "":
-		if rxAuto {
-			return ccBBR, 0, nil
-		}
-		name, tx := brutalTarget(serverRx, clientTx)
-		return name, tx, nil
 	case ccBbr3:
 		return ccBbr3, clientTx, nil
 	case ccBrutal:

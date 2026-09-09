@@ -3,6 +3,7 @@ package common
 import (
 	"github.com/daeuniverse/outbound/protocol/tuic/congestion"
 	"github.com/olicesx/quic-go"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -48,6 +49,12 @@ func SetCongestionController(quicConn quic.Connection, cc string, cwnd uint64) {
 		}
 		congestion.UseBrutal(quicConn, cwnd)
 	case "bbr3":
+		// Testers need an observable signal that the experimental controller
+		// was actually installed instead of silently falling back to BBR.
+		logrus.WithFields(logrus.Fields{
+			"cc":       "bbr3",
+			"hint_bps": cwnd,
+		}).Debug("installing experimental bbr3 congestion controller")
 		congestion.UseBbr3(quicConn, cwnd)
 	default:
 		congestion.UseBBR(quicConn)

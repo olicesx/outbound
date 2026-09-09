@@ -3,6 +3,11 @@ package tuic
 import (
 	"strings"
 	"testing"
+
+	"github.com/daeuniverse/outbound/dialer"
+	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/protocol"
+	"github.com/daeuniverse/outbound/protocol/direct"
 )
 
 func TestTuicURLRoundTripWithCwnd(t *testing.T) {
@@ -117,5 +122,37 @@ func TestTuicURLRoundTripWithCCOverride(t *testing.T) {
 					exported, hasOverride, tc.wantCCOverride != "")
 			}
 		})
+	}
+}
+
+// TestDialerPropagatesCCOverrideToHeader closes the last untested hop of the
+// opt-in path: a parsed link must reach the protocol layer as a client-local
+// override, while the server-visible Feature1 keeps congestion_control.
+func TestDialerPropagatesCCOverrideToHeader(t *testing.T) {
+	parsed, err := ParseTuicURL("tuic://uuid:pass@example.com:443?congestion_control=bbr&cc_override=bbr3")
+	if err != nil {
+		t.Fatalf("ParseTuicURL: %v", err)
+	}
+
+	original := newProtocolDialer
+	var capturedName string
+	var captured protocol.Header
+	newProtocolDialer = func(name string, next netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
+		capturedName, captured = name, header
+		return next, nil
+	}
+	defer func() { newProtocolDialer = original }()
+
+	if _, _, err := parsed.Dialer(&dialer.ExtraOption{}, direct.SymmetricDirect); err != nil {
+		t.Fatalf("Dialer: %v", err)
+	}
+	if capturedName != "tuic" {
+		t.Fatalf("protocol name = %q, want tuic", capturedName)
+	}
+	if captured.CongestionOverride != "bbr3" {
+		t.Fatalf("header CongestionOverride = %q, want bbr3", captured.CongestionOverride)
+	}
+	if captured.Feature1 != "bbr" {
+		t.Fatalf("header Feature1 = %v, want server-visible congestion_control bbr", captured.Feature1)
 	}
 }

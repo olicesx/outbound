@@ -103,6 +103,18 @@ tuic://<uuid>:<password>@<server>:<port>?congestion_control=bbr&cc_override=bbr3
 `cwnd` 与 brutal 使用同一单位（字节/秒），换算：`字节/秒 = 接入带宽 Mbps × 1e6 / 8`。
 不设 `cwnd` 时 bbr3 纯探测，**不在上表证据覆盖范围内**。
 
+### 3.1 如何确认 bbr3 真的装上了
+
+`dae validate` **不解析节点链接**（连非法端口都会放行），所以不能靠它验证。运行时把日志级别调到
+`debug`（`global { log_level: debug }`），每条 TUIC 连接安装控制器时会输出一行：
+
+```text
+level=debug msg="installing experimental bbr3 congestion controller" cc=bbr3 hint_bps=2500000
+```
+
+看不到这行 = 没生效（链接写错、`cc_override` 拼写错误、或走了其他节点）。注意：`cc_override`
+非法值在**首次拨号**时才报错，不会在配置校验阶段暴露，因此拼错时会表现为该节点连接失败。
+
 ---
 
 ## 4. 如何回退（三级，任选）

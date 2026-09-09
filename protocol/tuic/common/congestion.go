@@ -36,7 +36,9 @@ func CWNDFromFeature(v interface{}) uint64 {
 // SetCongestionController wires the configured congestion controller into
 // the QUIC connection. "brutal" uses cwnd as the target bandwidth in bytes
 // per second (community convention shared with sing-box and the tuic brutal
-// forks); when it is zero the connection falls back to BBR.
+// forks); when it is zero the connection falls back to BBR. "bbr3" uses the
+// same field as the access-link upper bound in bytes per second, which caps
+// pacing and inflight but is never a target; zero leaves it purely probing.
 func SetCongestionController(quicConn quic.Connection, cc string, cwnd uint64) {
 	switch cc {
 	case "brutal":
@@ -45,6 +47,8 @@ func SetCongestionController(quicConn quic.Connection, cc string, cwnd uint64) {
 			return
 		}
 		congestion.UseBrutal(quicConn, cwnd)
+	case "bbr3":
+		congestion.UseBbr3(quicConn, cwnd)
 	default:
 		congestion.UseBBR(quicConn)
 	}

@@ -1,6 +1,9 @@
 package tuic
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestTuicURLRoundTripWithCwnd(t *testing.T) {
 	cases := []struct {
@@ -51,6 +54,67 @@ func TestTuicURLRoundTripWithCwnd(t *testing.T) {
 			if reparsed.CongestionControl != parsed.CongestionControl {
 				t.Fatalf("round-trip CongestionControl = %q, want %q",
 					reparsed.CongestionControl, parsed.CongestionControl)
+			}
+		})
+	}
+}
+
+func TestTuicURLRoundTripWithCCOverride(t *testing.T) {
+	cases := []struct {
+		name           string
+		link           string
+		wantCC         string
+		wantCCOverride string
+	}{
+		{
+			name:           "cc_override bbr3",
+			link:           "tuic://uuid:pass@example.com:443?congestion_control=bbr&cc_override=bbr3",
+			wantCC:         "bbr",
+			wantCCOverride: "bbr3",
+		},
+		{
+			name:           "cc_override is lowercased and trimmed",
+			link:           "tuic://uuid:pass@example.com:443?congestion_control=bbr&cc_override=%20BBR3%20",
+			wantCC:         "bbr",
+			wantCCOverride: "bbr3",
+		},
+		{
+			name:           "missing cc_override stays empty",
+			link:           "tuic://uuid:pass@example.com:443?congestion_control=bbr",
+			wantCC:         "bbr",
+			wantCCOverride: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parsed, err := ParseTuicURL(tc.link)
+			if err != nil {
+				t.Fatalf("ParseTuicURL: %v", err)
+			}
+			if parsed.CCOverride != tc.wantCCOverride {
+				t.Fatalf("CCOverride = %q, want %q", parsed.CCOverride, tc.wantCCOverride)
+			}
+			// The override must not leak into the server-visible value.
+			if parsed.CongestionControl != tc.wantCC {
+				t.Fatalf("CongestionControl = %q, want %q", parsed.CongestionControl, tc.wantCC)
+			}
+
+			// Export/parse round trip must preserve the override.
+			exported := parsed.ExportToURL()
+			reparsed, err := ParseTuicURL(exported)
+			if err != nil {
+				t.Fatalf("re-ParseTuicURL: %v", err)
+			}
+			if reparsed.CCOverride != tc.wantCCOverride {
+				t.Fatalf("round-trip CCOverride = %q, want %q", reparsed.CCOverride, tc.wantCCOverride)
+			}
+			if reparsed.CongestionControl != tc.wantCC {
+				t.Fatalf("round-trip CongestionControl = %q, want %q", reparsed.CongestionControl, tc.wantCC)
+			}
+			if hasOverride := strings.Contains(exported, "cc_override="); hasOverride != (tc.wantCCOverride != "") {
+				t.Fatalf("exported URL %q cc_override presence = %v, want %v",
+					exported, hasOverride, tc.wantCCOverride != "")
 			}
 		})
 	}

@@ -159,8 +159,10 @@ HOME=/root go build -tags=$(cat .build_tags) -o dae .
 
 ### ③ 产品侧：把 dae 的 go.mod replace 钉回旧提交
 
-dae 当前钉的是 `github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260907140516-07427f11deb3`
-（即 fork 的 `07427f1`）。回退即恢复该钉法：
+dae 的基线分支（`kdae`）钉的是
+`github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260907140516-07427f11deb3`
+（即 fork 的 `07427f1`）；本特性分支 `feat/bbr3-experimental` 钉的是含 bbr3 的提交
+（当前 `v0.0.0-sticky-ip.0.20260909101419-8ef1d1b9d0a6`）。回退即恢复旧钉法：
 
 ```bash
 cd /root/dae

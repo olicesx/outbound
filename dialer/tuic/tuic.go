@@ -41,6 +41,11 @@ type Tuic struct {
 	CCOverride string
 }
 
+// newProtocolDialer is a test seam: production always calls protocol.NewDialer.
+// It lets a test observe the header Dialer builds, including the client-local
+// congestion controller override that must reach the protocol layer.
+var newProtocolDialer = protocol.NewDialer
+
 func NewTuic(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string) (netproxy.Dialer, *dialer.Property, error) {
 	s, err := ParseTuicURL(link)
 	if err != nil {
@@ -56,7 +61,7 @@ func (s *Tuic) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (n
 	if s.UdpRelayMode == "quic" {
 		flags |= protocol.Flags_Tuic_UdpRelayModeQuic
 	}
-	if d, err = protocol.NewDialer("tuic", d, protocol.Header{
+	if d, err = newProtocolDialer("tuic", d, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Feature1:     s.CongestionControl,
 		Feature2:     s.Cwnd,

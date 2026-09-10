@@ -106,6 +106,29 @@ func TestSamplerAckResolvesOwnPacketRecord(t *testing.T) {
 	}
 }
 
+// TestSamplerAnchorBehindTheSendHeadIsSafe pins the late-installation case: the
+// hysteria2 client installs the controller on a live connection, so the first
+// packet number the sampler sees can be far behind the next send. That jump is
+// wider than the ring, and it must re-anchor instead of locking registration out.
+func TestSamplerAnchorBehindTheSendHeadIsSafe(t *testing.T) {
+	s := newSampler(64)
+	t0 := time.Now()
+	// First call is an ack for a packet sent before the controller was installed.
+	if _, ok := s.onPacketAcked(t0, 10); ok {
+		t.Fatal("an ack with no send record produced a sample")
+	}
+	for pn := congestion.PacketNumber(5000); pn <= 5200; pn++ {
+		s.onPacketSent(t0, pn, 1200, 0, false)
+		if !tracked(s, pn) {
+			t.Fatalf("send record of pn=%d was discarded after a %d-packet jump (base=%d)",
+				pn, pn-10, s.base)
+		}
+	}
+	if live, capacity := s.liveSamples(), len(s.states); live > capacity {
+		t.Fatalf("retained %d send records, above the fixed capacity %d", live, capacity)
+	}
+}
+
 // TestSamplerWindowAboveHeadroomIsClean is the sizing corollary from the
 // reproduction: with a window comfortably larger than the in-flight packet span
 // the same send sequence registers without exception. It is kept as the control

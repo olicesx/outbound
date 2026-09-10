@@ -110,3 +110,13 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 func (c *Conn) CloseWrite() error {
 	return netproxy.ForwardCloseWrite(c.Conn)
 }
+
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped conn. Embedding the conn interface
+// promotes SetWriteDeadline but not this optional method, so without the
+// forward a session-closing inner conn (TUIC, hysteria2) would be invisible to
+// deadline-arming callers and they would arm a destructive timer believing it
+// was an ordinary write deadline.
+func (c *Conn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.Conn)
+}

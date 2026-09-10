@@ -84,6 +84,22 @@ func CleanScopedClientConnectionCache(scope string) {
 
 type ccCanceller func()
 
+// ClientConn is a gRPC tunnel that carries hunk-framed bytes.
+//
+// Deadline semantics, because they are asymmetric and the asymmetry is part of
+// the contract:
+//
+//   - A read deadline is transient: an expired read deadline makes the current
+//     Read return os.ErrDeadlineExceeded without touching the stream, and a
+//     later Read with a fresh deadline resumes normally. The receive pump
+//     keeps ownership of the hunk in flight.
+//   - A write deadline is terminal: a wedged Send cannot be aborted, and a
+//     second Send must not overtake it (that would reorder stream data), so
+//     the only way to unblock writers is to cancel the stream context. Once a
+//     write deadline fires, this ClientConn is permanently unusable.
+//
+// recvErr is sticky: once the receive pump has observed a stream error, every
+// subsequent Read returns it rather than reporting a clean EOF.
 type ClientConn struct {
 	tun       proto.GunService_TunClient
 	closer    context.CancelFunc
@@ -263,10 +279,18 @@ func (c *ClientConn) Write(p []byte) (n int, err error) {
 	case <-c.ctx.Done():
 		return 0, io.EOF
 	case err = <-sendDone:
-		if code := status.Code(err); code == codes.Unavailable || status.Code(err) == codes.OutOfRange {
-			err = io.EOF
+		if err != nil {
+			// A gRPC hunk is atomic at the message level: either the whole
+			// Hunk was accepted by the stream or none of it was, so there is
+			// no such thing as a partial send to report. Claiming len(p) on
+			// error contradicts the short-write contract and lets a caller
+			// treat a dropped chunk as delivered.
+			if code := status.Code(err); code == codes.Unavailable || code == codes.OutOfRange {
+				err = io.EOF
+			}
+			return 0, err
 		}
-		return len(p), err
+		return len(p), nil
 	}
 }
 

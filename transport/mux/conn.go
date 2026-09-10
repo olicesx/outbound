@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"sync"
+
+	"github.com/daeuniverse/outbound/netproxy"
 )
 
 type SessionStatus = byte
@@ -45,6 +47,13 @@ type Conn struct {
 
 	closeOnce sync.Once
 	closeErr  error
+}
+
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped conn. This type embeds net.Conn,
+// so SetWriteDeadline is promoted while the optional declaration is not.
+func (m *Conn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(m.Conn)
 }
 
 func (m *Conn) Read(b []byte) (int, error) {

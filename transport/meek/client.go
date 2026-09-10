@@ -98,6 +98,16 @@ func (s *assemblerClientSession) SetWriteDeadline(t time.Time) error {
 	return s.setSessionDeadline(t)
 }
 
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior.
+// SetWriteDeadline delegates to SetDeadline, which arms a session-wide timer
+// whose expiry calls finish and closes the whole session: every pending and
+// subsequent read and write fails. That is the destructive semantics the
+// marker exists to expose, so deadline-arming callers (e.g. dae's
+// UdpEndpoint) must not arm it merely to probe for a stalled write.
+func (s *assemblerClientSession) WriteDeadlineClosesSession() bool {
+	return true
+}
+
 func (s *assemblerClientSession) keepRunning() {
 	s.currentWriteWait = int(s.assembler.config.InitialPollingIntervalMs)
 	for s.ctx.Err() == nil {

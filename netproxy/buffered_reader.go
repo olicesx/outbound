@@ -51,6 +51,15 @@ type BufferedReaderConn struct {
 	reader *bufio.Reader
 }
 
+// WriteDeadlineClosesSession forwards the optional destructive write-deadline
+// declaration of the wrapped Conn. Embedding the Conn interface promotes
+// SetWriteDeadline but not this optional method, so without the forward a
+// session-closing inner conn is invisible to deadline-arming callers - the
+// exact case the type's own documentation calls "pass straight through".
+func (c *BufferedReaderConn) WriteDeadlineClosesSession() bool {
+	return WriteDeadlineClosesSession(c.Conn)
+}
+
 // NewBufferedReaderConn wraps c with a bufio.Reader of the given size.
 // Pass 0 to use the default (32 KiB). If c already coalesces reads (TLS
 // record layer, or AlreadyReadBuffered), c is returned unchanged so the

@@ -127,6 +127,15 @@ type FakeNetConn struct {
 	RAddr net.Addr
 }
 
+// WriteDeadlineClosesSession forwards the optional destructive write-deadline
+// declaration of the wrapped conn. Embedding the Conn interface promotes
+// SetWriteDeadline but not this optional method; without the forward a
+// session-closing inner conn behind this wrapper (e.g. TUIC under the HTTP/2
+// transport) is invisible to deadline-arming callers.
+func (conn *FakeNetConn) WriteDeadlineClosesSession() bool {
+	return WriteDeadlineClosesSession(conn.Conn)
+}
+
 func (conn *FakeNetConn) UnderlyingConn() net.Conn {
 	if underlying, ok := conn.Conn.(net.Conn); ok {
 		return underlying

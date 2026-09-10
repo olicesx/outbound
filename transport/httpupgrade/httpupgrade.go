@@ -36,6 +36,14 @@ func (c *bufferedConn) CloseWrite() error {
 	return netproxy.ForwardCloseWrite(c.Conn)
 }
 
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped conn: embedding netproxy.Conn
+// promotes SetWriteDeadline but not this optional method, so the inner
+// conn's destructive-deadline declaration would otherwise be erased here.
+func (c *bufferedConn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.Conn)
+}
+
 func (t *Dialer) UnwrapDialer() netproxy.Dialer {
 	return t.nextDialer
 }

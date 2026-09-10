@@ -116,7 +116,7 @@ func (c *UdpConn) writeTo(p []byte, addr socks.Addr) (n int, err error) {
 	infoIvLen := c.cipher.InfoIVLen()
 	buf := pool.Get(infoIvLen + len(addr) + len(p))
 	defer pool.Put(buf)
-	enc, err := c.cipher.NewEncryptor(buf)
+	enc, err := c.cipher.NewEncryptorInto(buf)
 	if err != nil {
 		return 0, err
 	}
@@ -158,7 +158,7 @@ func (c *UdpConn) WriteTransport(p []byte) (n int, err error) {
 	infoIvLen := c.cipher.InfoIVLen()
 	buf := pool.Get(infoIvLen + len(p))
 	defer pool.Put(buf)
-	enc, err := c.cipher.NewEncryptor(buf)
+	enc, err := c.cipher.NewEncryptorInto(buf)
 	if err != nil {
 		return 0, err
 	}

@@ -129,7 +129,8 @@ func splitDecryptedUdp(plain []byte) (payload []byte, from netip.AddrPort, err e
 	return plain[sizeMetadata:], netip.AddrPortFrom(mdata.IP, mdata.Port), nil
 }
 
-func NewUdpConn(conn netproxy.PacketConn, proxyAddress string, metadata protocol.Metadata, masterKey []byte, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {	conf := ciphers.AeadCiphersConf[metadata.Cipher]
+func NewUdpConn(conn netproxy.PacketConn, proxyAddress string, metadata protocol.Metadata, masterKey []byte, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
+	conf := ciphers.AeadCiphersConf[metadata.Cipher]
 	if conf.NewCipher == nil {
 		return nil, fmt.Errorf("invalid CipherConf")
 	}

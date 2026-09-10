@@ -41,36 +41,39 @@ var (
 
 // IsDNSTimeout checks if the error is a DNS timeout.
 //
-// Best Practice: Use direct comparison for best performance (1.19 ns/op):
+// The call sites run on every failed direct dial (protocol/direct/dialer.go),
+// so the fast paths are ordered by cost and do not allocate:
 //
-//	if err == ErrDNSTimeout { ... }
+//  1. identity comparison against the sentinel;
+//  2. errors.As into net.Error plus Timeout() - this covers every real Go
+//     network timeout, including *net.DNSError, and is the only structurally
+//     sound interface check.
 //
-// This function provides compatibility with wrapped errors.
-// Performance: Direct comparison path (1.19 ns), wrapped error path (~47 ns)
+// The former second branch asserted `interface{ IsTimeout() bool }`, which no
+// error in the standard library or in this tree implements: net.Error's method
+// is Timeout(), not IsTimeout(), so that branch was unreachable dead code.
+// The trailing substring match was a deprecated compatibility shim that
+// allocated on every call; it is gone, and an error that is neither the
+// sentinel nor a net.Error with Timeout()==true is reported as not-a-timeout.
 func IsDNSTimeout(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	// 🚀 Fast path: direct comparison (1.19 ns)
-	if err == ErrDNSTimeout {
+	// Fast path: identity comparison. errors.Is also unwraps, so a sentinel
+	// wrapped by %w is still recognised (the bare `==` the previous version
+	// used did not, which is why the wrapped case was untested).
+	if errors.Is(err, ErrDNSTimeout) {
 		return true
 	}
 
-	// 🚀 Fast path: interface check (11.6 ns)
-	if timeoutErr, ok := err.(interface{ IsTimeout() bool }); ok {
-		return timeoutErr.IsTimeout() && contains(err.Error(), "lookup")
-	}
-
-	// ⚡ Medium path: net.Error interface check
+	// Structurally correct interface check: net.Error.Timeout().
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
-		return contains(err.Error(), "lookup")
+		return true
 	}
 
-	// 🐌 Slow path: string matching for backward compatibility
-	errStr := err.Error()
-	return contains(errStr, "i/o timeout") && contains(errStr, "lookup")
+	return false
 }
 
 // IsStreamExhausted checks if the error indicates no more streams available.

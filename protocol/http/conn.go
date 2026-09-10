@@ -172,6 +172,24 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the current inner conn. This type overrides
+// SetWriteDeadline (the deadline may target a different inner conn after a
+// handshake retry), so the optional declaration must be forwarded explicitly or
+// a session-closing inner conn becomes invisible to deadline-arming callers.
+func (c *Conn) WriteDeadlineClosesSession() bool {
+	conn, h2 := c.currentConn()
+	if conn == nil {
+		return false
+	}
+	if h2 {
+		// The HTTP/2 transport multiplexes every flow onto one session, so it
+		// exposes no destructive per-flow write deadline.
+		return false
+	}
+	return netproxy.WriteDeadlineClosesSession(conn)
+}
+
 func (c *Conn) SetWriteDeadline(t time.Time) error {
 	c.muFinishShakeFuncs.Lock()
 	defer c.muFinishShakeFuncs.Unlock()

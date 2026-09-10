@@ -53,11 +53,15 @@ func (to *TLSObfs) read(b []byte, discardN int) (int, error) {
 		return to.readNext(b)
 	}
 	if length > len(b) {
+		// A single raw Read can return fewer bytes than the record holds, and
+		// the leftover must be recorded even when that Read fails partway:
+		// returning before setting remain desynchronizes the frame stream, so
+		// every later Read would start mid-record.
 		n, err := to.Conn.Read(b)
+		to.remain = length - n
 		if err != nil {
 			return n, err
 		}
-		to.remain = length - n
 		return n, nil
 	}
 
@@ -79,10 +83,10 @@ func (to *TLSObfs) readNext(b []byte) (int, error) {
 		}
 		if length > len(b) {
 			n, err := to.Conn.Read(b)
+			to.remain = length - n
 			if err != nil {
 				return n, err
 			}
-			to.remain = length - n
 			return n, nil
 		}
 		return io.ReadFull(to.Conn, b[:length])
@@ -117,6 +121,12 @@ func (to *TLSObfs) Read(b []byte) (int, error) {
 func (to *TLSObfs) Write(b []byte) (int, error) {
 	to.wMu.Lock()
 	defer to.wMu.Unlock()
+	// The return value is the count of bytes the caller may consider
+	// delivered, so it must count whole chunks that already went out. The
+	// previous version returned n from the *failing* chunk (often 0), which
+	// discards the accounting for every chunk already written - a retry then
+	// re-sends up to 16 KB that the peer has already accepted.
+	written := 0
 	length := len(b)
 	for i := 0; i < length; i += chunkSize {
 		end := i + chunkSize
@@ -125,11 +135,18 @@ func (to *TLSObfs) Write(b []byte) (int, error) {
 		}
 
 		n, err := to.write(b[i:end])
+		written += n
 		if err != nil {
-			return n, err
+			return written, err
+		}
+		if n != end-i {
+			// A chunk that reports success must have consumed all of its
+			// bytes; anything else is a short write and the remaining bytes
+			// are not safe to account for.
+			return written, io.ErrShortWrite
 		}
 	}
-	return length, nil
+	return written, nil
 }
 
 func (to *TLSObfs) write(b []byte) (int, error) {
@@ -154,6 +171,16 @@ func (to *TLSObfs) write(b []byte) (int, error) {
 
 func (to *TLSObfs) CloseWrite() error {
 	return netproxy.ForwardCloseWrite(to.Conn)
+}
+
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped conn. Embedding netproxy.Conn
+// promotes SetWriteDeadline but not this optional method, so without the
+// forward a session-closing inner conn (TUIC, hysteria2) behind this wrapper
+// would be invisible to deadline-arming callers and they would arm a
+// destructive timer believing it was an ordinary deadline.
+func (to *TLSObfs) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(to.Conn)
 }
 
 func NewTLSObfs(conn netproxy.Conn, server string) netproxy.Conn {

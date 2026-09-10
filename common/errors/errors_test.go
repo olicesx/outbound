@@ -8,6 +8,7 @@ package errors
 import (
 	"errors"
 	"fmt"
+	"net"
 	"testing"
 )
 
@@ -22,9 +23,20 @@ func TestIsDNSTimeout(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "DNS timeout with lookup",
-			err:  fmt.Errorf("lookup example.com on 127.0.0.53:53: i/o timeout"),
+			name: "resolve timeout via net.Error",
+			// The shape the resolver actually returns: *net.DNSError
+			// satisfies net.Error and Timeout() reports true.
+			err:  &net.DNSError{Err: "i/o timeout", Name: "example.com", IsTimeout: true},
 			want: true,
+		},
+		{
+			name: "plain string that merely looks like a DNS timeout",
+			// Deliberately false: the deprecated substring shim matched this
+			// without any evidence that the error was a timeout, and it
+			// allocated on every failed dial. Only a net.Error that reports
+			// Timeout()==true (or the sentinel) counts now.
+			err:  fmt.Errorf("lookup example.com on 127.0.0.53:53: i/o timeout"),
+			want: false,
 		},
 		{
 			name: "standard DNS timeout error",

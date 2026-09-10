@@ -183,6 +183,15 @@ func encryptUDPTo(
 	return required, nil
 }
 
+// EncryptUDPFromPool encrypts one UDP packet into pooled storage.
+//
+// Contract: salt becomes the HKDF salt AND is copied into the packet, while the
+// AEAD nonce is the fixed ciphers.ZeroNonce. The output is therefore fully
+// determined by (masterKey, salt, plaintext, reusedInfo): nonce uniqueness is
+// the caller's responsibility, and reusing a salt under the same master key
+// reuses the AEAD key/nonce pair. Callers must supply a fresh random salt per
+// packet (protocol/shadowsocks callers do; this helper currently has no
+// production caller in this module).
 func EncryptUDPFromPool(key *Key, b []byte, salt []byte, reusedInfo []byte) (pool.PB, error) {
 	buf := pool.Get(key.CipherConf.SaltLen + len(b) + key.CipherConf.TagLen)
 	n, err := EncryptUDPTo(buf, key, b, salt, reusedInfo)

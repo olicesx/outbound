@@ -5,10 +5,12 @@ package direct
 import (
 	"fmt"
 	"net/netip"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/pkg/logger"
 	"github.com/daeuniverse/outbound/pool"
 	"golang.org/x/sys/unix"
 )
@@ -37,9 +39,19 @@ type directPacketReceiverEntry struct {
 	fd      int
 	handler netproxy.PacketReceiveHandler
 	active  atomic.Bool
-	// pending queues datagrams fetched from the socket. The loop goroutine
-	// is the only producer and consumer, so the slice is reused.
+	// pending queues datagrams fetched from the socket by the epoll thread.
+	// Only the epoll thread touches it, so the slice is reused.
 	pending []*netproxy.ReceivedPacket
+
+	// deliverMu guards queued/signal, the handoff between the epoll thread
+	// (producer) and this entry's delivery goroutine (consumer). Delivery is
+	// decoupled from the epoll thread so one slow or wedged handler cannot
+	// stall packet reception on every other socket registered in the shared
+	// registry.
+	deliverMu sync.Mutex
+	queued    []*netproxy.ReceivedPacket
+	signal    chan struct{}
+	stopped   bool
 }
 
 var defaultPacketReceiverRegistry = &packetReceiverRegistry{}
@@ -104,6 +116,7 @@ func (r *packetReceiverRegistry) register(conn *directPacketConn, entry *directP
 	}
 	entry.fd = fd
 	entry.active.Store(true)
+	entry.startDelivery()
 	r.entries[fd] = entry
 	event := &unix.EpollEvent{
 		Events: unix.EPOLLIN | unix.EPOLLERR | unix.EPOLLHUP,
@@ -122,6 +135,7 @@ func (r *packetReceiverRegistry) unregister(entry *directPacketReceiverEntry) {
 		return
 	}
 	entry.active.Store(false)
+	entry.stopDelivery()
 	r.mu.Lock()
 	if current, ok := r.entries[entry.fd]; ok && current == entry {
 		delete(r.entries, entry.fd)
@@ -195,18 +209,21 @@ func (r *packetReceiverRegistry) fail(epollFD int, cause error) {
 	errPacket := fmt.Errorf("direct packet receiver: %w", cause)
 	for _, entry := range failed {
 		if entry.active.Swap(false) {
+			entry.stopDelivery()
 			packet := netproxy.NewReceivedPacket(nil, netip.AddrPort{}, errPacket, nil)
-			if !entry.handler(packet) {
+			if _, err := deliverToHandler(entry.handler, entry.fd, packet); err != nil {
 				packet.Release()
 			}
 		}
 	}
 }
 
-// drain fetches queued datagrams and delivers them to the handler.
+// drain fetches queued datagrams from the socket and queues them for this
+// entry's delivery goroutine. It runs on the shared epoll thread and must stay
+// cheap: the handler is never invoked here.
 func (r *packetReceiverRegistry) drain(entry *directPacketReceiverEntry) {
 	r.fetch(entry)
-	entry.deliver()
+	entry.enqueuePending()
 }
 
 // fetch drains up to directPacketReceiverBatchSize datagrams into the
@@ -269,16 +286,135 @@ func (r *packetReceiverRegistry) fetch(entry *directPacketReceiverEntry) {
 	}
 }
 
-// deliver hands fetched datagrams to the handler outside the registry
-// lock: the handler may synchronously stop the entry, which needs the
-// write lock.
-func (e *directPacketReceiverEntry) deliver() {
-	for _, packet := range e.pending {
-		if !e.active.Load() || !e.handler(packet) {
+// enqueuePending moves the freshly fetched datagrams onto the delivery queue
+// and wakes the delivery goroutine. Runs on the epoll thread.
+func (e *directPacketReceiverEntry) enqueuePending() {
+	if len(e.pending) == 0 {
+		return
+	}
+	e.deliverMu.Lock()
+	if e.stopped {
+		// The entry was stopped between the fetch and the handoff: release
+		// the datagrams here so their pool buffers are not leaked.
+		for _, packet := range e.pending {
+			packet.Release()
+		}
+		e.pending = e.pending[:0]
+		e.deliverMu.Unlock()
+		return
+	}
+	e.queued = append(e.queued, e.pending...)
+	e.pending = e.pending[:0]
+	signal := e.signal
+	e.deliverMu.Unlock()
+
+	if signal == nil {
+		return
+	}
+	select {
+	case signal <- struct{}{}:
+	default:
+		// A wakeup is already pending; the consumer drains the whole queue on
+		// every pass, so this one is redundant rather than lost.
+	}
+}
+
+// startDelivery launches this entry's delivery goroutine. The channel is
+// created here and never re-created, so the producer can always send on it
+// without racing a nil channel; the consumer may exit into a select that still
+// has a valid channel operand.
+func (e *directPacketReceiverEntry) startDelivery() {
+	e.deliverMu.Lock()
+	if e.signal != nil {
+		e.deliverMu.Unlock()
+		return
+	}
+	signal := make(chan struct{}, 1)
+	e.signal = signal
+	e.deliverMu.Unlock()
+	go e.deliverLoop(signal)
+}
+
+// deliverLoop hands queued datagrams to the handler off the epoll thread.
+func (e *directPacketReceiverEntry) deliverLoop(signal chan struct{}) {
+	for {
+		e.deliverMu.Lock()
+		batch := e.queued
+		e.queued = nil
+		stopped := e.stopped
+		e.deliverMu.Unlock()
+
+		if len(batch) > 0 {
+			e.deliverBatch(batch)
+			continue
+		}
+		if stopped {
+			// The batch above was the whole queue, so the entry is drained and
+			// the consumer can exit. stopDelivery's wakeup may already be
+			// buffered; nothing waits on this goroutine, so it is dropped.
+			return
+		}
+		select {
+		case <-signal:
+		}
+	}
+}
+
+// deliverBatch invokes the handler for each packet, then releases whatever the
+// handler did not take ownership of.
+func (e *directPacketReceiverEntry) deliverBatch(batch []*netproxy.ReceivedPacket) {
+	for _, packet := range batch {
+		if !e.active.Load() || !e.deliverToHandler(packet) {
 			packet.Release()
 		}
 	}
-	e.pending = e.pending[:0]
+}
+
+func (e *directPacketReceiverEntry) deliverToHandler(packet *netproxy.ReceivedPacket) bool {
+	delivered, _ := deliverToHandler(e.handler, e.fd, packet)
+	return delivered
+}
+
+// deliverToHandler runs one user handler call under a recover. The handler
+// belongs to the caller (dae's udp_endpoint_watcher), and a panic in it would
+// otherwise take down the process: this goroutine is not the caller's, so
+// nothing else would contain it. The panic is logged with its stack and the
+// packet is reported as not delivered; the registry keeps serving every other
+// socket.
+func deliverToHandler(handler netproxy.PacketReceiveHandler, fd int, packet *netproxy.ReceivedPacket) (delivered bool, panicked error) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Logger.WithFields(map[string]any{
+				"fd":    fd,
+				"from":  packet.From.String(),
+				"panic": fmt.Sprint(r),
+				"stack": string(debug.Stack()),
+			}).Error("direct: panic in packet receive handler")
+			delivered = false
+			panicked = fmt.Errorf("panic in packet receive handler: %v", r)
+		}
+	}()
+	return handler(packet), nil
+}
+
+// stopDelivery retires the delivery goroutine and releases anything it had not
+// handed over yet.
+func (e *directPacketReceiverEntry) stopDelivery() {
+	e.deliverMu.Lock()
+	e.stopped = true
+	pending := e.queued
+	e.queued = nil
+	signal := e.signal
+	e.deliverMu.Unlock()
+	for _, packet := range pending {
+		packet.Release()
+	}
+	if signal != nil {
+		select {
+		case signal <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func directPacketReceiverFD(conn *directPacketConn) (int, error) {

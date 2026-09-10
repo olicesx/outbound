@@ -8,6 +8,7 @@ import (
 	"crypto/rc4"
 	"encoding/binary"
 	"errors"
+	"fmt"
 
 	"github.com/daeuniverse/outbound/common"
 	rand "github.com/daeuniverse/outbound/pkg/fastrand"
@@ -265,10 +266,18 @@ func (c *StreamCipher) InitEncrypt() (iv []byte, err error) {
 	return iv, nil
 }
 
-func (c *StreamCipher) NewEncryptor(iv []byte) (enc cipher.Stream, err error) {
-	if iv == nil {
-		iv = pool.Get(c.info.ivLen)
-		defer pool.Put(iv)
+// NewEncryptorInto initializes an encrypting stream and writes a fresh random
+// IV into iv, which is a caller-provided OUTPUT buffer, not an input: the
+// bytes already in it are overwritten. It must be at least InfoIVLen() bytes
+// long, and the caller sends iv[:InfoIVLen()] on the wire ahead of the
+// ciphertext.
+//
+// The previous name (NewEncryptor) suggested the argument was an input IV,
+// which is the opposite of what it does; a short buffer silently panicked on
+// the reslice below.
+func (c *StreamCipher) NewEncryptorInto(iv []byte) (enc cipher.Stream, err error) {
+	if len(iv) < c.info.ivLen {
+		return nil, fmt.Errorf("stream cipher: IV buffer too short: %d bytes, need %d", len(iv), c.info.ivLen)
 	}
 	iv = iv[:c.info.ivLen]
 	_, _ = rand.Read(iv)
@@ -276,11 +285,19 @@ func (c *StreamCipher) NewEncryptor(iv []byte) (enc cipher.Stream, err error) {
 }
 
 func (c *StreamCipher) InitDecrypt(iv []byte) (err error) {
+	if len(iv) != c.info.ivLen {
+		return fmt.Errorf("stream cipher: IV must be exactly %d bytes, got %d", c.info.ivLen, len(iv))
+	}
 	c.dec, err = c.info.newStream(c.key, iv, Decrypt)
 	return err
 }
 
+// NewDecryptor returns a decrypting stream for the given wire IV. iv is an
+// INPUT buffer and must be exactly InfoIVLen() bytes.
 func (c *StreamCipher) NewDecryptor(iv []byte) (dec cipher.Stream, err error) {
+	if len(iv) != c.info.ivLen {
+		return nil, fmt.Errorf("stream cipher: IV must be exactly %d bytes, got %d", c.info.ivLen, len(iv))
+	}
 	return c.info.newStream(c.key, iv, Decrypt)
 }
 

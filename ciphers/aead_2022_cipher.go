@@ -158,11 +158,17 @@ func (f *SlidingWindowFilter) shiftWindow(shift uint64) {
 		}
 	}
 
-	// Handle remaining bit shift
+	// Handle remaining bit shift. Bits move toward higher indices, in the same
+	// direction as the word shift above: bit 0 is the newest packet ID, so a
+	// bit that recorded distance d before latest advanced by shift must end up
+	// at distance d+shift. Shifting right here (the pre-fix direction) moved
+	// recorded bits toward lower distances, which both let already-seen packet
+	// IDs through again (replay leak) and rejected packet IDs that were never
+	// seen (false reject).
 	if bitShift > 0 {
 		for i := len(f.window) - 1; i > 0; i-- {
-			f.window[i] = (f.window[i] >> bitShift) | (f.window[i-1] << (64 - bitShift))
+			f.window[i] = (f.window[i] << bitShift) | (f.window[i-1] >> (64 - bitShift))
 		}
-		f.window[0] = f.window[0] >> bitShift
+		f.window[0] <<= bitShift
 	}
 }

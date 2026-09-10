@@ -269,18 +269,54 @@ func TestSS2022UDPReplayWindowBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The cap is a soft bound: evictOldestIfNeeded only removes sessions that
+	// are already past SaltStorageDuration, so live traffic keeps its replay
+	// protection even when it exceeds maxTrackedUdpSessions. Two separate
+	// properties are asserted here.
 	now := time.Now()
-	for i := 0; i < maxTrackedUdpSessions*4; i++ {
+	total := maxTrackedUdpSessions * 4
+	ids := make([][8]byte, 0, total)
+	for i := 0; i < total; i++ {
 		var sessionID [8]byte
 		sessionID[0] = byte(i)
 		sessionID[1] = byte(i >> 8)
+		ids = append(ids, sessionID)
 		if !conn.checkAndUpdateReplay(sessionID, 1, now) {
 			t.Fatalf("session %d should be accepted on first packet", i)
 		}
 	}
 
-	if got := analysisReplayWindowLen(conn); got > maxTrackedUdpSessions {
-		t.Fatalf("replay window exceeded bound: got %d want <= %d", got, maxTrackedUdpSessions)
+	// Property 1: nothing is evicted while every session is inside its
+	// retention window. Losing a young session's window would re-admit packet
+	// IDs that were already seen for it.
+	if got := analysisReplayWindowLen(conn); got != total {
+		t.Fatalf("young sessions were evicted: window len = %d, want all %d retained", got, total)
+	}
+
+	// Property 2: once the sessions age past SaltStorageDuration they become
+	// evictable again, and the table is trimmed back to the cap.
+	old := now.Add(-2 * ciphers.SaltStorageDuration)
+	for _, id := range ids {
+		if !conn.checkAndUpdateReplay(id, 2, old) {
+			t.Fatalf("session %v should still accept a new packet ID", id)
+		}
+	}
+	// checkAndUpdateReplay overwrites lastSeen, so re-stamp every session as
+	// stale and drive one more registration to trigger the sweep.
+	for i := 0; i < total; i++ {
+		id := ids[i]
+		if v, ok := conn.replayWindow.Load(id); ok {
+			v.(*udpSessionReplayState).lastSeen.Store(old.UnixNano())
+		}
+	}
+	var fresh [8]byte
+	fresh[0], fresh[1] = 0xff, 0xff
+	if !conn.checkAndUpdateReplay(fresh, 1, now) {
+		t.Fatal("fresh session should be accepted")
+	}
+	if got := analysisReplayWindowLen(conn); got > maxTrackedUdpSessions+1 {
+		t.Fatalf("stale sessions were not reclaimed: window len = %d, want <= %d",
+			got, maxTrackedUdpSessions+1)
 	}
 }
 

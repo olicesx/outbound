@@ -260,7 +260,22 @@ func (c *UdpConn) cleanupExpiredSessions(nowNano, expireNano int64) {
 	})
 }
 
+// evictOldestIfNeeded trims the replay-session table back to its cap, but only
+// ever removes sessions that are already past SaltStorageDuration.
+//
+// The cap alone was the wrong-only criterion: SIP022 requires a session's
+// replay window to be retained for SaltStorageDuration (60s), and a burst of
+// new remote sessions could evict a session that is still inside that window.
+// The evicted session's window would be rebuilt empty on its next packet,
+// which re-admits every packet ID already seen for it - a deduplication
+// downgrade. Sessions that are too young to remove are deliberately left
+// tracked: exceeding the cap is a memory concern, losing replay protection is
+// a security one, and the excess is bounded by the arrival rate over one
+// SaltStorageDuration.
 func (c *UdpConn) evictOldestIfNeeded() {
+	nowNano := time.Now().UnixNano()
+	expireNano := ciphers.SaltStorageDuration.Nanoseconds()
+
 	for c.replayCount.Load() > maxTrackedUdpSessions {
 		var (
 			found      bool
@@ -272,6 +287,11 @@ func (c *UdpConn) evictOldestIfNeeded() {
 		c.replayWindow.Range(func(key, value interface{}) bool {
 			state := value.(*udpSessionReplayState)
 			seen := state.lastSeen.Load()
+			// Age filter: only sessions already past the required retention
+			// period are candidates.
+			if nowNano-seen <= expireNano {
+				return true
+			}
 			if !found || seen < oldestNano {
 				found = true
 				oldestKey = key.([8]byte)
@@ -282,7 +302,10 @@ func (c *UdpConn) evictOldestIfNeeded() {
 		})
 
 		if !found {
-			c.replayCount.Store(0)
+			// Every tracked session is still inside its retention window.
+			// Stop rather than evicting one early; the periodic
+			// cleanupExpiredSessions sweep will collect them once they age
+			// out.
 			return
 		}
 		if c.replayWindow.CompareAndDelete(oldestKey, oldestVal) {
@@ -538,10 +561,19 @@ func (c *UdpConn) decodeBlockPacket(buf []byte, now time.Time) ([]byte, netip.Ad
 	if err != nil {
 		return nil, netip.AddrPort{}, err
 	}
+	// Validate the whole payload (header type + timestamp) before committing
+	// the replay window, so this path holds the same "authenticate before
+	// committing anti-replay state" line as the Open above and as the chacha
+	// path. Committing on a packet that then fails validation would burn the
+	// packet ID of a packet that was never delivered.
+	out, addr, err := c.decodePacketPayload(buf, payload, now)
+	if err != nil {
+		return nil, netip.AddrPort{}, err
+	}
 	if !c.checkAndUpdateReplay(sessionID, packetID, now) {
 		return nil, netip.AddrPort{}, protocol.ErrReplayAttack
 	}
-	return c.decodePacketPayload(buf, payload, now)
+	return out, addr, nil
 }
 
 func (c *UdpConn) readFromChacha(b []byte) (n int, addr netip.AddrPort, err error) {
@@ -599,10 +631,18 @@ func (c *UdpConn) decodeChachaPacket(buf []byte, now time.Time) ([]byte, netip.A
 	if err := binary.Read(reader, binary.BigEndian, &packetID); err != nil {
 		return nil, netip.AddrPort{}, fmt.Errorf("failed to read packet ID: %w", err)
 	}
+	// Validate the whole payload (header type + timestamp) before committing
+	// the replay window: a packet that decrypts but is malformed or stale must
+	// not burn its ID in the window, and a forged-but-decryptable packet must
+	// not advance it.
+	out, addr, err := c.decodePacketPayload(buf, payload[reader.Size()-int64(reader.Len()):], now)
+	if err != nil {
+		return nil, netip.AddrPort{}, err
+	}
 	if !c.checkAndUpdateReplay(sessionID, packetID, now) {
 		return nil, netip.AddrPort{}, protocol.ErrReplayAttack
 	}
-	return c.decodePacketPayload(buf, payload[reader.Size()-int64(reader.Len()):], now)
+	return out, addr, nil
 }
 
 func (c *UdpConn) decodePacketPayload(buf, payload []byte, now time.Time) ([]byte, netip.AddrPort, error) {

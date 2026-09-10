@@ -22,7 +22,7 @@ func (m *mockShadowsocksPacketConn) Read(b []byte) (n int, err error) {
 
 func (m *mockShadowsocksPacketConn) Write(b []byte) (n int, err error) {
 	atomic.AddInt64(&m.writes, 1)
-	time.Sleep(10 * time.Microsecond) // 模拟延迟
+	time.Sleep(10 * time.Microsecond) // simulate latency
 	return len(b), nil
 }
 
@@ -32,7 +32,7 @@ func (m *mockShadowsocksPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPo
 
 func (m *mockShadowsocksPacketConn) WriteTo(p []byte, addr string) (n int, err error) {
 	atomic.AddInt64(&m.writes, 1)
-	time.Sleep(10 * time.Microsecond) // 模拟延迟
+	time.Sleep(10 * time.Microsecond) // simulate latency
 	return len(p), nil
 }
 
@@ -152,9 +152,9 @@ func TestShadowsocksUdpConnBufferPoolRace(t *testing.T) {
 	t.Log("Buffer pool concurrent access test completed")
 }
 
-// TestShadowsocksUdpConnRealConnection 使用真实 UDP 连接测试
+// TestShadowsocksUdpConnRealConnection tests with a real UDP connection
 func TestShadowsocksUdpConnRealConnection(t *testing.T) {
-	// 创建 UDP 服务器
+	// Create the UDP server
 	serverAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to resolve server address: %v", err)
@@ -166,7 +166,7 @@ func TestShadowsocksUdpConnRealConnection(t *testing.T) {
 	}
 	defer func() { _ = serverConn.Close() }()
 
-	// 接收服务器
+	// Server side that receives
 	go func() {
 		buf := make([]byte, 2048)
 		for {
@@ -178,18 +178,18 @@ func TestShadowsocksUdpConnRealConnection(t *testing.T) {
 		}
 	}()
 
-	// 创建客户端连接
+	// Create the client connection
 	clientConn, err := net.Dial("udp", serverConn.LocalAddr().String())
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
 	defer func() { _ = clientConn.Close() }()
 
-	// 包装为 netproxy.PacketConn（需要实现）
+	// Wrapping this as a netproxy.PacketConn is required but not implemented
 	t.Skip("Requires netproxy.PacketConn implementation")
 }
 
-// BenchmarkShadowsocksUdpConnWrite 基准测试
+// BenchmarkShadowsocksUdpConnWrite is the sequential write benchmark
 func BenchmarkShadowsocksUdpConnWrite(b *testing.B) {
 	mockConn := &mockShadowsocksPacketConn{}
 	udpConn := newRaceTestUDPConn(b, mockConn)
@@ -203,7 +203,7 @@ func BenchmarkShadowsocksUdpConnWrite(b *testing.B) {
 	}
 }
 
-// BenchmarkShadowsocksUdpConnWriteParallel 并发基准测试
+// BenchmarkShadowsocksUdpConnWriteParallel is the parallel write benchmark
 func BenchmarkShadowsocksUdpConnWriteParallel(b *testing.B) {
 	mockConn := &mockShadowsocksPacketConn{}
 	udpConn := newRaceTestUDPConn(b, mockConn)
@@ -219,7 +219,8 @@ func BenchmarkShadowsocksUdpConnWriteParallel(b *testing.B) {
 	})
 }
 
-// TestShadowsocksUdpConnMetadataParseRace 测试 metadata 解析的并发安全
+// TestShadowsocksUdpConnMetadataParseRace tests the concurrency safety of
+// metadata parsing
 func TestShadowsocksUdpConnMetadataParseRace(t *testing.T) {
 	const goroutines = 20
 	const opsPerGoroutine = 100

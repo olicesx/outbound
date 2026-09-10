@@ -6,18 +6,18 @@ import (
 	"testing"
 )
 
-// TestGetBiggerClosestN 测试 GetBiggerClosestN 的逻辑
+// TestGetBiggerClosestN tests the logic of GetBiggerClosestN
 func TestGetBiggerClosestN(t *testing.T) {
 	testCases := []struct {
 		input    int
 		expected int
 	}{
 		{1024, 10}, // 2^10 = 1024
-		{1025, 11}, // 需要 2^11 = 2048
+		{1025, 11}, // needs 2^11 = 2048
 		{2048, 11}, // 2^11 = 2048
-		{2049, 12}, // 需要 2^12 = 4096
+		{2049, 12}, // needs 2^12 = 4096
 		{4096, 12}, // 2^12 = 4096
-		{4097, 13}, // 需要 2^13 = 8192
+		{4097, 13}, // needs 2^13 = 8192
 	}
 
 	for _, tc := range testCases {

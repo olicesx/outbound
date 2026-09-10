@@ -23,7 +23,7 @@ func BenchmarkNewConnOptimized(b *testing.B) {
 	}
 	password := "test-password-12345"
 
-	// 预热缓存
+	// Warm the cache
 	_, _ = NewConn(mockConn, metadata, password)
 
 	b.ResetTimer()
@@ -68,10 +68,10 @@ func TestPasswordHashConsistency(t *testing.T) {
 	// First retrieval (computation)
 	hash1 := getPasswordHash(password)
 
-	// 第二次获取（缓存）
+	// Second retrieval (cached)
 	hash2 := getPasswordHash(password)
 
-	// 验证一致性
+	// Verify consistency
 	if hash1 != hash2 {
 		t.Errorf("password hash inconsistency")
 	}
@@ -84,13 +84,13 @@ func TestPasswordHashCorrectness(t *testing.T) {
 	// Compute using new function
 	hash := getPasswordHash(password)
 
-	// 手动计算预期值
+	// Compute the expected value by hand
 	expected := [56]byte{}
 	h := sha256.New224()
 	h.Write([]byte(password))
 	hex.Encode(expected[:], h.Sum(nil))
 
-	// 验证正确性
+	// Verify correctness
 	if hash != expected {
 		t.Errorf("password hash incorrect")
 	}

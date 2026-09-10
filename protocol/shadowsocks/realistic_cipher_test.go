@@ -9,7 +9,8 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-// BenchmarkUDPRealistic 模拟真实的 UDP 场景：每个包使用不同的 salt
+// BenchmarkUDPRealistic simulates the realistic UDP case: every packet uses a
+// different salt
 func BenchmarkUDPRealistic(b *testing.B) {
 	masterKey := make([]byte, 32)
 	key := &Key{
@@ -23,14 +24,14 @@ func BenchmarkUDPRealistic(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		// 真实场景：每个 UDP 包使用不同的随机 salt
+		// Realistic case: every UDP packet uses a different random salt
 		salt := make([]byte, 32)
-		_, err := rand.Read(salt) // 模拟 RandomSaltGenerator
+		_, err := rand.Read(salt) // Simulate RandomSaltGenerator
 		if err != nil {
 			b.Fatal(err)
 		}
 
-		// 使用 EncryptUDPFromPool 进行完整的加密流程
+		// Run the full encryption path through EncryptUDPFromPool
 		_, err = EncryptUDPFromPool(key, data, salt, reusedInfo)
 		if err != nil {
 			b.Fatal(err)
@@ -38,7 +39,8 @@ func BenchmarkUDPRealistic(b *testing.B) {
 	}
 }
 
-// BenchmarkUDPSameSalt 错误的场景：所有包使用相同的 salt（我之前的测试）
+// BenchmarkUDPSameSalt is the wrong scenario: every packet uses the same salt
+// (an earlier test of mine)
 func BenchmarkUDPSameSalt(b *testing.B) {
 	masterKey := make([]byte, 32)
 	key := &Key{
@@ -47,7 +49,7 @@ func BenchmarkUDPSameSalt(b *testing.B) {
 	}
 	reusedInfo := []byte("ss-subkey")
 	data := make([]byte, 1400)
-	salt := make([]byte, 32) // 固定的 salt
+	salt := make([]byte, 32) // fixed salt
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -60,7 +62,8 @@ func BenchmarkUDPSameSalt(b *testing.B) {
 	}
 }
 
-// BenchmarkTCPRealistic 模拟真实的 TCP 场景：每个连接只初始化一次 cipher
+// BenchmarkTCPRealistic simulates the realistic TCP case: the cipher is
+// initialized once per connection
 func BenchmarkTCPRealistic(b *testing.B) {
 	masterKey := make([]byte, 32)
 	key := &Key{
@@ -74,13 +77,13 @@ func BenchmarkTCPRealistic(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	// 模拟 TCP 连接建立：一次性派生 subKey 和 cipher
+	// Simulate TCP connection setup: derive subKey and cipher once
 	subKey := make([]byte, key.CipherConf.KeyLen)
 	kdf := hkdf.New(sha1.New, key.MasterKey, salt, reusedInfo)
 	_, _ = kdf.Read(subKey)
 	ciph, _ := key.CipherConf.NewCipher(subKey)
 
-	// 模拟多个数据包使用同一个 cipher
+	// Simulate several packets sharing one cipher
 	data := make([]byte, 1400)
 	nonce := make([]byte, key.CipherConf.NonceLen)
 
@@ -88,12 +91,13 @@ func BenchmarkTCPRealistic(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		// TCP 场景：cipher 已预先创建，只需要 Seal
+		// TCP case: the cipher already exists, so only Seal is needed
 		_ = ciph.Seal(data[:0], nonce, data, nil)
 	}
 }
 
-// BenchmarkTCPOverheadIncludingInit 包含初始化开销的 TCP
+// BenchmarkTCPOverheadIncludingInit is TCP including the initialization
+// overhead
 func BenchmarkTCPOverheadIncludingInit(b *testing.B) {
 	masterKey := make([]byte, 32)
 	key := &Key{
@@ -108,7 +112,7 @@ func BenchmarkTCPOverheadIncludingInit(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		// 每次都重新初始化（模拟新建连接）
+		// Re-initialize on every iteration (simulating a new connection)
 		salt := make([]byte, 32)
 		_, err := rand.Read(salt)
 		if err != nil {
@@ -124,7 +128,7 @@ func BenchmarkTCPOverheadIncludingInit(b *testing.B) {
 	}
 }
 
-// BenchmarkUDPSmallPacketRealistic 真实的 UDP 小包场景
+// BenchmarkUDPSmallPacketRealistic is the realistic small-packet UDP case
 func BenchmarkUDPSmallPacketRealistic(b *testing.B) {
 	masterKey := make([]byte, 32)
 	key := &Key{
@@ -132,7 +136,7 @@ func BenchmarkUDPSmallPacketRealistic(b *testing.B) {
 		CipherConf: ciphers.AeadCiphersConf["aes-128-gcm"],
 	}
 	reusedInfo := []byte("ss-subkey")
-	data := make([]byte, 64) // DNS 查询大小的包
+	data := make([]byte, 64) // packet sized like a DNS query
 
 	b.ResetTimer()
 	b.ReportAllocs()

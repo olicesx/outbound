@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// TestPool_Get_Bug 测试 pool.Get 对于 2 的幂次的问题
+// TestPool_Get_Bug tests pool.Get for power-of-two sizes
 func TestPool_Get_Bug(t *testing.T) {
 	fmt.Println("=== Testing pool.Get for powers of 2 ===")
 	fmt.Println()
@@ -106,11 +106,11 @@ func TestGetBucketCapacityBug(t *testing.T) {
 	}
 }
 
-// TestPoolInitialization 测试 pool 初始化是否正确
+// TestPoolInitialization tests whether pool initialization is correct
 func TestPoolInitialization(t *testing.T) {
 	fmt.Println("\n=== Pool Initialization Test ===")
 
-	// 测试每个 bucket
+	// Test every bucket
 	for i := minsizePower; i < num; i++ {
 		buf := pools[i].Get().([]byte)
 		actualCap := cap(buf)
@@ -128,11 +128,13 @@ func TestPoolInitialization(t *testing.T) {
 	fmt.Println()
 }
 
-// TestPool_PutNonPowerOfTwoCapDoesNotPolluteBucket 回归测试：非 2 幂 cap 的缓冲
-// 必须被丢弃而不是存入下一档桶——否则后续 Get(2^n) 会把池中的短缓冲
-// 重新切片到桶大小，导致 slice bounds panic。
+// TestPool_PutNonPowerOfTwoCapDoesNotPolluteBucket is a regression test: a
+// buffer whose cap is not a power of two must be discarded instead of being
+// stored in the next bucket up, otherwise a later Get(2^n) reslices the short
+// pooled buffer to the bucket size and panics with slice bounds out of range.
 func TestPool_PutNonPowerOfTwoCapDoesNotPolluteBucket(t *testing.T) {
-	// 模拟 append 增长产生的非 2 幂 cap（如 socks5 认证分支撑破 512 → ~832）。
+	// Simulate the non-power-of-two cap that append growth produces (e.g. the
+	// socks5 authentication branch pushing past 512 → ~832).
 	polluter := make([]byte, 512)
 	polluter = append(polluter, make([]byte, 300)...)
 	if cap(polluter)&(cap(polluter)-1) == 0 {
@@ -140,7 +142,8 @@ func TestPool_PutNonPowerOfTwoCapDoesNotPolluteBucket(t *testing.T) {
 	}
 	Put(polluter)
 
-	// 若污染了下一档桶，这里对 1024/2048 的 Get 会 panic 或返回容量不足的缓冲。
+	// If the next bucket up were polluted, a Get(1024/2048) here would panic or
+	// return a buffer with insufficient capacity.
 	for i := 0; i < 200; i++ {
 		b := Get(2048)
 		if cap(b) < 2048 {

@@ -47,7 +47,7 @@ func BenchmarkPasswordHashSyncMap(b *testing.B) {
 	password := "test-password-12345"
 	var cache sync.Map
 
-	// 预计算
+	// Pre-compute
 	hash := sha256.New224()
 	hash.Write([]byte(password))
 	var result [56]byte
@@ -70,7 +70,7 @@ func BenchmarkNewConnComparison(b *testing.B) {
 	b.Run("Original", func(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			// 原始实现：每次都重新计算
+			// Original implementation: recompute on every iteration
 			hash := sha256.New224()
 			hash.Write([]byte(password))
 			var pass [56]byte
@@ -80,12 +80,12 @@ func BenchmarkNewConnComparison(b *testing.B) {
 	})
 
 	b.Run("OptimizedCached", func(b *testing.B) {
-		// 预热缓存
+		// Warm the cache
 		_ = getPasswordHash(password)
 
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			// 优化后：使用缓存
+			// Optimized: use the cache
 			pass := getPasswordHash(password)
 			_ = pass
 		}

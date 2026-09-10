@@ -5,12 +5,12 @@ import (
 	"testing"
 )
 
-// TestPoolGetPanicScenario 测试原始 panic 场景
+// TestPoolGetPanicScenario tests the original panic scenario
 func TestPoolGetPanicScenario(t *testing.T) {
 	fmt.Println("=== Testing Original Panic Scenario ===")
 	fmt.Println()
 
-	// 原始 panic: pool.Get(2080) 返回 cap=2048 的 buffer
+	// Original panic: pool.Get(2080) returned a buffer with cap=2048
 	// 2080 = 2048 (len(b)) + 16 (salt) + 16 (tagLen)
 
 	testCases := []struct {
@@ -45,7 +45,7 @@ func TestPoolGetPanicScenario(t *testing.T) {
 	}
 }
 
-// TestAllPoolFunctions 测试所有 pool 函数
+// TestAllPoolFunctions tests every pool function
 func TestAllPoolFunctions(t *testing.T) {
 	fmt.Println("=== Testing All Pool Functions ===")
 	fmt.Println()

@@ -5,8 +5,9 @@ import (
 	"time"
 )
 
-// TestPushBackFullDoesNotBlock 回归测试：队列满时 PushBack 必须丢弃而非阻塞，
-// 否则唯一的解复用 goroutine 会停摆（head-of-line blocking）。
+// TestPushBackFullDoesNotBlock is a regression test: PushBack must drop rather
+// than block when the queue is full, otherwise the single demultiplexing
+// goroutine stalls (head-of-line blocking).
 func TestPushBackFullDoesNotBlock(t *testing.T) {
 	p := NewPackets()
 	for i := 0; i < packetChanCap; i++ {
@@ -23,7 +24,8 @@ func TestPushBackFullDoesNotBlock(t *testing.T) {
 		t.Fatal("PushBack blocked on full queue (head-of-line blocking)")
 	}
 
-	// 队列仍可正常消费（丢弃不影响既有数据）。
+	// The queue is still consumable (the drop did not disturb the entries
+	// already in it).
 	for i := 0; i < packetChanCap; i++ {
 		pkt, closed := p.PopFrontBlock()
 		if closed || pkt == nil {

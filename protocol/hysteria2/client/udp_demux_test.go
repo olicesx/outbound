@@ -135,8 +135,9 @@ func TestUDPSessionManagerDemuxPreservesPerSessionOrder(t *testing.T) {
 	}
 }
 
-// TestUDPSessionManagerParallelDemux 回归测试：多个 run() goroutine 并发
-// 消费 datagram 时，各 session 的消息仍被完整、正确地分发。
+// TestUDPSessionManagerParallelDemux is a regression test: when several run()
+// goroutines consume datagrams concurrently, every session still receives all
+// of its messages, and only its own.
 func TestUDPSessionManagerParallelDemux(t *testing.T) {
 	const numSessions = 4
 	const msgsPerSession = 500

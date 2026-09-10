@@ -9,7 +9,8 @@ import (
 	"time"
 )
 
-// oneByteConn 每次 Read 最多返回 1 字节，模拟极端 TCP 分片。
+// oneByteConn returns at most one byte per Read, simulating extreme TCP
+// fragmentation.
 type oneByteConn struct {
 	data []byte
 	pos  int
@@ -39,12 +40,13 @@ func (c *oneByteConn) SetWriteDeadline(time.Time) error {
 	return nil
 }
 
-// TestConnReadFragmentedStatus 回归测试：status 字段被 TCP 分片时
-// 必须用 ReadFull 读满 2 字节，否则帧流永久错位（desync）。
+// TestConnReadFragmentedStatus is a regression test: when the status field is
+// split across TCP segments, both bytes must be read with ReadFull, otherwise
+// the frame stream stays desynchronized forever.
 func TestConnReadFragmentedStatus(t *testing.T) {
 	payload := []byte("hello")
 	var frame []byte
-	// 帧头: 2B length(=4) + 2B id + 2B status + 2B dataLen + payload
+	// Frame header: 2B length(=4) + 2B id + 2B status + 2B dataLen + payload
 	frame = binary.BigEndian.AppendUint16(frame, 4)
 	frame = binary.BigEndian.AppendUint16(frame, 0)                  // id
 	frame = binary.BigEndian.AppendUint16(frame, uint16(OptionData)) // status: keep=0, opts=OptionData
@@ -53,7 +55,8 @@ func TestConnReadFragmentedStatus(t *testing.T) {
 
 	c := &Conn{Conn: &oneByteConn{data: frame}}
 	buf := make([]byte, len(payload))
-	// Read 允许返回部分数据（m.remain 机制），用 io.ReadFull 读完整载荷。
+	// Read may return partial data (the m.remain mechanism), so use io.ReadFull
+	// to read the whole payload.
 	if _, err := io.ReadFull(c, buf); err != nil {
 		t.Fatalf("ReadFull: %v", err)
 	}
@@ -62,7 +65,8 @@ func TestConnReadFragmentedStatus(t *testing.T) {
 	}
 }
 
-// 保证 Conn 满足最小接口要求（编译期检查 oneByteConn 不会静默错用）。
+// Assert oneByteConn satisfies the minimal interface (a compile-time check that
+// it cannot be misused silently).
 var _ interface {
 	Read([]byte) (int, error)
 	io.Writer

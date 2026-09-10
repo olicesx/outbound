@@ -31,8 +31,8 @@ func BenchmarkUDPRealistic(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		// Run the full encryption path through EncryptUDPFromPool
-		_, err = EncryptUDPFromPool(key, data, salt, reusedInfo)
+		// Run the full encryption path through EncryptUDPFromPoolZeroNonce
+		_, err = EncryptUDPFromPoolZeroNonce(key, data, salt, reusedInfo)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -55,7 +55,7 @@ func BenchmarkUDPSameSalt(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_, err := EncryptUDPFromPool(key, data, salt, reusedInfo)
+		_, err := EncryptUDPFromPoolZeroNonce(key, data, salt, reusedInfo)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -148,7 +148,7 @@ func BenchmarkUDPSmallPacketRealistic(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		_, err = EncryptUDPFromPool(key, data, salt, reusedInfo)
+		_, err = EncryptUDPFromPoolZeroNonce(key, data, salt, reusedInfo)
 		if err != nil {
 			b.Fatal(err)
 		}

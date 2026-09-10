@@ -51,7 +51,7 @@ func udpABKey(b *testing.B, payloadSize int) (*Key, pool.PB, []byte) {
 	info := []byte("juicity-reused-info")
 	plaintext := make([]byte, payloadSize)
 	_, _ = fastrand.Read(plaintext)
-	encrypted, err := EncryptUDPFromPool(key, plaintext, salt, info)
+	encrypted, err := EncryptUDPFromPoolZeroNonce(key, plaintext, salt, info)
 	if err != nil {
 		b.Fatal(err)
 	}

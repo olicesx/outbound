@@ -23,7 +23,7 @@ func TestUDPRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 50; j++ {
-				encrypted, err := EncryptUDPFromPool(key, data, salt, nil)
+				encrypted, err := EncryptUDPFromPoolZeroNonce(key, data, salt, nil)
 				if err != nil {
 					t.Error(err)
 					return
@@ -35,7 +35,7 @@ func TestUDPRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 50; j++ {
-				encrypted, _ := EncryptUDPFromPool(key, data, salt, nil)
+				encrypted, _ := EncryptUDPFromPoolZeroNonce(key, data, salt, nil)
 				decrypted := make([]byte, len(data)+32)
 				_, err := DecryptUDP(decrypted[:0], key, encrypted, nil)
 				if err != nil {

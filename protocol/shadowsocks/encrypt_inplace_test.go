@@ -18,7 +18,7 @@ func fillRandom(t *testing.T, b []byte) {
 }
 
 // TestEncryptUDPInPlaceEquivalence verifies that encryptUDPInPlace produces
-// the same output as EncryptUDPFromPool when given the same inputs.
+// the same output as EncryptUDPFromPoolZeroNonce when given the same inputs.
 func TestEncryptUDPInPlaceEquivalence(t *testing.T) {
 	testCases := []struct {
 		name      string
@@ -57,9 +57,9 @@ func TestEncryptUDPInPlaceEquivalence(t *testing.T) {
 			}
 
 			// Encrypt using original method
-			encryptedOriginal, err := EncryptUDPFromPool(key, payload, salt, reusedInfo)
+			encryptedOriginal, err := EncryptUDPFromPoolZeroNonce(key, payload, salt, reusedInfo)
 			if err != nil {
-				t.Fatalf("EncryptUDPFromPool failed: %v", err)
+				t.Fatalf("EncryptUDPFromPoolZeroNonce failed: %v", err)
 			}
 			defer pool.Put(encryptedOriginal)
 

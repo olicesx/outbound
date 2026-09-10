@@ -148,8 +148,8 @@ func BenchmarkPoolGetPutLarge(b *testing.B) {
 	}
 }
 
-// BenchmarkEncryptUDPFromPool benchmarks UDP encryption with pool
-func BenchmarkEncryptUDPFromPool(b *testing.B) {
+// BenchmarkEncryptUDPFromPoolZeroNonce benchmarks UDP encryption with pool
+func BenchmarkEncryptUDPFromPoolZeroNonce(b *testing.B) {
 	conf := ciphers.AeadCiphersConf["aes-256-gcm"]
 	masterKey := make([]byte, conf.KeyLen)
 	salt := make([]byte, conf.SaltLen)
@@ -163,7 +163,7 @@ func BenchmarkEncryptUDPFromPool(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		shadowBytes, _ := EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+		shadowBytes, _ := EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 		shadowBytes.Put()
 	}
 }
@@ -181,7 +181,7 @@ func BenchmarkDecryptUDPFromPool(b *testing.B) {
 		MasterKey:  masterKey,
 	}
 
-	shadowBytes, _ := EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	shadowBytes, _ := EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 	defer shadowBytes.Put()
 
 	b.ResetTimer()
@@ -231,7 +231,7 @@ func BenchmarkFullEncryptionPipeline(b *testing.B) {
 		salt := make([]byte, conf.SaltLen)
 
 		// Encrypt
-		shadowBytes, _ := EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+		shadowBytes, _ := EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 
 		// Decrypt
 		buf, _ := DecryptUDPFromPool(key, shadowBytes, reusedInfo)
@@ -262,7 +262,7 @@ func benchmarkEncryptSize(b *testing.B, size int) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		shadowBytes, _ := EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+		shadowBytes, _ := EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 		shadowBytes.Put()
 	}
 }

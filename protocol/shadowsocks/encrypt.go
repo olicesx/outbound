@@ -179,20 +179,33 @@ func encryptUDPTo(
 	if err != nil {
 		return 0, err
 	}
+	// The AEAD nonce is ciphers.ZeroNonce for every packet, which is the
+	// Shadowsocks AEAD UDP layout: the per-packet salt is the only key
+	// freshness, so the salt carries the whole nonce-uniqueness requirement.
+	// See EncryptUDPFromPoolZeroNonce for the caller-facing contract.
 	_ = ciph.Seal(dst[saltLen:saltLen], ciphers.ZeroNonce[:key.CipherConf.NonceLen], plaintext, nil)
 	return required, nil
 }
 
-// EncryptUDPFromPool encrypts one UDP packet into pooled storage.
+// EncryptUDPFromPoolZeroNonce encrypts one UDP packet into pooled storage with
+// the fixed ciphers.ZeroNonce as the AEAD nonce. The name states the layout on
+// purpose: the salt is not just a protocol field here, it is the only thing
+// separating this packet's AEAD key/nonce pair from the next one's.
 //
-// Contract: salt becomes the HKDF salt AND is copied into the packet, while the
-// AEAD nonce is the fixed ciphers.ZeroNonce. The output is therefore fully
-// determined by (masterKey, salt, plaintext, reusedInfo): nonce uniqueness is
-// the caller's responsibility, and reusing a salt under the same master key
-// reuses the AEAD key/nonce pair. Callers must supply a fresh random salt per
-// packet (protocol/shadowsocks callers do; this helper currently has no
-// production caller in this module).
-func EncryptUDPFromPool(key *Key, b []byte, salt []byte, reusedInfo []byte) (pool.PB, error) {
+// Contract: salt is used as the HKDF salt AND copied into the packet verbatim,
+// while the nonce is always zero, so the packet is fully determined by
+// (masterKey, salt, plaintext, reusedInfo) and two packets encrypted under the
+// same master key and the same salt share a keystream. An observer holding both
+// ciphertexts then recovers c1^c2 = p1^p2 without the key, which is why salt
+// MUST be a fresh random value for every packet. Nonce uniqueness is the
+// caller's responsibility, and TestEncryptUDPFromPoolZeroNonceSaltReuse pins
+// that failure mode.
+//
+// The production UDP paths generate their salt per packet (protocol/shadowsocks
+// UdpConn.WriteTo via RandomSaltGenerator, protocol/juicity's packet conn) and
+// go through EncryptUDPTo/EncryptUDPToWithScratch; this pooled helper has no
+// production caller in this module.
+func EncryptUDPFromPoolZeroNonce(key *Key, b []byte, salt []byte, reusedInfo []byte) (pool.PB, error) {
 	buf := pool.Get(key.CipherConf.SaltLen + len(b) + key.CipherConf.TagLen)
 	n, err := EncryptUDPTo(buf, key, b, salt, reusedInfo)
 	if err != nil {

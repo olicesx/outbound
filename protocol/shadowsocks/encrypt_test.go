@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/daeuniverse/outbound/ciphers"
+	"github.com/daeuniverse/outbound/pool"
 )
 
 func TestEncryptDecrypt(t *testing.T) {
@@ -23,9 +24,9 @@ func TestEncryptDecrypt(t *testing.T) {
 		MasterKey:  masterKey,
 	}
 
-	encrypted, err := EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	encrypted, err := EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 	if err != nil {
-		t.Fatalf("EncryptUDPFromPool failed: %v", err)
+		t.Fatalf("EncryptUDPFromPoolZeroNonce failed: %v", err)
 	}
 	defer encrypted.Put()
 
@@ -47,7 +48,7 @@ func TestEncryptUDPToMatchesPooledWire(t *testing.T) {
 	plaintext := []byte("destination-buffer")
 	reusedInfo := []byte("ss-subkey")
 
-	pooled, err := EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	pooled, err := EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +94,7 @@ func TestMultipleSalts(t *testing.T) {
 		salt := make([]byte, conf.SaltLen)
 		fillRandom(t, salt)
 
-		encrypted, err := EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+		encrypted, err := EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 		if err != nil {
 			t.Fatalf("Encrypt iteration %d failed: %v", i, err)
 		}
@@ -119,7 +120,7 @@ func TestDecryptUDPWithScratchMatchesPlaintext(t *testing.T) {
 	salt := make([]byte, conf.SaltLen)
 	plaintext := []byte("destination-decryption")
 	reusedInfo := []byte("ss-subkey")
-	encrypted, err := EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	encrypted, err := EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,6 +134,107 @@ func TestDecryptUDPWithScratchMatchesPlaintext(t *testing.T) {
 	}
 	if !bytes.Equal(dst[:n], plaintext) {
 		t.Fatal("scratch decryption changed plaintext")
+	}
+}
+
+// TestEncryptUDPFromPoolZeroNonceSaltReuse is the failure assertion behind the
+// contract documented on EncryptUDPFromPoolZeroNonce: reusing a salt reuses the
+// AEAD key/nonce pair, and the damage is visible in the ciphertexts alone.
+//
+// Two packets with different plaintexts, encrypted under one master key with
+// the same salt, share a keystream. XOR-ing their payloads cancels that
+// keystream and yields the XOR of the two plaintexts, so an observer who sees
+// both packets on the wire learns p1^p2 with no key and no cryptanalysis. Both
+// packets remain individually valid and decryptable, so nothing downstream
+// reports a problem; only the XOR reveals the reuse.
+//
+// The test fails if the zero-nonce layout stops holding (the XOR equality would
+// disappear) or if the salt stops being the only per-packet input to the key
+// schedule (a different salt would no longer break the equality). It is the
+// assertion that makes this API's hazard explicit instead of leaving it as a
+// trap for the next caller.
+func TestEncryptUDPFromPoolZeroNonceSaltReuse(t *testing.T) {
+	for _, cipherName := range []string{"aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"} {
+		t.Run(cipherName, func(t *testing.T) {
+			conf := ciphers.AeadCiphersConf[cipherName]
+			masterKey := make([]byte, conf.KeyLen)
+			fillRandom(t, masterKey)
+			key := &Key{CipherConf: conf, MasterKey: masterKey}
+			reusedInfo := []byte("ss-subkey")
+
+			salt := make([]byte, conf.SaltLen)
+			fillRandom(t, salt)
+
+			// Equal-length plaintexts so the payload XOR is well defined.
+			firstPlain := []byte("first plaintext: 0123456789abcdef")
+			secondPlain := []byte("second plaintext, different bytes")
+			if len(firstPlain) != len(secondPlain) {
+				t.Fatalf("test setup: plaintext lengths differ (%d, %d)", len(firstPlain), len(secondPlain))
+			}
+
+			encrypt := func(plaintext, salt []byte) pool.PB {
+				packet, err := EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
+				if err != nil {
+					t.Fatalf("EncryptUDPFromPoolZeroNonce: %v", err)
+				}
+				return packet
+			}
+			payload := func(packet pool.PB) []byte {
+				return packet[conf.SaltLen : conf.SaltLen+len(firstPlain)]
+			}
+			xor := func(a, b []byte) []byte {
+				out := make([]byte, len(a))
+				for i := range a {
+					out[i] = a[i] ^ b[i]
+				}
+				return out
+			}
+
+			first := encrypt(firstPlain, salt)
+			defer first.Put()
+			second := encrypt(secondPlain, salt)
+			defer second.Put()
+
+			if !bytes.Equal(first[:conf.SaltLen], salt) || !bytes.Equal(second[:conf.SaltLen], salt) {
+				t.Fatal("the packet must carry the caller-supplied salt verbatim")
+			}
+			if bytes.Equal(first, second) {
+				t.Fatal("different plaintexts produced identical packets")
+			}
+
+			// Same salt => same keystream => c1^c2 == p1^p2.
+			recovered := xor(payload(first), payload(second))
+			want := xor(firstPlain, secondPlain)
+			if bytes.Equal(want, make([]byte, len(want))) {
+				t.Fatal("test setup: the two plaintexts must differ")
+			}
+			if !bytes.Equal(recovered, want) {
+				t.Fatalf("reused salt did not reuse the keystream: c1^c2 = %x, want p1^p2 = %x",
+					recovered, want)
+			}
+
+			// The reuse is silent: both packets still decrypt on their own.
+			for i, plaintext := range [][]byte{firstPlain, secondPlain} {
+				packet := [2]pool.PB{first, second}[i]
+				decrypted, err := DecryptUDPFromPool(key, packet, reusedInfo)
+				if err != nil {
+					t.Fatalf("packet %d did not decrypt: %v", i, err)
+				}
+				if !bytes.Equal(decrypted, plaintext) {
+					t.Fatalf("packet %d decrypted to %q, want %q", i, decrypted, plaintext)
+				}
+				decrypted.Put()
+			}
+
+			// A fresh salt breaks the equality: that is the whole protection.
+			otherSalt := make([]byte, conf.SaltLen)
+			fillRandom(t, otherSalt)
+			third := encrypt(firstPlain, otherSalt)
+			defer third.Put()
+			if bytes.Equal(xor(payload(third), payload(second)), want) {
+				t.Fatal("a different salt still shared the keystream")
+			}
+		})
 	}
 }
 
@@ -183,7 +285,7 @@ func TestDecryptUDPWithScratchAllocationCeiling(t *testing.T) {
 	salt := make([]byte, conf.SaltLen)
 	plaintext := make([]byte, 1400)
 	reusedInfo := []byte("ss-subkey")
-	encrypted, err := EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	encrypted, err := EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +319,7 @@ func BenchmarkEncrypt(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		shadowBytes, _ := EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+		shadowBytes, _ := EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 		shadowBytes.Put()
 	}
 }
@@ -234,7 +336,7 @@ func BenchmarkDecrypt(b *testing.B) {
 		MasterKey:  masterKey,
 	}
 
-	shadowBytes, _ := EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	shadowBytes, _ := EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 	defer shadowBytes.Put()
 
 	b.ResetTimer()

@@ -37,7 +37,7 @@ func (juicityDatagramHarness) Name() string { return "juicity" }
 func (h *juicityDatagramHarness) BuildDatagram(b *testing.B, payloadSize int) []byte {
 	b.Helper()
 	plaintext := make([]byte, payloadSize)
-	enc, err := shadowsocks.EncryptUDPFromPool(h.key, plaintext, h.salt, h.info)
+	enc, err := shadowsocks.EncryptUDPFromPoolZeroNonce(h.key, plaintext, h.salt, h.info)
 	if err != nil {
 		b.Fatalf("encrypt: %v", err)
 	}

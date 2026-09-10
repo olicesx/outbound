@@ -33,7 +33,7 @@ func TestOptimizedEncryptDecryptCorrectness(t *testing.T) {
 		salt := make([]byte, conf.SaltLen)
 		_, _ = fastrand.Read(salt)
 
-		encrypted, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+		encrypted, err := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 		if err != nil {
 			t.Fatalf("Encryption failed at iteration %d: %v", i, err)
 		}
@@ -71,13 +71,13 @@ func TestOptimizedCacheEffectiveness(t *testing.T) {
 	plaintext := []byte("Cache test for juicity")
 	reusedInfo := ciphers.JuicityReusedInfo
 
-	encrypted1, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	encrypted1, err := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
 	encrypted1.Put()
 
-	encrypted2, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	encrypted2, err := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestOptimizedConcurrentAccess(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < 20; j++ {
-				encrypted, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+				encrypted, err := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 				if err != nil {
 					errors <- err
 					return
@@ -174,7 +174,7 @@ func TestOptimizedMemoryLeak(t *testing.T) {
 		salt := make([]byte, conf.SaltLen)
 		_, _ = fastrand.Read(salt)
 
-		encrypted, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+		encrypted, err := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -222,7 +222,7 @@ func TestOptimizedPoolMemoryLeak(t *testing.T) {
 	runtime.ReadMemStats(&memBefore)
 
 	for i := 0; i < 10000; i++ {
-		encrypted, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+		encrypted, err := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -268,7 +268,7 @@ func BenchmarkJuicityEncrypt(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		encrypted, _ := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+		encrypted, _ := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 		encrypted.Put()
 	}
 }
@@ -289,7 +289,7 @@ func BenchmarkJuicityDecrypt(b *testing.B) {
 	plaintext := make([]byte, 1400)
 	reusedInfo := ciphers.JuicityReusedInfo
 
-	encrypted, _ := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	encrypted, _ := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 	defer encrypted.Put()
 
 	decrypted, _ := shadowsocks.DecryptUDPFromPool(key, encrypted, reusedInfo)
@@ -322,7 +322,7 @@ func BenchmarkJuicityEncryptDecrypt(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		encrypted, _ := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+		encrypted, _ := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 		decrypted, _ := shadowsocks.DecryptUDPFromPool(key, encrypted, reusedInfo)
 		encrypted.Put()
 		decrypted.Put()
@@ -348,7 +348,7 @@ func BenchmarkJuicityVsOriginal(b *testing.B) {
 	b.Run("Original", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			encrypted, _ := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+			encrypted, _ := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 			decrypted := pool.Get(len(encrypted))
 			n, _ := shadowsocks.DecryptUDP(decrypted[:0], key, encrypted, reusedInfo)
 			encrypted.Put()
@@ -360,7 +360,7 @@ func BenchmarkJuicityVsOriginal(b *testing.B) {
 	b.Run("Optimized", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			encrypted, _ := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+			encrypted, _ := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 			decrypted, _ := shadowsocks.DecryptUDPFromPool(key, encrypted, reusedInfo)
 			encrypted.Put()
 			decrypted.Put()
@@ -392,7 +392,7 @@ func BenchmarkJuicityMultipleSalts(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			salt := salts[i%numSalts]
-			encrypted, _ := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+			encrypted, _ := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 			encrypted.Put()
 		}
 	})
@@ -401,7 +401,7 @@ func BenchmarkJuicityMultipleSalts(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			salt := salts[i%numSalts]
-			encrypted, _ := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+			encrypted, _ := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 			encrypted.Put()
 		}
 	})
@@ -430,7 +430,7 @@ func BenchmarkJuicityRealistic(b *testing.B) {
 			if i%100 == 0 {
 				_, _ = fastrand.Read(salt)
 			}
-			encrypted, _ := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+			encrypted, _ := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 			decrypted, _ := shadowsocks.DecryptUDPFromPool(key, encrypted, reusedInfo)
 			encrypted.Put()
 			decrypted.Put()
@@ -453,7 +453,7 @@ func TestTransportPacketConnOptimizedPath(t *testing.T) {
 	_, _ = fastrand.Read(salt)
 	reusedInfo := ciphers.JuicityReusedInfo
 
-	encrypted, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	encrypted, err := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +536,7 @@ func TestTransportPacketConnSimulatedReadWrite(t *testing.T) {
 
 		reusedInfo := ciphers.JuicityReusedInfo
 
-		encrypted, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+		encrypted, err := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -572,7 +572,7 @@ func TestTransportPacketConnTargetAddress(t *testing.T) {
 	_, _ = fastrand.Read(salt)
 	reusedInfo := ciphers.JuicityReusedInfo
 
-	encrypted, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	encrypted, err := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,7 +591,7 @@ func TestTransportPacketConnTargetAddress(t *testing.T) {
 	_ = tgt
 }
 
-// TestEncryptUDPFromPoolIsDeterministicPerSalt is the P3-27 replacement for the
+// TestEncryptUDPFromPoolZeroNonceIsDeterministicPerSalt is the P3-27 replacement for the
 // former TestCacheExpiration, which asserted nothing: it compared a buffer
 // AFTER returning it to the pool (use-after-Put, so the comparison was against
 // whatever the pool's LIFO handed back) and only checked that the result was
@@ -604,7 +604,7 @@ func TestTransportPacketConnTargetAddress(t *testing.T) {
 // responsibility through salt uniqueness, and this test states that contract
 // explicitly instead of asserting an independence the implementation does not
 // provide.
-func TestEncryptUDPFromPoolIsDeterministicPerSalt(t *testing.T) {
+func TestEncryptUDPFromPoolZeroNonceIsDeterministicPerSalt(t *testing.T) {
 	conf := CipherConf
 	masterKey := make([]byte, conf.KeyLen)
 	_, _ = fastrand.Read(masterKey)
@@ -620,7 +620,7 @@ func TestEncryptUDPFromPoolIsDeterministicPerSalt(t *testing.T) {
 	plaintext := []byte("Per-call encryption test")
 	reusedInfo := ciphers.JuicityReusedInfo
 
-	first, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	first, err := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +629,7 @@ func TestEncryptUDPFromPoolIsDeterministicPerSalt(t *testing.T) {
 	firstBytes := append([]byte(nil), []byte(first)...)
 	first.Put()
 
-	second, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	second, err := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, salt, reusedInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -648,7 +648,7 @@ func TestEncryptUDPFromPoolIsDeterministicPerSalt(t *testing.T) {
 	// which is the property that makes salt uniqueness load-bearing.
 	otherSalt := make([]byte, conf.SaltLen)
 	_, _ = fastrand.Read(otherSalt)
-	third, err := shadowsocks.EncryptUDPFromPool(key, plaintext, otherSalt, reusedInfo)
+	third, err := shadowsocks.EncryptUDPFromPoolZeroNonce(key, plaintext, otherSalt, reusedInfo)
 	if err != nil {
 		t.Fatal(err)
 	}

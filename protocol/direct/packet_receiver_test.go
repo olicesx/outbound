@@ -111,7 +111,12 @@ func newUnixDatagramReceiverEntry(t *testing.T) (*directPacketReceiverEntry, int
 	}
 	entry := &directPacketReceiverEntry{fd: fds[0]}
 	entry.active.Store(true)
+	// Delivery is decoupled from the epoll thread, so a hand-built entry needs
+	// the same delivery goroutine register() starts: the handler now runs
+	// there, not on the caller of drain().
+	entry.startDelivery()
 	return entry, fds[1], func() {
+		entry.stopDelivery()
 		entry.active.Store(false)
 		_ = unix.Close(fds[0])
 		_ = unix.Close(fds[1])

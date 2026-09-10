@@ -2,6 +2,7 @@ package shadowsocks_2022
 
 import (
 	"encoding/binary"
+	stderrors "errors"
 	"io"
 	"net"
 	"net/netip"
@@ -149,11 +150,60 @@ func TestValidateTimestamp(t *testing.T) {
 	if err := validateTimestamp(now.Add(-ciphers.TimestampTolerance+time.Millisecond), now); err != nil {
 		t.Fatalf("near-past timestamp should pass: %v", err)
 	}
-	if err := validateTimestamp(now.Add(ciphers.TimestampTolerance+time.Millisecond), now); err != protocol.ErrReplayAttack {
-		t.Fatalf("too-far future timestamp should fail with replay, got: %v", err)
+	if err := validateTimestamp(now.Add(ciphers.TimestampTolerance+time.Millisecond), now); err != protocol.ErrTimestampExpired {
+		t.Fatalf("too-far future timestamp should fail with an expired timestamp, got: %v", err)
 	}
-	if err := validateTimestamp(now.Add(-ciphers.TimestampTolerance-time.Millisecond), now); err != protocol.ErrReplayAttack {
-		t.Fatalf("too-old timestamp should fail with replay, got: %v", err)
+	if err := validateTimestamp(now.Add(-ciphers.TimestampTolerance-time.Millisecond), now); err != protocol.ErrTimestampExpired {
+		t.Fatalf("too-old timestamp should fail with an expired timestamp, got: %v", err)
+	}
+}
+
+// TestTimestampExpiryIsDistinguishableFromReplay pins the classification split:
+// a rejected timestamp reports its own cause, and a replayed packet ID keeps
+// reporting a replay. A consumer that reacts to one of them must therefore say
+// so explicitly instead of inheriting the other's behaviour.
+func TestTimestampExpiryIsDistinguishableFromReplay(t *testing.T) {
+	now := time.Now()
+	stale := validateTimestamp(now.Add(-ciphers.TimestampTolerance-time.Second), now)
+	if stale == nil {
+		t.Fatal("a stale timestamp must be rejected")
+	}
+	if !stderrors.Is(stale, protocol.ErrTimestampExpired) {
+		t.Fatalf("stale timestamp error = %v, want ErrTimestampExpired", stale)
+	}
+	if stderrors.Is(stale, protocol.ErrReplayAttack) {
+		t.Fatalf("stale timestamp error = %v, must not be classified as a replay", stale)
+	}
+
+	replay := protocol.ErrReplayAttack
+	if !stderrors.Is(replay, protocol.ErrReplayAttack) || stderrors.Is(replay, protocol.ErrTimestampExpired) {
+		t.Fatalf("replay error = %v, want it classified as a replay only", replay)
+	}
+
+	// The UDP replay window keeps reporting a plain replay: the split moved the
+	// timestamp rejection out of ErrReplayAttack and left this decision intact.
+	conf := ciphers.Aead2022CiphersConf["2022-blake3-aes-256-gcm"]
+	if conf == nil {
+		t.Fatal("missing ss2022 cipher config")
+	}
+	psk := make([]byte, conf.KeyLen)
+	for i := range psk {
+		psk[i] = 0x11
+	}
+	core, err := NewSS2022Core(conf, [][]byte{psk}, psk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := [8]byte{1, 1, 1, 1, 1, 1, 1, 1}
+	conn, err := NewUdpConn(&udpReadBufferConn{}, core, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !conn.checkAndUpdateReplay(sessionID, 7, now) {
+		t.Fatal("the first packet of a session must be accepted")
+	}
+	if conn.checkAndUpdateReplay(sessionID, 7, now) {
+		t.Fatal("a repeated packet ID must be rejected")
 	}
 }
 

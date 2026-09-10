@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -103,32 +104,73 @@ func (ho *HTTPObfs) Write(b []byte) (int, error) {
 	ho.wMu.Lock()
 	defer ho.wMu.Unlock()
 	if ho.firstRequest {
-		req, _ := http.NewRequest("GET", fmt.Sprintf("http://%s%s", ho.host, ho.path), bytes.NewBuffer(b[:]))
+		req, err := http.NewRequest("GET", fmt.Sprintf("http://%s%s", ho.authorityHost(), ho.path), bytes.NewBuffer(b[:]))
+		if err != nil {
+			// Do not swallow this: without a request there is no obfs
+			// handshake, and the caller must see the failure rather than
+			// have raw payload sent as if it were the first request.
+			return 0, fmt.Errorf("simple-obfs http: build first request: %w", err)
+		}
 		req.Header.Set("User-Agent", fmt.Sprintf("curl/7.%d.%d", fastrand.Int()%87, fastrand.Int()%2))
 		req.Header.Set("Upgrade", "websocket")
 		req.Header.Set("Connection", "Upgrade")
 		if ho.port != "80" {
-			req.Host = fmt.Sprintf("%s:%s", ho.host, ho.port)
+			req.Host = net.JoinHostPort(ho.host, ho.port)
 		}
 		randBytes := make([]byte, 16)
 		_, _ = fastrand.Read(randBytes)
 		req.Header.Set("Sec-WebSocket-Key", base64.URLEncoding.EncodeToString(randBytes))
 		req.ContentLength = int64(len(b))
-		err := req.Write(ho.Conn)
+		if err := req.Write(ho.Conn); err != nil {
+			// Leave firstRequest set: the request was not delivered, so a
+			// retry must still emit the obfs handshake instead of writing
+			// the payload bare.
+			return 0, err
+		}
 		ho.firstRequest = false
-		return len(b), err
+		return len(b), nil
 	}
 
 	return ho.Conn.Write(b)
+}
+
+// authorityHost renders the request URL authority. A bare IPv6 literal must be
+// bracketed or url.Parse rejects it, and a zone identifier must have its "%"
+// escaped (RFC 6874's "%25") or url.Parse fails on the escape sequence. The Go
+// toolchain this repo builds with (1.26) no longer panics on an unescaped
+// colon in the authority, but the request still has to be well formed.
+func (ho *HTTPObfs) authorityHost() string {
+	host := ho.host
+	if !strings.Contains(host, ":") {
+		return host
+	}
+	if strings.Contains(host, "%") {
+		host = strings.Replace(host, "%", "%25", 1)
+	}
+	return "[" + host + "]"
 }
 
 func (ho *HTTPObfs) CloseWrite() error {
 	return netproxy.ForwardCloseWrite(ho.Conn)
 }
 
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped conn; see TLSObfs for why the
+// forward is required rather than inherited.
+func (ho *HTTPObfs) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(ho.Conn)
+}
+
 func NewHTTPObfs(conn netproxy.Conn, host string, port string, path string) netproxy.Conn {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
+	}
+	// The Host header carries the bare address; brackets are added when the
+	// authority is rendered. Accepting a bracketed literal here keeps the
+	// constructor's contract with its callers (simpleobfs.NewSimpleObfs passes
+	// the ?host= override verbatim, dialer/shadowsocks passes u.Hostname()).
+	if len(host) > 1 && strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
 	}
 	return &HTTPObfs{
 		Conn:          conn,

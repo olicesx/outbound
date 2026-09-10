@@ -78,8 +78,19 @@ func (vc *Conn) filterTLSLocked(buffer []byte) (index int) {
 					vc.remainingServerHello = binary.BigEndian.Uint16(buffer[index+3:]) + 5
 					vc.isTLS12orAbove = true
 					if lenP-index >= 79 && vc.remainingServerHello >= 79 {
+						// RFC 8446 4.1.2: legacy_session_id is opaque<0..32>.
+						// The pre-fix code indexed the cipher suite without
+						// validating that length, so an oversized field read
+						// past the end of the buffer (panic on a hostile
+						// ServerHello). A length outside the RFC range skips
+						// cipher discovery: vc.cipher stays 0, XTLS stays
+						// false, and the connection falls back to plain VLESS
+						// relaying - the fail-safe direction.
 						sessionIDLen := int(buffer[index+43])
-						vc.cipher = binary.BigEndian.Uint16(buffer[index+43+sessionIDLen+1:])
+						cipherOff := index + 44 + sessionIDLen
+						if sessionIDLen <= 32 && cipherOff+2 <= lenP {
+							vc.cipher = binary.BigEndian.Uint16(buffer[cipherOff:])
+						}
 					}
 				}
 			}

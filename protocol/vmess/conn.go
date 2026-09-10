@@ -219,7 +219,22 @@ func (c *Conn) writePacket(b []byte, preWrite []byte) (n int, err error) {
 	return len(b), nil
 }
 
+// vmessInstructionDataFixedLen is the number of bytes InitContext reads from a
+// request instruction block: 1 version byte + 16 IV + 16 key + 1 options byte
+// + 1 security byte + 1 reserved byte, with the last fixed byte at index 35.
+// The variable-length address, its padding and the trailing FNV1a checksum
+// follow it.
+const vmessInstructionDataFixedLen = 36
+
 func (c *Conn) InitContext(instructionData []byte) error {
+	// This path is reached from the server side with peer-supplied bytes, so
+	// the length must be validated before any fixed offset is read: the
+	// indexes below (up to 35) would otherwise panic on a short block, turning
+	// a malformed request into a denial of service against the process.
+	if len(instructionData) < vmessInstructionDataFixedLen {
+		return fmt.Errorf("vmess: instruction data too short: %d bytes, need at least %d",
+			len(instructionData), vmessInstructionDataFixedLen)
+	}
 	c.responseAuth = instructionData[33]
 	copy(c.requestBodyIV[:], instructionData[1:])
 	copy(c.requestBodyKey[:], instructionData[17:])

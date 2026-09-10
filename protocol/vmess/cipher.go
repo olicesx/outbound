@@ -166,6 +166,14 @@ func ReqInstructionDataFromPool(metadata Metadata) []byte {
 	binary.BigEndian.PutUint16(buf[38:40], metadata.Port) // Port
 	buf[40] = MetadataTypeToByte(metadata.Type)           // Address Type
 	metadata.PutAddr(buf[41:])                            // Address
+	// The P-byte padding between the address and the FNV1a checksum is part of
+	// the wire layout and must be given a definite value. pool.Get does not
+	// zero, and this region was previously left untouched, so up to 15 bytes of
+	// uninitialized pool residue went out on every connection (a per-connection
+	// nondeterministic byte pattern the server can see). RespHeaderFromPool
+	// already fills its padding; this is the request-side counterpart.
+	padding := buf[41+metadata.AddrLen() : 41+metadata.AddrLen()+P]
+	_, _ = fastrand.Read(padding)
 	n := len(buf) - 4
 	h := fnv.New32a()
 	h.Write(buf[:n])

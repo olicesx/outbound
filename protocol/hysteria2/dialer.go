@@ -60,9 +60,16 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		config.Auth = header.User + ":" + header.Password
 	}
 	if feature := header.Feature1; feature != nil {
-		config.BandwidthConfig = feature.(*Feature1).BandwidthConfig
-		config.UDPHopInterval = feature.(*Feature1).UDPHopInterval
-		config.ObfsPassword = feature.(*Feature1).ObfsPassword
+		// protocol.Header is an exported API, so an external caller can hand
+		// this dialer any value. A bare type assertion would panic inside
+		// NewDialer; a configuration error must come back as an error.
+		typed, ok := feature.(*Feature1)
+		if !ok {
+			return nil, fmt.Errorf("hysteria2: unexpected Feature1 type %T, want *Feature1", feature)
+		}
+		config.BandwidthConfig = typed.BandwidthConfig
+		config.UDPHopInterval = typed.UDPHopInterval
+		config.ObfsPassword = typed.ObfsPassword
 	}
 	// The override is client-local and never reaches the server. Validate it
 	// here so a typo fails at dialer construction, like tuic and juicity,

@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"reflect"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ import (
 	"unsafe"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/pkg/logger"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
@@ -211,7 +213,14 @@ func NewReality(s string, d netproxy.Dialer) (*Reality, error) {
 		return nil, fmt.Errorf(`invalid "spiderX": %v`, x.spiderX)
 	}
 	x.spiderY = make([]int64, 10)
-	tmpU, _ := url.Parse(x.spiderX)
+	// spiderX comes from the subscription link (?spx=), so it is attacker- and
+	// typo-controllable. url.Parse returns a nil *URL on error, and the very
+	// next line dereferences it: a malformed value must be rejected here, at
+	// configuration load / hot-reload time, instead of panicking the process.
+	tmpU, err := url.Parse(x.spiderX)
+	if err != nil {
+		return nil, fmt.Errorf("REALITY: invalid spiderX %q: %w", x.spiderX, err)
+	}
 	q := tmpU.Query()
 	parse := func(param string, index int) {
 		if q.Get(param) != "" {
@@ -330,8 +339,19 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 		// }
 		// logrus.Println("11", uConn.Verified)
 		if !uConn.Verified {
-			// Trigger spider.
+			// Trigger spider. This goroutine lives as long as the process and
+			// nothing else owns it, so an unhandled panic here would take the
+			// whole process down; contain it and report it instead.
 			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						logger.Logger.WithFields(map[string]any{
+							"server_name": uConn.ServerName,
+							"panic":       fmt.Sprint(r),
+							"stack":       string(debug.Stack()),
+						}).Error("REALITY: panic in spider goroutine")
+					}
+				}()
 				client := &http.Client{
 					Transport: &http2.Transport{
 						DialTLSContext: func(ctx context.Context, network, addr string, cfg *gotls.Config) (net.Conn, error) {
@@ -359,12 +379,21 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 						err  error
 						body []byte
 					)
+					var target string
 					if first {
-						req, _ = http.NewRequest("GET", firstURL, nil)
+						target = firstURL
 					} else {
 						maps.Lock()
-						req, _ = http.NewRequest("GET", string(prefix)+getPathLocked(paths), nil)
+						target = string(prefix) + getPathLocked(paths)
 						maps.Unlock()
+					}
+					// The harvested paths are peer-controlled (href values
+					// scraped from the backdrop), so an unbuildable request
+					// URL is a real outcome. A nil request here would panic
+					// on the next line, in a goroutine that outlives the
+					// handshake.
+					if req, err = http.NewRequest("GET", target, nil); err != nil {
+						return
 					}
 					req.Header.Set("User-Agent", x.fingerprint.Client) // TODO: User-Agent map
 					// if first && config.Show {

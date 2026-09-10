@@ -591,18 +591,20 @@ func TestTransportPacketConnTargetAddress(t *testing.T) {
 	_ = tgt
 }
 
-func TestCacheExpiration(t *testing.T) {
-	originalCleanupInterval := udpCacheCleanupInterval
-	originalMaxAge := udpCacheMaxAge
-
-	udpCacheCleanupInterval = 100 * time.Millisecond
-	udpCacheMaxAge = 200 * time.Millisecond
-
-	defer func() {
-		udpCacheCleanupInterval = originalCleanupInterval
-		udpCacheMaxAge = originalMaxAge
-	}()
-
+// TestEncryptUDPFromPoolIsDeterministicPerSalt is the P3-27 replacement for the
+// former TestCacheExpiration, which asserted nothing: it compared a buffer
+// AFTER returning it to the pool (use-after-Put, so the comparison was against
+// whatever the pool's LIFO handed back) and only checked that the result was
+// still decryptable, which the pool reuse made true regardless of the cipher.
+//
+// The replacement pins what the function actually guarantees. It is
+// deterministic: the salt is copied into the packet and used as the HKDF salt
+// while the AEAD nonce is the fixed ciphers.ZeroNonce, so two calls with the
+// same salt produce identical bytes. Nonce uniqueness is therefore the CALLER's
+// responsibility through salt uniqueness, and this test states that contract
+// explicitly instead of asserting an independence the implementation does not
+// provide.
+func TestEncryptUDPFromPoolIsDeterministicPerSalt(t *testing.T) {
 	conf := CipherConf
 	masterKey := make([]byte, conf.KeyLen)
 	_, _ = fastrand.Read(masterKey)
@@ -615,27 +617,57 @@ func TestCacheExpiration(t *testing.T) {
 	salt := make([]byte, conf.SaltLen)
 	_, _ = fastrand.Read(salt)
 
-	plaintext := []byte("Cache expiration test")
+	plaintext := []byte("Per-call encryption test")
 	reusedInfo := ciphers.JuicityReusedInfo
 
-	encrypted, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
+	first, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	encrypted.Put()
+	// Copy before Put: reading a pooled buffer after returning it is
+	// use-after-Put (the pool may hand the same slice to another caller).
+	firstBytes := append([]byte(nil), []byte(first)...)
+	first.Put()
 
-	time.Sleep(300 * time.Millisecond)
-
-	decrypted, err := shadowsocks.DecryptUDPFromPool(key, encrypted, reusedInfo)
+	second, err := shadowsocks.EncryptUDPFromPool(key, plaintext, salt, reusedInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer decrypted.Put()
+	secondBytes := append([]byte(nil), []byte(second)...)
+	second.Put()
 
-	if !bytes.Equal(decrypted, plaintext) {
-		t.Error("Cache expiration caused decryption failure")
+	if !bytes.Equal(firstBytes, secondBytes) {
+		t.Fatal("same salt produced different ciphertext; the salt/no-nonce layout changed " +
+			"and this test must be updated with it")
+	}
+	if !bytes.Equal(firstBytes[:conf.SaltLen], salt) {
+		t.Fatal("the packet must carry the caller-supplied salt verbatim")
+	}
+
+	// A different salt must produce a different packet (a different subkey),
+	// which is the property that makes salt uniqueness load-bearing.
+	otherSalt := make([]byte, conf.SaltLen)
+	_, _ = fastrand.Read(otherSalt)
+	third, err := shadowsocks.EncryptUDPFromPool(key, plaintext, otherSalt, reusedInfo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdBytes := append([]byte(nil), []byte(third)...)
+	third.Put()
+	if bytes.Equal(firstBytes, thirdBytes) {
+		t.Fatal("a different salt produced identical bytes: the HKDF salt is not being used")
+	}
+
+	// Every ciphertext must decrypt independently.
+	for i, ct := range [][]byte{firstBytes, secondBytes, thirdBytes} {
+		decrypted, err := shadowsocks.DecryptUDPFromPool(key, ct, reusedInfo)
+		if err != nil {
+			t.Fatalf("ciphertext %d: DecryptUDPFromPool error = %v", i, err)
+		}
+		got := append([]byte(nil), []byte(decrypted)...)
+		decrypted.Put()
+		if !bytes.Equal(got, plaintext) {
+			t.Fatalf("ciphertext %d: decrypted %q, want %q", i, got, plaintext)
+		}
 	}
 }
-
-var udpCacheCleanupInterval = 5 * time.Minute
-var udpCacheMaxAge = 10 * time.Minute

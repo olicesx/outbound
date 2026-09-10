@@ -44,10 +44,16 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		return nil, err
 	}
 	//log.Trace("vmess.NewDialer: metadata: %v, password: %v", metadata, password)
+	// protocol.Header is an exported API: a caller passing a non-string
+	// Feature1 must get an error, not a panic inside NewDialer.
+	grpcServiceName, ok := header.Feature1.(string)
+	if !ok {
+		return nil, fmt.Errorf("vmess: unexpected Feature1 type %T, want string", header.Feature1)
+	}
 	return &Dialer{
 		proxyAddress:      header.ProxyAddress,
 		proxySNI:          header.SNI,
-		grpcServiceName:   header.Feature1.(string),
+		grpcServiceName:   grpcServiceName,
 		nextDialer:        nextDialer,
 		metadata:          metadata,
 		key:               NewID(id).CmdKey(),

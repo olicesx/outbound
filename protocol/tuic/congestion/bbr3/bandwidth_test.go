@@ -114,7 +114,10 @@ func TestSamplerBoundsRetainedState(t *testing.T) {
 	for i := 0; i < window*8; i++ {
 		s.onPacketSent(t0, congestion.PacketNumber(i), 1200, 1200, false)
 	}
-	if len(s.states) > window+window/4 {
-		t.Fatalf("retained %d packet states, want at most %d", len(s.states), window+window/4)
+	if got := s.liveSamples(); got > window+1 {
+		t.Fatalf("retained %d live packet states, want at most window+1 (%d)", got, window+1)
+	}
+	if cap(s.states) != window+1 {
+		t.Fatalf("ring capacity = %d, want the fixed window+1 = %d", cap(s.states), window+1)
 	}
 }

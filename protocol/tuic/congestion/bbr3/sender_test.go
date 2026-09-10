@@ -12,7 +12,7 @@ func TestAccessHintCapsSteadyStatePacingAndWindow(t *testing.T) {
 	s := newTestSender(hint)
 	s.model.bw.Update(10_000_000, 0) // path estimate far above the access link
 	s.model.round = 0
-	s.mode = modeProbeBWCruise
+	s.mode.Store(uint32(modeProbeBWCruise))
 	s.recalc()
 
 	if s.PacingRate() > Bandwidth(hint) {
@@ -32,7 +32,7 @@ func TestAccessHintAllowsBoundedProbeOvershoot(t *testing.T) {
 
 	// A probe may exceed the hint, but only by the configured factor: otherwise
 	// a hint equal to path capacity would pin the estimate below capacity.
-	s.mode = modeProbeBWUp
+	s.mode.Store(uint32(modeProbeBWUp))
 	s.recalc()
 	ceiling := Bandwidth(float64(hint) * s.params.HintProbeOvershoot)
 	if s.PacingRate() > ceiling {
@@ -42,7 +42,7 @@ func TestAccessHintAllowsBoundedProbeOvershoot(t *testing.T) {
 		t.Fatalf("probe pacing = %d, want it to exceed the hint and discover capacity", s.PacingRate())
 	}
 	// Never an unbounded probe either.
-	s.mode = modeStartup
+	s.mode.Store(uint32(modeStartup))
 	s.recalc()
 	if s.PacingRate() > ceiling {
 		t.Fatalf("startup pacing = %d, want <= %d", s.PacingRate(), ceiling)
@@ -78,8 +78,47 @@ func TestLegacyCallbacksAreNoOps(t *testing.T) {
 	if s.model.roundBytesLost != 0 {
 		t.Fatalf("roundBytesLost = %d, want 0", s.model.roundBytesLost)
 	}
-	if s.model.bytesInFlight != 1200 {
-		t.Fatalf("bytesInFlight = %d, want the sent packet only", s.model.bytesInFlight)
+	// quic-go's OnPacketSent argument is inclusive of the packet being sent
+	// (sent_packet_handler.go:275-282 increments bytesInFlight first), so the
+	// model must record the argument verbatim.
+	if s.model.bytesInFlight != 0 {
+		t.Fatalf("bytesInFlight = %d, want 0: the argument was 0 and the stack had not counted this packet",
+			s.model.bytesInFlight)
+	}
+}
+
+// TestOnPacketSentTracksTheStackInFlightAccounting drives a realistic send/ack
+// sequence exactly as quic-go's sentPacketHandler would and asserts the model
+// mirrors the stack's own arithmetic: the inclusive argument on send, and the
+// pre-subtraction priorInFlight on ack.
+func TestOnPacketSentTracksTheStackInFlightAccounting(t *testing.T) {
+	s := newTestSender(0)
+	now := time.Now()
+
+	// The stack increments its counter before calling the controller.
+	stackInFlight := congestion.ByteCount(0)
+	stackInFlight += 1200
+	s.OnPacketSent(now, stackInFlight, 1, 1200, true)
+	if s.model.bytesInFlight != stackInFlight {
+		t.Fatalf("after send 1: model in-flight = %d, want the stack's %d",
+			s.model.bytesInFlight, stackInFlight)
+	}
+
+	stackInFlight += 1200
+	s.OnPacketSent(now.Add(time.Millisecond), stackInFlight, 2, 1200, true)
+	if s.model.bytesInFlight != stackInFlight {
+		t.Fatalf("after send 2: model in-flight = %d, want the stack's %d",
+			s.model.bytesInFlight, stackInFlight)
+	}
+
+	// Acking packet 1: the stack reads priorInFlight before removing the ack.
+	priorInFlight := stackInFlight
+	stackInFlight -= 1200
+	acked := []congestion.AckedPacketInfo{{PacketNumber: 1, BytesAcked: 1200, ReceivedTime: now.Add(80 * time.Millisecond)}}
+	s.OnCongestionEventEx(priorInFlight, now.Add(80*time.Millisecond), acked, nil)
+	if s.model.bytesInFlight != stackInFlight {
+		t.Fatalf("after acking 1200: model in-flight = %d, want the stack's %d",
+			s.model.bytesInFlight, stackInFlight)
 	}
 }
 
@@ -88,12 +127,12 @@ func TestStartupOvershootExitsWithoutSettingInflightHi(t *testing.T) {
 	now := time.Now()
 	now = drive(s, now, 6, 80*time.Millisecond)
 
-	s.mode = modeStartup
+	s.mode.Store(uint32(modeStartup))
 	s.model.inflightHi = 0
 	losePackets(s, now, 100_000, 5_000)
 
-	if s.mode != modeDrain {
-		t.Fatalf("mode = %s, want DRAIN after sustained startup loss", s.mode)
+	if mode(s.mode.Load()) != modeDrain {
+		t.Fatalf("mode = %s, want DRAIN after sustained startup loss", s.Mode())
 	}
 	// PROBE_UP owns the upper bound; pinning it from a startup loss would clamp
 	// the sender to a tiny window for the rest of the connection.
@@ -107,10 +146,10 @@ func TestSingleLossEventIsNotTreatedAsOvershoot(t *testing.T) {
 	now := time.Now()
 	now = drive(s, now, 6, 80*time.Millisecond)
 
-	s.mode = modeStartup
+	s.mode.Store(uint32(modeStartup))
 	losePackets(s, now, 8_000, 400) // tiny round: below the volume floor
-	if s.mode != modeStartup {
-		t.Fatalf("mode = %s, want STARTUP to survive a stray loss", s.mode)
+	if mode(s.mode.Load()) != modeStartup {
+		t.Fatalf("mode = %s, want STARTUP to survive a stray loss", s.Mode())
 	}
 }
 
@@ -118,7 +157,7 @@ func TestStartupReachesFullBandwidthAndDrains(t *testing.T) {
 	s := newTestSender(0)
 	now := time.Now()
 	now = drive(s, now, 40, 80*time.Millisecond)
-	if s.mode == modeStartup {
+	if mode(s.mode.Load()) == modeStartup {
 		t.Fatal("still in STARTUP after 40 rounds of a saturated path")
 	}
 	if s.model.estimate() == 0 {
@@ -136,8 +175,8 @@ func TestProbeRttEntryAndExit(t *testing.T) {
 	// Expire the min-RTT filter to force PROBE_RTT.
 	now = now.Add(DefaultParams().MinRttFilterLen + time.Second)
 	s.OnCongestionEventEx(0, now, []congestion.AckedPacketInfo{{PacketNumber: s.model.lastSent, BytesAcked: 0}}, nil)
-	if s.mode != modeProbeRTT {
-		t.Fatalf("mode = %s, want PROBE_RTT after min RTT expiry", s.mode)
+	if mode(s.mode.Load()) != modeProbeRTT {
+		t.Fatalf("mode = %s, want PROBE_RTT after min RTT expiry", s.Mode())
 	}
 	if s.model.probeRttTarget() <= s.model.minCwnd {
 		t.Fatalf("probe target %d collapsed to minCwnd", s.model.probeRttTarget())
@@ -149,14 +188,14 @@ func TestProbeRttEntryAndExit(t *testing.T) {
 	s.OnCongestionEventEx(0, now, []congestion.AckedPacketInfo{{PacketNumber: s.model.lastSent + 1, BytesAcked: 0}}, nil)
 	now = now.Add(DefaultParams().ProbeRttDuration + 80*time.Millisecond)
 	s.OnCongestionEventEx(0, now, []congestion.AckedPacketInfo{{PacketNumber: s.model.lastSent + 2, BytesAcked: 0}}, nil)
-	if s.mode == modeProbeRTT {
+	if mode(s.mode.Load()) == modeProbeRTT {
 		t.Fatal("stuck in PROBE_RTT after the probe duration and a round")
 	}
 }
 
 func TestModeCycleAdvancesPerRound(t *testing.T) {
 	s := newTestSender(0)
-	s.mode = modeProbeBWDown
+	s.mode.Store(uint32(modeProbeBWDown))
 
 	seen := map[mode]bool{}
 	for i := 0; i < 8; i++ {
@@ -165,7 +204,7 @@ func TestModeCycleAdvancesPerRound(t *testing.T) {
 			PacketNumber: s.model.lastSent,
 			BytesAcked:   1200,
 		}}, nil)
-		seen[s.mode] = true
+		seen[mode(s.mode.Load())] = true
 	}
 	for _, m := range []mode{modeProbeBWUp, modeProbeBWDown, modeProbeBWCruise, modeProbeBWRefill} {
 		if !seen[m] {

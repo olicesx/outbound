@@ -73,12 +73,19 @@ func newModel(params Params, maxDatagramSize congestion.ByteCount) *model {
 		sampler:         newSampler(params.PacketStateWindow),
 	}
 }
+
+// setMaxDatagramSize updates the per-packet size ceiling. This is NOT the path
+// MTU: it is the largest single datagram the sender may put on the wire, and it
+// is the unit every packet-count-derived window is expressed in, so all of them
+// must be recomputed here. Recomputed: minCwnd and initialCwnd (P3-53). The
+// sender's maxCwnd is recomputed in Bbr3Sender.SetMaxDatagramSize.
 func (m *model) setMaxDatagramSize(s congestion.ByteCount) {
 	if s <= 0 {
 		return
 	}
 	m.maxDatagramSize = s
 	m.minCwnd = congestion.ByteCount(m.params.MinCwndPackets) * s
+	m.initialCwnd = congestion.ByteCount(m.params.InitialCwndPackets) * s
 }
 
 // estimate is the windowed-max delivery-rate estimate.

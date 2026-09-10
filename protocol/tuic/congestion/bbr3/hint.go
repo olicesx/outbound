@@ -20,10 +20,17 @@ const (
 // Revoke reasons. rejections counts every withdraw attempt in any state;
 // withdrawals counts only exits from probing/validated. The strings are a
 // frozen diagnostic vocabulary: rename nothing, reorder nothing.
+//
+// There is deliberately no "pto" reason. PTO is not observable through
+// congestion.CongestionControl in this quic-go fork: the only reference to
+// OnRetransmissionTimeout is the pure forwarder at
+// internal/ackhandler/cc_adapter.go:52-53, and the PTO path in
+// sent_packet_handler.go (OnLossDetectionTimeout, ~lines 713-780) never
+// notifies the controller. A reason bucket that can never be filled would make
+// the telemetry claim a coverage the controller does not have (P3-50).
 const (
 	reasonLoss       = "loss"
 	reasonEcnOrTimer = "ecn_or_timer"
-	reasonPto        = "pto"
 	reasonRtt        = "rtt"
 	reasonZeroRtt    = "zero_rtt"
 	reasonBackwards  = "backwards"
@@ -32,10 +39,10 @@ const (
 	reasonProbeFail  = "probe_fail"
 )
 
-const nRevokeReasons = 9
+const nRevokeReasons = 8
 
 var revokeReasons = [nRevokeReasons]string{
-	reasonLoss, reasonEcnOrTimer, reasonPto, reasonRtt, reasonZeroRtt,
+	reasonLoss, reasonEcnOrTimer, reasonRtt, reasonZeroRtt,
 	reasonBackwards, reasonExpiry, reasonDelivery, reasonProbeFail,
 }
 
@@ -418,7 +425,8 @@ func (b *Bbr3Sender) hintEstimate(est Bandwidth) Bandwidth {
 		}
 	}
 	// Draining, RTT measurement, and congestion bounds always take priority.
-	if b.mode == modeDrain || b.mode == modeProbeBWDown || b.mode == modeProbeRTT {
+	cur := mode(b.mode.Load())
+	if cur == modeDrain || cur == modeProbeBWDown || cur == modeProbeRTT {
 		return est
 	}
 	if target > est {

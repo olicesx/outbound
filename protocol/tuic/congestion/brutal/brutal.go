@@ -12,10 +12,25 @@ import (
 )
 
 const (
-	pktInfoSlotCount           = 5 // slot index is based on seconds, so this is basically how many seconds we sample
-	minSampleCount             = 50
-	minAckRate                 = 0.8
-	congestionWindowMultiplier = 3 // 2→3: larger cwnd headroom so game heartbeats survive ackRate drops without hitting SendAck
+	pktInfoSlotCount = 5 // slot index is based on seconds, so this is basically how many seconds we sample
+	minSampleCount   = 50
+	minAckRate       = 0.8
+	// congestionWindowMultiplier is the fork's deliberate divergence from the
+	// upstream hysteria implementation this controller is derived from, which
+	// uses 2 (/root/sing-quic-src/hysteria/congestion/brutal.go:18). It is 3
+	// here: the larger cwnd headroom lets game heartbeats survive an ackRate
+	// drop without hitting SendAck.
+	//
+	// Contract (P2-33): a closed-loop A/B over a single-bottleneck FIFO with
+	// the real BrutalSender and the real common.Pacer showed every behaviour
+	// metric identical between 2 and 3 (queue depth, p95 RTT, throughput,
+	// loss, in-flight), with cwnd_bound=false in all eight scenarios: because
+	// the pacer holds ~one BDP in flight while cwnd allows M of them, CanSend
+	// is structurally true for any M >= 1. The only observable difference is
+	// the reported window, which is exactly M x. So this constant must NOT be
+	// changed on performance grounds - there are none to gain - and any future
+	// change needs a reason that is not a throughput claim.
+	congestionWindowMultiplier = 3
 
 	debugEnv           = "HYSTERIA_BRUTAL_DEBUG"
 	debugPrintInterval = 2
@@ -72,8 +87,24 @@ func (b *BrutalSender) CanSend(bytesInFlight congestion.ByteCount) bool {
 	return bytesInFlight <= b.GetCongestionWindow()
 }
 
+// GetCongestionWindow returns the controller's window:
+//
+//	cwnd = max(bps * smoothedRTT * congestionWindowMultiplier / ackRate, maxDatagramSize)
+//
+// The window is a pure function of the target bandwidth, the RTT and the ack
+// rate: it is not grown by acks and not cut by loss, which is what makes this a
+// sender-side rate limiter rather than a loss-reactive controller. The
+// maxDatagramSize floor keeps a non-zero window even before an RTT sample
+// exists. See congestionWindowMultiplier for the fork delta and its contract.
 func (b *BrutalSender) GetCongestionWindow() congestion.ByteCount {
-	rtt := b.rttStats.SmoothedRTT()
+	// The window is computed on every CanSend call, which quic-go can reach
+	// before SetRTTStatsProvider installs the provider (and every test that
+	// constructs a sender by hand reaches it without one). A nil provider must
+	// fall back to the bootstrap window, not dereference nil.
+	rtt := time.Duration(0)
+	if b.rttStats != nil {
+		rtt = b.rttStats.SmoothedRTT()
+	}
 	if rtt <= 0 {
 		return 10240
 	}

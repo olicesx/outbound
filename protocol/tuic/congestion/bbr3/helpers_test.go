@@ -31,14 +31,23 @@ func newTestSender(hint uint64) *Bbr3Sender {
 // drive keeps a pipeline running: each round fills the current congestion window
 // with fresh packets and acknowledges the previous round's batch, so bytes stay
 // in flight and the sampler is never app-limited.
+//
+// It maintains its own in-flight counter the way quic-go's sentPacketHandler
+// does - incremented before OnPacketSent, read before the acked bytes are
+// subtracted for OnCongestionEventEx - because that is the convention the
+// controller is written against. Feeding the CONTROLLER's own field back in
+// would make this helper a mirror of whatever accounting the controller has,
+// which is how the double-count in OnPacketSent stayed invisible.
 func drive(s *Bbr3Sender, now time.Time, rounds int, rtt time.Duration) time.Time {
 	var nextPn congestion.PacketNumber
 	var pending []congestion.PacketNumber
+	var stackInFlight congestion.ByteCount
 	for r := 0; r < rounds; r++ {
 		n := int(s.GetCongestionWindow()/1200) + 2
 		for i := 0; i < n; i++ {
 			nextPn++
-			s.OnPacketSent(now, s.model.bytesInFlight, nextPn, 1200, true)
+			stackInFlight += 1200
+			s.OnPacketSent(now, stackInFlight, nextPn, 1200, true)
 			now = now.Add(time.Millisecond)
 		}
 		if len(pending) > 0 {
@@ -46,7 +55,9 @@ func drive(s *Bbr3Sender, now time.Time, rounds int, rtt time.Duration) time.Tim
 			for _, pn := range pending {
 				acked = append(acked, congestion.AckedPacketInfo{PacketNumber: pn, BytesAcked: 1200})
 			}
-			s.OnCongestionEventEx(s.model.bytesInFlight, now, acked, nil)
+			priorInFlight := stackInFlight
+			stackInFlight -= congestion.ByteCount(1200 * len(pending))
+			s.OnCongestionEventEx(priorInFlight, now, acked, nil)
 		}
 		pending = pending[:0]
 		for i := 0; i < n; i++ {

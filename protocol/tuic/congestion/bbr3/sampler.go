@@ -17,9 +17,17 @@ type packetState struct {
 // sampler is a simplified local estimator: delivered volume since send divided
 // by packet age. It is not the reference BBR sampler and is not guaranteed immune
 // to ACK compression. Hint validation uses a separate wall-clock delivery window.
+//
+// Storage is a fixed-size ring indexed by packet number, not a map: the data
+// plane calls onPacketSent once per sent packet, and a map entry per packet cost
+// one allocation per packet (plus a slice copy per eviction). The ring is sized
+// from PacketStateWindow and never grows, so the whole estimator is
+// allocation-free after construction.
 type sampler struct {
-	states    map[congestion.PacketNumber]*packetState
-	order     []congestion.PacketNumber
+	states    []packetState
+	occupied  []bool
+	hasBase   bool
+	base      congestion.PacketNumber
 	delivered congestion.ByteCount
 	window    int
 	lastAcked congestion.PacketNumber
@@ -30,34 +38,71 @@ func newSampler(window int) *sampler {
 		window = 1024
 	}
 	return &sampler{
-		states:    make(map[congestion.PacketNumber]*packetState, window),
-		order:     make([]congestion.PacketNumber, 0, window),
+		states:    make([]packetState, window+1),
+		occupied:  make([]bool, window+1),
 		window:    window,
 		lastAcked: -1,
 	}
 }
 
+// slot maps a packet number to its ring index, rebasing the ring when the packet
+// number has moved past the tracked range. Rebasing drops the records that fell
+// out of range, which is exactly what the window is for: a record whose ack can
+// no longer arrive usefully must not be retained.
+func (s *sampler) slot(pn congestion.PacketNumber) (int, bool) {
+	size := congestion.PacketNumber(len(s.states))
+	if !s.hasBase {
+		s.hasBase = true
+		s.base = pn
+		return 0, true
+	}
+	if pn < s.base {
+		return 0, false
+	}
+	offset := pn - s.base
+	if offset < size {
+		return int(offset), true
+	}
+	// Advance the base so pn lands at the last slot, clearing everything the
+	// rebase skipped over.
+	advance := offset - size + 1
+	for i := congestion.PacketNumber(0); i < advance && i < size; i++ {
+		s.occupied[int((s.base+i)%size)] = false
+	}
+	s.base += advance
+	if pn < s.base {
+		return 0, false
+	}
+	return int(pn - s.base), true
+}
+
 func (s *sampler) onPacketSent(now time.Time, pn congestion.PacketNumber, size congestion.ByteCount, _ congestion.ByteCount, appLimited bool) {
-	if _, exists := s.states[pn]; exists {
+	slot, ok := s.slot(pn)
+	if !ok {
 		return
 	}
-	s.states[pn] = &packetState{
+	if s.occupied[slot] {
+		// A resend of a packet number already tracked keeps the original
+		// record: the delivery-rate sample is anchored on the first send.
+		return
+	}
+	s.states[slot] = packetState{
 		sentTime:        now,
 		size:            size,
 		deliveredAtSend: s.delivered,
 		appLimited:      appLimited,
 	}
-	s.order = append(s.order, pn)
-	s.evict()
+	s.occupied[slot] = true
 }
 
 // onPacketAcked records the delivery and returns the rate sample for pn.
 func (s *sampler) onPacketAcked(now time.Time, pn congestion.PacketNumber) (Bandwidth, bool) {
-	st, ok := s.states[pn]
-	if !ok {
+	slot, ok := s.slot(pn)
+	if !ok || !s.occupied[slot] {
 		return 0, false
 	}
-	delete(s.states, pn)
+	st := s.states[slot]
+	s.occupied[slot] = false
 	s.delivered += st.size
 	if pn > s.lastAcked {
 		s.lastAcked = pn
@@ -75,32 +120,22 @@ func (s *sampler) onPacketAcked(now time.Time, pn congestion.PacketNumber) (Band
 }
 
 func (s *sampler) onPacketLost(pn congestion.PacketNumber) {
-	delete(s.states, pn)
+	if slot, ok := s.slot(pn); ok {
+		s.occupied[slot] = false
+	}
 }
 
 // deliveredVolume exposes uniquely acknowledged bytes retained by the sampler.
 func (s *sampler) deliveredVolume() congestion.ByteCount { return s.delivered }
 
-// evict drops send records that can no longer be acked usefully, bounding the
-// map to roughly the packet-state window. It trims a quarter-window at a time
-// so the cost is amortised O(1) per sent packet instead of a full copy of the
-// order slice on every send.
-func (s *sampler) evict() {
-	if len(s.order) <= s.window {
-		return
+// liveSamples reports how many send records are currently retained. Exposed for
+// the invariant test that pins the bound on retained state.
+func (s *sampler) liveSamples() int {
+	n := 0
+	for _, occupied := range s.occupied {
+		if occupied {
+			n++
+		}
 	}
-	batch := s.window / 4
-	if batch < 1 {
-		batch = 1
-	}
-	cut := len(s.order) - s.window + batch
-	if cut > len(s.order) {
-		cut = len(s.order)
-	}
-	for _, pn := range s.order[:cut] {
-		delete(s.states, pn)
-	}
-	kept := make([]congestion.PacketNumber, len(s.order)-cut)
-	copy(kept, s.order[cut:])
-	s.order = kept
+	return n
 }

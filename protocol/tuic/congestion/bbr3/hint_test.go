@@ -97,7 +97,7 @@ func TestWrongHintCannotBecomeTarget(t *testing.T) {
 	}
 }
 func TestDeliveryDropAndExpiryRevokeHint(t *testing.T) {
-	for _, kind := range []string{"delivery", "expiry", "pto", "loss"} {
+	for _, kind := range []string{"delivery", "expiry", "loss"} {
 		t.Run(kind, func(t *testing.T) {
 			h := newHintTraffic(100_000, true)
 			for i := 0; i < 150; i++ {
@@ -110,8 +110,6 @@ func TestDeliveryDropAndExpiryRevokeHint(t *testing.T) {
 				}
 			case "expiry":
 				h.s.HasPacingBudget(h.now.Add(2 * time.Second))
-			case "pto":
-				h.s.OnRetransmissionTimeout(true)
 			case "loss":
 				h.s.OnCongestionEventEx(h.inflight, h.now, nil, []congestion.LostPacketInfo{{PacketNumber: h.pn, BytesLost: 1000}})
 			}
@@ -146,7 +144,7 @@ func TestHintDisabledAndStrictCap(t *testing.T) {
 	s := NewBbr3SenderWithParams(1200, 100_000, p)
 	s.model.bw.Update(1_000_000, 0)
 	for _, m := range []mode{modeStartup, modeDrain, modeProbeBWUp, modeProbeBWCruise} {
-		s.mode = m
+		s.mode.Store(uint32(m))
 		s.recalc()
 		if s.PacingRate() > 100_000 {
 			t.Fatalf("strict cap exceeded in %v", m)
@@ -178,7 +176,7 @@ func TestBoundedHintProbeAndTarget(t *testing.T) {
 	for i := 0; i < 150; i++ {
 		h.step(1000)
 	}
-	h.s.mode = modeProbeBWCruise
+	h.s.mode.Store(uint32(modeProbeBWCruise))
 	if target := h.s.hintEstimate(80_000); target != 100_000 {
 		t.Fatalf("validated target %d", target)
 	}
@@ -194,12 +192,12 @@ func TestInvalidParamsRejected(t *testing.T) {
 }
 func TestInflightUpperBoundWins(t *testing.T) {
 	s := newTestSender(0)
-	s.mode = modeProbeBWCruise
+	s.mode.Store(uint32(modeProbeBWCruise))
 	s.model.inflightHi = 12000
 	s.model.inflightLo = 24000
 	s.recalc()
-	if s.cwnd > 12000 {
-		t.Fatalf("lower bound overrode upper: %d", s.cwnd)
+	if got := s.GetCongestionWindow(); got > 12000 {
+		t.Fatalf("lower bound overrode upper: %d", got)
 	}
 }
 func TestLossBaselineCannotAbsorbCurrentRound(t *testing.T) {
@@ -253,15 +251,15 @@ func TestHintRejectionAndWithdrawalTelemetry(t *testing.T) {
 	if h.s.HintStatus().State != "validated" {
 		t.Fatal("did not revalidate")
 	}
+	// PTO is not observable through this quic-go's CongestionControl interface
+	// (see OnRetransmissionTimeout), so it must neither withdraw the hint nor
+	// appear in the reason telemetry.
 	h.s.OnRetransmissionTimeout(true)
-	if st = h.s.HintStatus(); st.Withdrawals["pto"] != 1 || st.RejectionsTotal["pto"] != 1 {
-		t.Fatalf("pto withdrawal misclassified: %+v", st)
+	if st = h.s.HintStatus(); st.Withdrawals["pto"] != 0 || st.RejectionsTotal["pto"] != 0 {
+		t.Fatalf("pto must not be a revoke reason: %+v", st)
 	}
-	for i := 0; i < 250; i++ {
-		h.step(1000)
-	}
-	if h.s.HintStatus().State != "validated" {
-		t.Fatal("did not revalidate after pto")
+	if st.State != "validated" {
+		t.Fatalf("state %q changed on an unobservable PTO callback", st.State)
 	}
 	h.s.OnCongestionEvent(h.pn, 0, h.inflight)
 	if st = h.s.HintStatus(); st.Withdrawals["ecn_or_timer"] != 1 {
@@ -382,7 +380,7 @@ func TestLiftTelemetryCountsRealPacingLift(t *testing.T) {
 	s := NewBbr3SenderWithParams(1200, 100_000, p)
 	s.SetRTTStatsProvider(&fakeRTT{latest: 80 * time.Millisecond, smoothed: 80 * time.Millisecond})
 	s.gate.state = hintValidated
-	s.mode = modeProbeBWCruise
+	s.mode.Store(uint32(modeProbeBWCruise))
 	if target := s.hintEstimate(90_000); target != 100_000 {
 		t.Fatalf("lift target %d", target)
 	}
@@ -409,7 +407,7 @@ func TestLiftTelemetryCountsRealPacingLift(t *testing.T) {
 	for i := 0; i < 150; i++ {
 		h.step(1000)
 	}
-	h.s.mode = modeProbeBWCruise
+	h.s.mode.Store(uint32(modeProbeBWCruise))
 	before := h.s.HintStatus()
 	if target := h.s.hintEstimate(80_000); target != 100_000 {
 		t.Fatalf("validated target %d", target)
@@ -436,6 +434,7 @@ func TestDisabledHintTelemetryStaysZero(t *testing.T) {
 		h.step(1000)
 	}
 	h.s.OnCongestionEvent(h.pn, 500, h.inflight)
+	// A no-op PTO callback must not move telemetry either.
 	h.s.OnRetransmissionTimeout(true)
 	h.s.HasPacingBudget(h.now.Add(2 * time.Second))
 	st := h.s.HintStatus()

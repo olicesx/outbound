@@ -1,6 +1,7 @@
 package bbr3
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/outbound/protocol/tuic/congestion/common"
@@ -16,10 +17,18 @@ type Bbr3Sender struct {
 
 	maxCwnd congestion.ByteCount
 
-	mode mode
-
-	pacingRate Bandwidth
-	cwnd       congestion.ByteCount
+	// mode, pacingRate and cwnd are written only by the run-loop goroutine
+	// (inside recalc) but read from quic-go's sender goroutine and from
+	// callers of Mode/PacingRate/GetCongestionWindow/CanSend/InSlowStart.
+	// They are atomics because the two accesses are unsynchronised: a reader
+	// may observe a value from an earlier recalc (stale is acceptable and
+	// expected), but it must never observe a torn value. This is deliberately
+	// NOT a mutex around recalc: recalc runs on the packet path, and the fields
+	// it publishes are scalars whose staleness is harmless, unlike the model
+	// state it derives them from.
+	mode       atomic.Uint32
+	pacingRate atomic.Uint64
+	cwnd       atomic.Int64
 
 	// PROBE_RTT bookkeeping.
 	probeRttExitAt time.Time
@@ -54,36 +63,45 @@ func NewBbr3SenderWithParams(maxDatagramSize congestion.ByteCount, hintBps uint6
 		params:    params,
 		model:     m,
 		maxCwnd:   congestion.ByteCount(congestion.MaxCongestionWindowPackets) * m.maxDatagramSize,
-		mode:      modeStartup,
 		hint:      Bandwidth(hintBps),
-		cwnd:      m.initialCwnd,
 		createdAt: time.Now(),
 	}
-	s.pacer = common.NewPacer(func() congestion.ByteCount { return congestion.ByteCount(s.pacingRate) })
+	s.mode.Store(uint32(modeStartup))
+	s.cwnd.Store(int64(m.initialCwnd))
+	s.pacer = common.NewPacer(func() congestion.ByteCount { return congestion.ByteCount(s.pacingRate.Load()) })
 	s.pacer.SetMaxDatagramSize(m.maxDatagramSize)
 	s.recalc()
 	return s
 }
 
-// Mode reports the current state-machine state.
-func (b *Bbr3Sender) Mode() string { return b.mode.String() }
+// Mode reports the current state-machine state. Safe to call from any
+// goroutine; the value may lag the newest recalc by one event.
+func (b *Bbr3Sender) Mode() string { return mode(b.mode.Load()).String() }
 
-// PacingRate reports the current pacing rate in bytes per second.
-func (b *Bbr3Sender) PacingRate() Bandwidth { return b.pacingRate }
+// PacingRate reports the current pacing rate in bytes per second. Safe to call
+// from any goroutine; the value may lag the newest recalc by one event.
+func (b *Bbr3Sender) PacingRate() Bandwidth { return Bandwidth(b.pacingRate.Load()) }
 
 // SetRTTStatsProvider implements congestion.CongestionControl.
 func (b *Bbr3Sender) SetRTTStatsProvider(p congestion.RTTStatsProvider) {
 	b.rttStats = p
 }
 
-// SetMaxDatagramSize implements congestion.CongestionControl.
+// SetMaxDatagramSize implements congestion.CongestionControl. maxDatagramSize is
+// the per-packet size ceiling (not the path MTU): the unit every
+// packet-count-derived window is expressed in, so this recomputes maxCwnd
+// (P3-53) alongside the model's minCwnd and initialCwnd. It deliberately does
+// not re-run recalc: the pacing/window decision belongs to the next ack event,
+// and forcing one here makes the state machine advance on a configuration
+// change (which is how the startup ramp was perturbed before).
 func (b *Bbr3Sender) SetMaxDatagramSize(s congestion.ByteCount) {
 	if s <= 0 {
 		return
 	}
 	b.model.setMaxDatagramSize(s)
-	if b.cwnd < b.model.minCwnd {
-		b.cwnd = b.model.minCwnd
+	b.maxCwnd = congestion.ByteCount(congestion.MaxCongestionWindowPackets) * s
+	if congestion.ByteCount(b.cwnd.Load()) < b.model.minCwnd {
+		b.cwnd.Store(int64(b.model.minCwnd))
 	}
 	b.pacer.SetMaxDatagramSize(s)
 }
@@ -101,16 +119,25 @@ func (b *Bbr3Sender) HasPacingBudget(now time.Time) bool {
 
 // CanSend implements congestion.CongestionControl.
 func (b *Bbr3Sender) CanSend(bytesInFlight congestion.ByteCount) bool {
-	return bytesInFlight < b.cwnd
+	return bytesInFlight < congestion.ByteCount(b.cwnd.Load())
 }
 
 // OnPacketSent implements congestion.CongestionControl.
+//
+// Argument convention (verified against this quic-go fork,
+// internal/ackhandler/sent_packet_handler.go:275-282): bytesInFlight ALREADY
+// includes the packet being sent - the handler does `h.bytesInFlight += size`
+// before calling the controller. The model therefore stores the argument
+// verbatim; adding `bytes` here double-counted exactly one packet per send.
+// The ack path mirrors it: priorInFlight (sent_packet_handler.go:655) is read
+// before the acked/lost bytes are removed, which is what onAckEvent's
+// `priorInFlight - ackedBytes - lostBytes` assumes.
 func (b *Bbr3Sender) OnPacketSent(sentTime time.Time, bytesInFlight congestion.ByteCount, packetNumber congestion.PacketNumber, bytes congestion.ByteCount, isRetransmittable bool) {
 	if !isRetransmittable {
 		return
 	}
 	b.expireHint(sentTime)
-	b.model.bytesInFlight = bytesInFlight + bytes
+	b.model.bytesInFlight = bytesInFlight
 	b.model.onPacketSent(sentTime, packetNumber, bytes, b.model.bytesInFlight)
 	b.pacer.SentPacket(sentTime, bytes)
 }
@@ -119,22 +146,31 @@ func (b *Bbr3Sender) OnPacketSent(sentTime time.Time, bytesInFlight congestion.B
 // driven by the bandwidth model, not by this hint.
 func (b *Bbr3Sender) MaybeExitSlowStart() {}
 
-// OnRetransmissionTimeout withdraws hint authorization on a retransmitting PTO.
-func (b *Bbr3Sender) OnRetransmissionTimeout(packetsRetransmitted bool) {
-	if packetsRetransmitted {
-		b.revokeHint(time.Now(), reasonPto)
-		b.recalc()
-	}
-}
+// OnRetransmissionTimeout implements congestion.CongestionControl. It is a
+// deliberate no-op: PTO is NOT OBSERVABLE through this interface in this
+// quic-go fork.
+//
+// The only reference to this method anywhere in the fork is the pure
+// forwarder internal/ackhandler/cc_adapter.go:52-53; the PTO path itself
+// (sent_packet_handler.go OnLossDetectionTimeout, ~lines 713-780) never
+// notifies the congestion controller, it only arms probes. So there is no
+// signal to react to, and the former `revokeHint(..., "pto")` branch was
+// unreachable code that made the hint telemetry claim a coverage it did not
+// have (audit finding P3-50, adjudication A9 option 2). If a future quic-go
+// starts calling this, the hint-authorization withdrawal must be restored
+// together with a test that drives it through the real callback.
+func (b *Bbr3Sender) OnRetransmissionTimeout(packetsRetransmitted bool) {}
 
 // InSlowStart implements congestion.CongestionControl.
-func (b *Bbr3Sender) InSlowStart() bool { return b.mode == modeStartup }
+func (b *Bbr3Sender) InSlowStart() bool { return mode(b.mode.Load()) == modeStartup }
 
 // InRecovery reports false; this experiment has no explicit recovery state.
 func (b *Bbr3Sender) InRecovery() bool { return false }
 
 // GetCongestionWindow implements congestion.CongestionControl.
-func (b *Bbr3Sender) GetCongestionWindow() congestion.ByteCount { return b.cwnd }
+func (b *Bbr3Sender) GetCongestionWindow() congestion.ByteCount {
+	return congestion.ByteCount(b.cwnd.Load())
+}
 
 // OnPacketAcked implements congestion.CongestionControl. It is deliberately a
 // no-op: quic-go reports the acknowledgement both per packet through this
@@ -191,8 +227,8 @@ func (b *Bbr3Sender) onAckEvent(now time.Time, acked []congestion.AckedPacketInf
 	// congestion window: pacing deliberately holds about one BDP in flight
 	// while cwnd allows two, so a cwnd-relative test would mark every event
 	// app-limited and starve the bandwidth model of samples forever.
-	limit := b.cwnd
-	if p := m.pacingInFlight(b.pacingRate); p < limit {
+	limit := congestion.ByteCount(b.cwnd.Load())
+	if p := m.pacingInFlight(b.PacingRate()); p < limit {
 		limit = p
 	}
 	m.appLimited = priorInFlight < limit*3/4
@@ -226,7 +262,8 @@ func (b *Bbr3Sender) onAckEvent(now time.Time, acked []congestion.AckedPacketInf
 		m.adaptLowerBounds()
 	}
 
-	switch b.mode {
+	cur := mode(b.mode.Load())
+	switch cur {
 	case modeStartup:
 		// The full-bandwidth test is a per-round measurement; running it on
 		// every ack event would exit STARTUP within a single round.
@@ -237,26 +274,27 @@ func (b *Bbr3Sender) onAckEvent(now time.Time, acked []congestion.AckedPacketInf
 			// Sustained loss during the ramp means the path is saturated: stop
 			// probing and drain the queue. The upper bound is left unset so
 			// PROBE_UP owns it in this local policy.
-			b.mode = modeDrain
+			cur = modeDrain
 		} else if m.fullBwReached {
-			b.mode = modeDrain
+			cur = modeDrain
 		}
 	case modeDrain:
 		if m.bytesInFlight <= m.bdp() {
-			b.mode = modeProbeBWDown
+			cur = modeProbeBWDown
 		}
 	case modeProbeBWUp:
-		if m.probeUpRound(roundStart, lostBytes, b.cwnd) {
-			b.mode = modeProbeBWDown
+		if m.probeUpRound(roundStart, lostBytes, congestion.ByteCount(b.cwnd.Load())) {
+			cur = modeProbeBWDown
 		}
 	case modeProbeBWDown, modeProbeBWCruise, modeProbeBWRefill:
 		if roundStart {
-			b.mode = b.mode.advance()
-			if b.mode == modeProbeBWUp {
+			cur = cur.advance()
+			if cur == modeProbeBWUp {
 				m.resetProbeUp()
 			}
 		}
 	}
+	b.mode.Store(uint32(cur))
 
 	if roundStart {
 		m.updateLossBaseline()
@@ -277,7 +315,8 @@ func (b *Bbr3Sender) rttSample() time.Duration {
 // maybeProbeRtt enters PROBE_RTT when the minimum RTT has expired and leaves it
 // after ProbeRttDuration plus one round with inflight at the target.
 func (b *Bbr3Sender) maybeProbeRtt(now time.Time, roundStart, minRttExpired bool) {
-	if b.mode == modeProbeRTT {
+	cur := mode(b.mode.Load())
+	if cur == modeProbeRTT {
 		if b.probeRttExitAt.IsZero() {
 			if b.model.bytesInFlight <= b.model.probeRttTarget() {
 				b.probeRttExitAt = now.Add(b.params.ProbeRttDuration)
@@ -290,12 +329,12 @@ func (b *Bbr3Sender) maybeProbeRtt(now time.Time, roundStart, minRttExpired bool
 		}
 		if b.probeRttRound && !now.Before(b.probeRttExitAt) {
 			b.probeRttExitAt = time.Time{}
-			b.mode = modeProbeBWDown
+			b.mode.Store(uint32(modeProbeBWDown))
 		}
 		return
 	}
 	if minRttExpired {
-		b.mode = modeProbeRTT
+		b.mode.Store(uint32(modeProbeRTT))
 		b.probeRttExitAt = time.Time{}
 		b.probeRttRound = false
 	}
@@ -312,7 +351,8 @@ func (b *Bbr3Sender) recalc() {
 	if b.hint > 0 && est > b.hint {
 		est = b.hint
 	}
-	rate := Bandwidth(float64(est) * b.params.pacingGain(b.mode))
+	cur := mode(b.mode.Load())
+	rate := Bandwidth(float64(est) * b.params.pacingGain(cur))
 	if rate < b.params.MinPacingRate {
 		rate = b.params.MinPacingRate
 	}
@@ -321,7 +361,7 @@ func (b *Bbr3Sender) recalc() {
 	// to path capacity would pin throughput below capacity.
 	if b.hint > 0 {
 		ceiling := b.hint
-		if !b.params.StrictHintCap && b.mode == modeProbeBWUp {
+		if !b.params.StrictHintCap && cur == modeProbeBWUp {
 			ceiling = Bandwidth(float64(b.hint) * b.params.HintProbeOvershoot)
 		}
 		if rate > ceiling {
@@ -339,10 +379,10 @@ func (b *Bbr3Sender) recalc() {
 			rate = ceiling
 		}
 	}
-	b.pacingRate = rate
+	b.pacingRate.Store(uint64(rate))
 
 	var cwnd congestion.ByteCount
-	if b.mode == modeProbeRTT {
+	if cur == modeProbeRTT {
 		cwnd = m.probeRttTarget()
 	} else {
 		cwnd = congestion.ByteCount(b.params.CwndGain * float64(bdpFrom(est, m.minRttValue())))
@@ -353,7 +393,7 @@ func (b *Bbr3Sender) recalc() {
 			cwnd = m.inflightHi
 		}
 	}
-	if b.mode == modeStartup && cwnd < m.initialCwnd {
+	if cur == modeStartup && cwnd < m.initialCwnd {
 		cwnd = m.initialCwnd
 	}
 	if cwnd < m.minCwnd {
@@ -368,7 +408,7 @@ func (b *Bbr3Sender) recalc() {
 	// applied to inflight_hi, which is a path observation.
 	if b.hint > 0 {
 		capFactor := 1.0
-		if b.mode == modeProbeBWUp && !b.params.StrictHintCap {
+		if cur == modeProbeBWUp && !b.params.StrictHintCap {
 			capFactor = b.params.HintProbeOvershoot
 		}
 		capCwnd := congestion.ByteCount(float64(b.hint) * m.minRttValue().Seconds() * b.params.CwndGain * capFactor)
@@ -380,5 +420,5 @@ func (b *Bbr3Sender) recalc() {
 		}
 	}
 
-	b.cwnd = cwnd
+	b.cwnd.Store(int64(cwnd))
 }

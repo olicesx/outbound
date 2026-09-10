@@ -26,15 +26,41 @@ import (
 const packetChanCap = 2048
 
 type Packets struct {
-	mu       sync.Mutex
+	mu sync.Mutex
+	// ch is the bounded queue. It is nil until the first PushBack that has to
+	// enqueue: an association whose receiver is registered immediately, or
+	// which only ever sends, never pays for the 2048-slot buffer.
 	ch       chan *Packet
 	receiver *packetHandlerRegistration
 	closed   atomic.Bool
+
+	// cond wakes a blocked PopFrontBlock when a packet is enqueued or the
+	// queue closes. A bare receive cannot do that job on a lazily allocated
+	// queue: receiving from a nil channel blocks forever, and re-reading the
+	// field after the check would race a channel that materializes later.
+	// L is p.mu, so the wait predicate is always evaluated under the same lock
+	// that PushBack and Close mutate under.
+	cond *sync.Cond
+
+	// dropped counts packets discarded because the queue was full, and
+	// droppedNoReceiver counts packets discarded because no receiver was
+	// registered at delivery time. Both are loss that would otherwise be
+	// completely unobservable; see DroppedPackets.
+	dropped           atomic.Uint64
+	droppedNoReceiver atomic.Uint64
 
 	// deliverMu serializes direct receiver delivery (PushBack) against the
 	// receiver swap + queued-prefix drain in registerPacketHandler, so a
 	// packet pushed after the swap cannot overtake the drained prefix (FIFO).
 	deliverMu sync.Mutex
+}
+
+// DroppedPackets reports how many packets this association discarded without
+// delivering them, split into (queue full, no receiver). ReadFrom-based
+// consumers silently lose these; RegisterPacketReceiver-based consumers have
+// no error return either, so this is the only signal that loss happened.
+func (p *Packets) DroppedPackets() (full uint64, noReceiver uint64) {
+	return p.dropped.Load(), p.droppedNoReceiver.Load()
 }
 
 type packetHandlerRegistration struct {
@@ -43,9 +69,20 @@ type packetHandlerRegistration struct {
 }
 
 func NewPackets() *Packets {
-	return &Packets{
-		ch: make(chan *Packet, packetChanCap),
+	// The 2048-slot data queue is allocated lazily by ensureChan; only the
+	// mutex and the condition variable are eager.
+	p := &Packets{}
+	p.cond = sync.NewCond(&p.mu)
+	return p
+}
+
+// ensureChan lazily allocates the bounded data queue. Callers must hold p.mu,
+// which also serializes channel creation against the close in Close.
+func (p *Packets) ensureChan() chan *Packet {
+	if p.ch == nil {
+		p.ch = make(chan *Packet, packetChanCap)
 	}
+	return p.ch
 }
 
 func (p *Packets) PushBack(packet *Packet) {
@@ -63,6 +100,7 @@ func (p *Packets) PushBack(packet *Packet) {
 			receiver.handler(packet)
 			return
 		}
+		p.droppedNoReceiver.Add(1)
 		packet.releaseData()
 		return
 	}
@@ -71,9 +109,14 @@ func (p *Packets) PushBack(packet *Packet) {
 	// When full, drop instead of blocking: this call runs on the single
 	// demux goroutine serving every association on the QUIC connection, and
 	// blocking here would stall all of them (head-of-line blocking).
+	ch := p.ensureChan()
 	select {
-	case p.ch <- packet:
+	case ch <- packet:
+		if p.cond != nil {
+			p.cond.Signal()
+		}
 	default:
+		p.dropped.Add(1)
 		packet.releaseData()
 	}
 	p.mu.Unlock()
@@ -98,6 +141,8 @@ func (p *Packets) registerPacketHandler(handler func(*Packet) bool) (func(), boo
 		return nil, false
 	}
 	p.receiver = registration
+	// The queue may never have been materialized (no PushBack has had to
+	// enqueue yet), in which case there is no prefix to drain.
 	queued := make([]*Packet, 0, len(p.ch))
 drainLoop:
 	for {
@@ -136,12 +181,35 @@ drainLoop:
 	}, true
 }
 
+// PopFrontBlock blocks until a packet is queued or the queue is closed.
+//
+// It waits on p.cond rather than receiving directly, so it works on a queue
+// whose data channel has not been materialized yet: a receive would otherwise
+// park on a nil channel (forever) or on a channel that is created after the
+// reader's check (a lost wakeup). The predicate is evaluated under p.mu, the
+// same lock PushBack Signals and Close Broadcasts under.
 func (p *Packets) PopFrontBlock() (packet *Packet, closed bool) {
-	packet, ok := <-p.ch
-	if !ok {
-		return nil, true
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for {
+		if p.closed.Load() {
+			return nil, true
+		}
+		if p.ch != nil {
+			select {
+			case packet := <-p.ch:
+				return packet, false
+			default:
+			}
+		}
+		if p.cond == nil {
+			// Only reachable for a zero-value Packets (not produced by
+			// NewPackets, but constructed by tests); report closed rather
+			// than spinning.
+			return nil, true
+		}
+		p.cond.Wait()
 	}
-	return packet, false
 }
 
 func (p *Packets) Close() error {
@@ -160,12 +228,22 @@ func (p *Packets) Close() error {
 	// Drain buffered packets so PopFrontBlock returns closed immediately,
 	// matching the previous list.Init() drop-on-close semantics. No new
 	// PushBack can run concurrently — it would block on p.mu.
-	for len(p.ch) > 0 {
-		if pkt := <-p.ch; pkt != nil {
-			pkt.releaseData()
+	//
+	// The data queue is left nil when PushBack never materialized it: there is
+	// nothing to drain, and the Broadcast below is what wakes a parked reader,
+	// so allocating ~18.5 KB at teardown just to close it would defeat the
+	// lazy allocation entirely.
+	if p.ch != nil {
+		for len(p.ch) > 0 {
+			if pkt := <-p.ch; pkt != nil {
+				pkt.releaseData()
+			}
 		}
+		close(p.ch)
 	}
-	close(p.ch)
+	if p.cond != nil {
+		p.cond.Broadcast()
+	}
 	return nil
 }
 

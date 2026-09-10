@@ -23,6 +23,44 @@ func buildPacketMessage(b *testing.B, dataSize int) []byte {
 	return buf.Bytes()
 }
 
+// BenchmarkReadPacketFromMessage is the source of truth for the allocation
+// count documented on readPacketFromMessage. It measures the native
+// (UdpRelayMode=native) per-datagram parse, which runs once per inbound UDP
+// datagram on the shared demux goroutine.
+//
+// Measured: 6 allocs/op (Packet + CommandHead + Address + ADDR slice +
+// packetDataOwner + the pooled DATA slice). The first four are structural; the
+// DATA slice is a pool.Get rather than a fresh allocation, so its size does not
+// grow with the payload. The comment previously claimed 4 and omitted
+// CommandHead and packetDataOwner.
+func BenchmarkReadPacketFromMessage(b *testing.B) {
+	msg := buildPacketMessage(b, 100)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pkt, err := readPacketFromMessage(msg)
+		if err != nil {
+			b.Fatal(err)
+		}
+		pkt.releaseData()
+	}
+}
+
+// BenchmarkReadPacketFromMessageSmall uses a tiny payload so the fixed
+// structural cost dominates: this is the number the alloc comment refers to.
+func BenchmarkReadPacketFromMessageSmall(b *testing.B) {
+	msg := buildPacketMessage(b, 8)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pkt, err := readPacketFromMessage(msg)
+		if err != nil {
+			b.Fatal(err)
+		}
+		pkt.releaseData()
+	}
+}
+
 // BenchmarkReadPacketFromStream measures the QUIC uni-stream parser used
 // when UdpRelayMode=quic. Native processDatagram is a different path.
 func BenchmarkReadPacketFromStream(b *testing.B) {

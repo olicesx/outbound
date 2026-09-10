@@ -3,6 +3,7 @@ package tuic
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -17,6 +18,7 @@ import (
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/tuic/common"
 	"github.com/olicesx/quic-go"
+	"github.com/sirupsen/logrus"
 )
 
 const Ver5 = 0x5
@@ -65,7 +67,41 @@ type clientImpl struct {
 
 	streamSem chan struct{}
 
+	// malformedDatagrams counts inbound datagrams the shared tunnel dropped
+	// because the peer's bytes did not parse. A single bad datagram must not
+	// retire the tunnel (every multiplexed stream rides it), but an unbounded
+	// stream of them means the peer is broken or hostile, so
+	// malformedDatagramsWindow escalates to forceClose at
+	// malformedDatagramEscalationThreshold. Both are observable through
+	// MalformedDatagramStats.
+	malformedDatagrams       atomic.Uint64
+	malformedDatagramsWindow atomic.Uint64
+
+	// lastMalformedLogNano rate-limits the drop warning to one line per
+	// malformedDatagramLogInterval so a flood cannot turn the fix into a
+	// log-spam amplifier.
+	lastMalformedLogNano atomic.Int64
+
 	onClose func()
+}
+
+// ClientStatSnapshot is the observability surface for inbound UDP loss on a
+// shared TUIC tunnel.
+type ClientStatSnapshot struct {
+	// MalformedDatagrams is the lifetime count of dropped unparseable
+	// inbound datagrams.
+	MalformedDatagrams uint64
+	// MalformedDatagramsWindow is the count since the last escalation-window
+	// reset; reaching malformedDatagramEscalationThreshold retires the tunnel.
+	MalformedDatagramsWindow uint64
+}
+
+// MalformedDatagramStats reports the malformed-datagram drop counters.
+func (t *clientImpl) MalformedDatagramStats() ClientStatSnapshot {
+	return ClientStatSnapshot{
+		MalformedDatagrams:       t.malformedDatagrams.Load(),
+		MalformedDatagramsWindow: t.malformedDatagramsWindow.Load(),
+	}
 }
 
 // newClientImpl builds a TUIC client around option with its lifecycle state
@@ -290,12 +326,41 @@ func (t *clientImpl) processDatagram(quicConn quic.Connection, message []byte) {
 		}
 	}()
 	if len(message) < 2 {
+		// Too short to even carry a command type: peer data, not a local
+		// failure. Count it so the drop is observable, and still hand the
+		// tunnel over so a flood of these escalates - dropping them forever
+		// would be exactly the silent degradation this classification exists
+		// to avoid. There is no association to name, so the deferred cleanup
+		// has nothing to release.
+		var ctx context.Context
+		if quicConn != nil {
+			ctx = quicConn.Context()
+		}
+		t.noteMalformedDatagram(ctx, quicConn, "datagram shorter than a command header")
 		return
 	}
 	switch CommandType(message[1]) {
 	case PacketType:
+		// Learn the association before parsing: if the malformed datagram
+		// flood escalates, the deferred cleanup must still retire the queue
+		// the hostile peer is aiming at. ASSOC_ID sits at a fixed offset
+		// (VER(1)+TYPE(1)+ASSOC_ID(2)); a datagram too short to carry it is
+		// malformed anyway, so the deferred cleanup simply has no association
+		// to release.
+		if len(message) >= 4 {
+			assocId = binary.BigEndian.Uint16(message[2:4])
+		}
 		packet, parseErr := readPacketFromMessage(message)
 		if parseErr != nil {
+			if errors.Is(parseErr, errMalformedDatagram) {
+				// One peer's garbage packet does not break the connection:
+				// every multiplexed TCP stream and every other UDP
+				// association rides this same QUIC connection. Drop it,
+				// count it, and let the escalation threshold decide when the
+				// peer has proven itself broken.
+				t.noteMalformedDatagram(quicConn.Context(), quicConn, parseErr.Error())
+				return
+			}
 			err = parseErr
 			return
 		}
@@ -311,6 +376,65 @@ func (t *clientImpl) processDatagram(quicConn quic.Connection, message []byte) {
 		packet.releaseData()
 	case HeartbeatType:
 		// Fixed 2-byte command (VER+TYPE); no further bytes to consume.
+	}
+}
+
+// malformedDatagramEscalationThreshold is the number of unparseable inbound
+// datagrams that turns a per-packet drop into a tunnel teardown. It is set
+// high enough that ordinary corruption (a truncated read, a single stray
+// datagram) never retires a healthy tunnel, and low enough that a peer which
+// cannot produce one valid datagram is retired quickly instead of parking the
+// connection in a permanent drop loop.
+const malformedDatagramEscalationThreshold = 4096
+
+// malformedDatagramLogInterval rate-limits the drop warning: at datagram line
+// rate an unthrottled log would cost more than the datagrams do.
+const malformedDatagramLogInterval = 5 * time.Second
+
+// noteMalformedDatagram records a dropped unparseable datagram: it bumps both
+// counters, emits a rate-limited warning, and escalates to forceClose once the
+// window reaches malformedDatagramEscalationThreshold. ctx is used for the
+// log's cancellation context and may be nil (background).
+func (t *clientImpl) noteMalformedDatagram(ctx context.Context, quicConn quic.Connection, reason string) {
+	total := t.malformedDatagrams.Add(1)
+	window := t.malformedDatagramsWindow.Add(1)
+
+	now := time.Now().UnixNano()
+	if last := t.lastMalformedLogNano.Load(); last == 0 ||
+		now-last >= malformedDatagramLogInterval.Nanoseconds() {
+		if t.lastMalformedLogNano.CompareAndSwap(last, now) {
+			fields := logrus.Fields{
+				"reason":             reason,
+				"dropped_total":      total,
+				"dropped_in_window":  window,
+				"escalation_at":      malformedDatagramEscalationThreshold,
+				"udp_relay_mode":     t.UdpRelayMode,
+				"tunnel_retirement":  "on threshold",
+				"next_log_in_second": int64(malformedDatagramLogInterval / time.Second),
+			}
+			if ctx != nil {
+				logrus.WithContext(ctx).WithFields(fields).
+					Warn("tuic: dropped malformed inbound datagram")
+			} else {
+				logrus.WithFields(fields).
+					Warn("tuic: dropped malformed inbound datagram")
+			}
+		}
+	}
+
+	if window >= malformedDatagramEscalationThreshold {
+		// Reset the window so the escalation log is emitted once per window
+		// rather than on every datagram past the threshold.
+		t.malformedDatagramsWindow.Store(0)
+		logrus.WithFields(logrus.Fields{
+			"threshold":     malformedDatagramEscalationThreshold,
+			"dropped_total": total,
+			"reason":        reason,
+		}).Error("tuic: peer exceeded the malformed-datagram threshold; retiring the shared tunnel")
+		if quicConn != nil {
+			t.forceClose(quicConn, fmt.Errorf("%w: %d malformed inbound datagrams (last: %s)",
+				errMalformedDatagram, malformedDatagramEscalationThreshold, reason))
+		}
 	}
 }
 

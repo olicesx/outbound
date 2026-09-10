@@ -2,12 +2,28 @@ package tuic
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 
 	"github.com/daeuniverse/outbound/pool"
 )
+
+// errMalformedDatagram marks a parse failure caused by the peer's bytes: a
+// truncated field, an unknown address type, or a wrong command type inside the
+// datagram. It exists so the receive loop can tell "this datagram is garbage"
+// apart from "this connection is broken": the former is one peer's packet, the
+// latter retires the shared tunnel that carries every multiplexed stream.
+//
+// Errors that are not wrapped in this sentinel (pool exhaustion, an io error
+// from a stream) keep their existing fatal treatment.
+var errMalformedDatagram = errors.New("tuic: malformed datagram")
+
+// malformedDatagramf wraps a peer-data parse failure in the sentinel.
+func malformedDatagramf(format string, args ...any) error {
+	return fmt.Errorf("%w: "+format, append([]any{errMalformedDatagram}, args...)...)
+}
 
 // readPacketFromMessage parses a TUIC Packet command from its wire-format
 // message (CommandHead + Packet fields + Address + DATA) using direct slice
@@ -16,16 +32,20 @@ import (
 //
 // Hot path: processDatagram calls this for every inbound UDP datagram.
 //
-// Allocations: 4 (Packet + Address + ADDR slice + DATA slice), down from
-// 12 via the reader+binary.Read path.
+// Allocations: 6 / 157 B per datagram, down from 12 via the reader+binary.Read
+// path. The six are Packet, CommandHead, Address, the ADDR slice, the dataOwner
+// wrapper, and the DATA slice - the last only when pool.Get misses, so it is
+// measured as always-allocating by BenchmarkReadPacketFromMessage (the pool hit
+// path is covered by TestTuicUnfragmentedDataPooled). Measured, not estimated:
+// see BenchmarkReadPacketFromMessage / BenchmarkReadPacketFromMessageSmall.
 func readPacketFromMessage(msg []byte) (*Packet, error) {
 	// VER(1) + TYPE(1) + ASSOC_ID(2) + PKT_ID(2) + FRAG_TOTAL(1) + FRAG_ID(1) + SIZE(2)
 	const fixedLen = 2 + 2 + 2 + 1 + 1 + 2
 	if len(msg) < fixedLen {
-		return nil, fmt.Errorf("tuic: packet too short: %d bytes", len(msg))
+		return nil, malformedDatagramf("packet too short: %d bytes", len(msg))
 	}
 	if typ := CommandType(msg[1]); typ != PacketType {
-		return nil, fmt.Errorf("tuic: not a packet command: %s", typ)
+		return nil, malformedDatagramf("not a packet command: %s", typ)
 	}
 	ver := msg[0]
 	off := 2
@@ -50,7 +70,7 @@ func readPacketFromMessage(msg []byte) (*Packet, error) {
 	var dataOwner *packetDataOwner
 	if size > 0 {
 		if len(msg[off:]) < int(size) {
-			return nil, fmt.Errorf("tuic: data truncated: need %d have %d", size, len(msg[off:]))
+			return nil, malformedDatagramf("data truncated: need %d have %d", size, len(msg[off:]))
 		}
 		// Every parsed payload is pool-backed. Fragment defraggers own their
 		// packets until assembly, timeout, rejection, or association teardown.
@@ -77,7 +97,7 @@ func readPacketFromMessage(msg []byte) (*Packet, error) {
 // Avoids the BufferedReader interface and io.ReadFull overhead.
 func readAddressFromSlice(msg []byte) (*Address, int, error) {
 	if len(msg) < 1 {
-		return nil, 0, fmt.Errorf("tuic: address type byte missing")
+		return nil, 0, malformedDatagramf("address type byte missing")
 	}
 	typ := msg[0]
 	off := 1
@@ -86,7 +106,7 @@ func readAddressFromSlice(msg []byte) (*Address, int, error) {
 	case AtypIPv4:
 		const addrLen = net.IPv4len
 		if len(msg[off:]) < addrLen+2 {
-			return nil, 0, fmt.Errorf("tuic: ipv4 address too short")
+			return nil, 0, malformedDatagramf("ipv4 address too short")
 		}
 		addr = make([]byte, addrLen)
 		copy(addr, msg[off:])
@@ -94,18 +114,18 @@ func readAddressFromSlice(msg []byte) (*Address, int, error) {
 	case AtypIPv6:
 		const addrLen = net.IPv6len
 		if len(msg[off:]) < addrLen+2 {
-			return nil, 0, fmt.Errorf("tuic: ipv6 address too short")
+			return nil, 0, malformedDatagramf("ipv6 address too short")
 		}
 		addr = make([]byte, addrLen)
 		copy(addr, msg[off:])
 		off += addrLen
 	case AtypDomainName:
 		if len(msg[off:]) < 1 {
-			return nil, 0, fmt.Errorf("tuic: domain length byte missing")
+			return nil, 0, malformedDatagramf("domain length byte missing")
 		}
 		addrLen := int(msg[off])
 		if len(msg[off:]) < 1+addrLen+2 {
-			return nil, 0, fmt.Errorf("tuic: domain address too short")
+			return nil, 0, malformedDatagramf("domain address too short")
 		}
 		addr = make([]byte, 1+addrLen)
 		addr[0] = byte(addrLen)
@@ -115,10 +135,10 @@ func readAddressFromSlice(msg []byte) (*Address, int, error) {
 		// Address type None: no ADDR, no PORT (used on non-first fragments).
 		return &Address{TYPE: typ}, off, nil
 	default:
-		return nil, 0, fmt.Errorf("tuic: unknown address type: %#x", typ)
+		return nil, 0, malformedDatagramf("unknown address type: %#x", typ)
 	}
 	if len(msg[off:]) < 2 {
-		return nil, 0, fmt.Errorf("tuic: address port missing")
+		return nil, 0, malformedDatagramf("address port missing")
 	}
 	port := binary.BigEndian.Uint16(msg[off:])
 	off += 2

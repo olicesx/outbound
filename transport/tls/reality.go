@@ -240,7 +240,14 @@ func NewReality(s string, d netproxy.Dialer) (*Reality, error) {
 	parse("t", 4) // times
 	parse("i", 6) // interval
 	parse("r", 8) // return
-	u.RawQuery = q.Encode()
+	// The five parameters above are REALITY's own spider schedule and are
+	// consumed by the parse calls, so they must not survive into x.spiderX:
+	// that value is concatenated onto "https://"+serverName to build the
+	// cover-traffic GET (paths[x.spiderX] below), and upstream Xray strips
+	// them for exactly that reason (config.SpiderX = u.String() with u parsed
+	// from spiderX in infra/conf/transport_security.go). The stripped query
+	// therefore belongs to the spiderX URL, not to the outer link in u.
+	tmpU.RawQuery = q.Encode()
 	x.spiderX = tmpU.String()
 	// x.infoWriter = logger.Logger.WriterLevel(logrus.TraceLevel)
 	// logrus.Printf("%#v", x)

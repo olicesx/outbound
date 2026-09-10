@@ -79,10 +79,10 @@ func TestNewRealityValidSpiderXStillParses(t *testing.T) {
 					t.Fatalf("spx=%q: spiderY[%d] = %d, want %d", tc.spx, i, x.spiderY[i], want)
 				}
 			}
-			// Note: this fork strips the schedule params from u.RawQuery, but
-			// x.spiderX is taken from tmpU.String(), so the parameters remain
-			// in the spider's request path. That is pre-existing behaviour and
-			// is recorded here rather than silently asserted away.
+			// The schedule parameters are consumed into spiderY, so they must
+			// not survive into the path the spider requests; see
+			// TestNewRealitySpiderXStripsScheduleParams for the URL-level
+			// before/after pair.
 			if !strings.HasPrefix(x.spiderX, "/") {
 				t.Fatalf("spx=%q: spiderX = %q, want a rooted path", tc.spx, x.spiderX)
 			}
@@ -98,5 +98,84 @@ func TestNewRealityValidSpiderXStillParses(t *testing.T) {
 func TestNewRealityRejectsNonRootedSpiderX(t *testing.T) {
 	if _, err := NewReality(realityTestLink(t, "relative/path"), nil); err == nil {
 		t.Fatal("NewReality accepted a non-rooted spiderX")
+	}
+}
+
+// spiderSeedURL reproduces the first URL the spider requests. reality.go seeds
+// the per-serverName path set with x.spiderX and builds every target as
+// "https://"+serverName+getPathLocked(paths), so with a one-entry set this is
+// the request target the fix has to keep clean.
+func spiderSeedURL(x *Reality) string {
+	return "https://" + x.serverName + getPathLocked(map[string]bool{x.spiderX: true})
+}
+
+// TestNewRealitySpiderXStripsScheduleParams is the P3-68 regression: p/c/t/i/r
+// are REALITY's own spider schedule (padding, concurrency, times, interval,
+// return), consumed by the parse calls in NewReality. They must not survive
+// into x.spiderX, because that value becomes the path of the cover-traffic GET
+// the spider sends to the backdrop.
+//
+// The pre-fix code wrote the stripped query into the OUTER subscription link
+// (`u.RawQuery = q.Encode()`, where u is the link parsed at the top of
+// NewReality), leaving tmpU — the spiderX URL that x.spiderX is taken from —
+// untouched. The "before" column is what that produced on the wire; the fix
+// writes the stripped query back into tmpU, which is what upstream Xray does
+// (infra/conf/transport_security.go: u is parsed from c.SpiderX there).
+func TestNewRealitySpiderXStripsScheduleParams(t *testing.T) {
+	const serverName = "example.com"
+	for _, tc := range []struct {
+		name string
+		spx  string
+		// want is the spiderX, i.e. the seed request path, after the strip.
+		want string
+		// before is the path the pre-fix code sent, empty when it is want.
+		before string
+	}{
+		{"default path", "/", "/", ""},
+		{
+			"full schedule",
+			"/?p=100-200&c=2-3&t=4-5&i=6-7&r=8-9",
+			"/",
+			"/?p=100-200&c=2-3&t=4-5&i=6-7&r=8-9",
+		},
+		{"schedule on a sub path", "/news?p=100&c=2", "/news", "/news?p=100&c=2"},
+		{"unrelated query is preserved", "/?q=1", "/?q=1", ""},
+		{"only schedule keys are removed", "/news?p=7-9&utm=x", "/news?utm=x", "/news?p=7-9&utm=x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x, err := NewReality(realityTestLink(t, tc.spx), nil)
+			if err != nil {
+				t.Fatalf("spx=%q: NewReality error = %v", tc.spx, err)
+			}
+			if x.spiderX != tc.want {
+				t.Fatalf("spx=%q: spiderX = %q, want %q", tc.spx, x.spiderX, tc.want)
+			}
+			if tc.before != "" && x.spiderX == tc.before {
+				t.Fatalf("spx=%q: spiderX still holds the pre-fix value %q", tc.spx, tc.before)
+			}
+
+			got := spiderSeedURL(x)
+			if wantURL := "https://" + serverName + tc.want; got != wantURL {
+				t.Fatalf("spx=%q: cover request URL = %q, want %q", tc.spx, got, wantURL)
+			}
+			u, err := url.Parse(got)
+			if err != nil {
+				t.Fatalf("spx=%q: cover request URL %q is not parseable: %v", tc.spx, got, err)
+			}
+			for _, param := range []string{"p", "c", "t", "i", "r"} {
+				if u.Query().Has(param) {
+					t.Fatalf("spx=%q: cover request URL %q still carries the schedule param %q",
+						tc.spx, got, param)
+				}
+			}
+
+			// The strip must not disturb what the outer link means.
+			if x.serverName != serverName {
+				t.Fatalf("spx=%q: serverName = %q, want %q", tc.spx, x.serverName, serverName)
+			}
+			if x.fingerprint == nil || x.fingerprint.Client == "" {
+				t.Fatalf("spx=%q: fingerprint was not resolved from the outer link", tc.spx)
+			}
+		})
 	}
 }

@@ -827,17 +827,33 @@ func isCanceledOrClosed(err error) bool {
 		strings.Contains(errStr, "use of closed network connection")
 }
 
+// logAllIPsFailed reports that every resolved proxy IP failed for one dial
+// attempt.
+//
+// This is a per-connection decision ("this node is unusable, hand the failure
+// back so the caller switches nodes"), not a fault the operator has to act on:
+// an unreachable proxy node is the normal state that the health check and the
+// dialer group exist to handle. It used to be logged at error level, which
+// turned a routine node outage into an error line per dial attempt and buried
+// the errors that do need action.
+//
+// Nothing is dropped by logging it at debug level: the failure is still
+// returned to the caller as the dial error, and the consumer escalates it -
+// dae logs "Marking dialer as unavailable due to persistent proxy IP failures"
+// at warn level once its own failure threshold is reached, and reports the
+// per-attempt cause at debug level ("Connectivity Check Failed"). The fields
+// below are unchanged, so a debug-level log still names the address and cause.
 func logAllIPsFailed(proxyAddr string, lastErr error) {
 	if isCanceledOrClosed(lastErr) {
 		return
 	}
-	if logger.IsLevelEnabled(logrus.ErrorLevel) {
+	if logger.IsLevelEnabled(logrus.DebugLevel) {
 		fields := logrus.Fields{
 			"proxy_addr": proxyAddr,
 		}
 		if lastErr != nil {
 			fields["error"] = lastErr.Error()
 		}
-		logger.WithFields(fields).Error("[StickyIP] All proxy IPs failed")
+		logger.WithFields(fields).Debug("[StickyIP] All proxy IPs failed")
 	}
 }

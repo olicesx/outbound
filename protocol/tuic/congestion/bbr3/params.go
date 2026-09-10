@@ -60,6 +60,16 @@ type Params struct {
 	DefaultMinRtt     time.Duration
 	MinPacingRate     Bandwidth
 	MaxBwFilterRounds uint64
+	// PacketStateWindow is the packet-number SPAN, in packets, whose send
+	// records the sampler can still resolve: a record is retained while
+	// send head - packet number <= PacketStateWindow.
+	//
+	// It is not a memory of the last N packet numbers and it does not cap
+	// registration or throughput. When a send leaves the span its record is
+	// dropped - its ack can no longer be attributed to the right send time - and
+	// the slot it used becomes immediately reusable, so the next send registers
+	// normally however wide the span grows. Retained state stays bounded by
+	// PacketStateWindow + 1 slots at every span.
 	PacketStateWindow int
 }
 

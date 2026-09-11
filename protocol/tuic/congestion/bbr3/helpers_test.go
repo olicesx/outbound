@@ -3,6 +3,7 @@ package bbr3
 import (
 	"time"
 
+	"github.com/daeuniverse/outbound/protocol/tuic/congestion/bbr"
 	"github.com/olicesx/quic-go/congestion"
 )
 
@@ -82,4 +83,33 @@ func losePackets(s *Bbr3Sender, now time.Time, sentBytes, lostBytes congestion.B
 		})
 	}
 	s.OnCongestionEventEx(s.model.bytesInFlight, now, nil, lost)
+}
+
+// seedEstimate gives the model a known delivery-rate estimate by driving the
+// shared reference estimator with one sent and acknowledged packet: 1200 bytes
+// acknowledged after 1200/bw seconds samples bw bytes per second. Tests that
+// used to write model.bw directly use this instead, because the estimate is now
+// owned by bbr.RefSampler.
+func seedEstimate(m *model, bw Bandwidth) {
+	if bw == 0 {
+		return
+	}
+	const bytes congestion.ByteCount = 1200
+	t0 := time.Unix(0, 0)
+	delta := time.Duration(float64(bytes) / float64(bw) * float64(time.Second))
+	if delta <= 0 {
+		delta = time.Nanosecond
+	}
+	m.ref.OnPacketSent(t0, 0, bytes, 0, true)
+	m.ref.OnCongestionEvent(t0.Add(delta),
+		[]congestion.AckedPacketInfo{{PacketNumber: 0, BytesAcked: bytes}}, nil, 0)
+}
+
+// setEstimate replaces the model's estimate with a known value, which is what
+// the removed local filter expressed as bw.Reset() followed by bw.Update(v, 0).
+// The reference estimator has no reset, so a fresh sampler is installed and
+// seeded; every other model field is left alone.
+func setEstimate(m *model, bw Bandwidth) {
+	m.ref = bbr.NewRefSampler(m.params.MaxBwFilterRounds)
+	seedEstimate(m, bw)
 }

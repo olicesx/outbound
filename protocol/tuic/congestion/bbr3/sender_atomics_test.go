@@ -16,7 +16,7 @@ import (
 func TestSenderAccessorsTolerateConcurrentRecalc(t *testing.T) {
 	s := newTestSender(0)
 	// A saturated estimate so recalc produces a non-degenerate window.
-	s.model.bw.Update(10_000_000, 0)
+	seedEstimate(s.model, 10_000_000)
 
 	const (
 		readers = 8
@@ -60,8 +60,11 @@ func TestSenderAccessorsTolerateConcurrentRecalc(t *testing.T) {
 					t.Errorf("negative cwnd: %d", got)
 					return
 				}
-				if got := s.PacingRate(); got < 0 {
-					t.Errorf("negative pacing rate: %d", got)
+				// PacingRate is an unsigned rate, so a negative value is not
+				// representable; recalc always stores at least MinPacingRate,
+				// so zero is the impossible value this type can express.
+				if got := s.PacingRate(); got == 0 {
+					t.Error("zero pacing rate")
 					return
 				}
 				_ = s.CanSend(12000)

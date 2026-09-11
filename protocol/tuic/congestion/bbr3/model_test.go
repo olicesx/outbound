@@ -109,7 +109,7 @@ func TestLossRateNeedsVolumeAndPacketFloor(t *testing.T) {
 func TestCapInflightHiUsesSentVolumeWithBdpFloor(t *testing.T) {
 	m := newModel(DefaultParams(), 1200)
 	m.minRtt = 80 * time.Millisecond
-	m.bw.Update(1_000_000, 0) // 1 MB/s
+	seedEstimate(m, 1_000_000) // 1 MB/s
 	m.lastRoundSent = 500_000
 	m.inflightHi = 10_000_000
 	m.capInflightHi()
@@ -130,7 +130,7 @@ func TestCapInflightHiUsesSentVolumeWithBdpFloor(t *testing.T) {
 func TestAdaptLowerBoundsNeverFallsBelowStandingBdp(t *testing.T) {
 	m := newModel(DefaultParams(), 1200)
 	m.minRtt = 80 * time.Millisecond
-	m.bw.Update(1_000_000, 0)
+	seedEstimate(m, 1_000_000)
 	m.adaptLowerBounds()
 	if m.inflightLo != m.bdp() {
 		t.Fatalf("inflightLo = %d, want bdp %d", m.inflightLo, m.bdp())
@@ -146,7 +146,7 @@ func TestAdaptLowerBoundsNeverFallsBelowStandingBdp(t *testing.T) {
 
 func TestCheckFullBwReached(t *testing.T) {
 	m := newModel(DefaultParams(), 1200)
-	m.bw.Update(1_000_000, 0)
+	seedEstimate(m, 1_000_000)
 	m.checkFullBwReached() // establishes the baseline
 	if m.fullBwReached {
 		t.Fatal("full bandwidth reached on the first sample")
@@ -162,7 +162,7 @@ func TestCheckFullBwReached(t *testing.T) {
 func TestProbeUpGrowsInflightHiAndCapsOnOvershoot(t *testing.T) {
 	m := newModel(DefaultParams(), 1200)
 	m.minRtt = 80 * time.Millisecond
-	m.bw.Update(1_000_000, 0)
+	seedEstimate(m, 1_000_000)
 	m.inflightHi = 100_000
 
 	m.probeUpRound(true, 0, 100_000)

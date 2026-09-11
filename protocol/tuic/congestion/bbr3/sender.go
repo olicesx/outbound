@@ -134,11 +134,14 @@ func (b *Bbr3Sender) CanSend(bytesInFlight congestion.ByteCount) bool {
 // `priorInFlight - ackedBytes - lostBytes` assumes.
 func (b *Bbr3Sender) OnPacketSent(sentTime time.Time, bytesInFlight congestion.ByteCount, packetNumber congestion.PacketNumber, bytes congestion.ByteCount, isRetransmittable bool) {
 	if !isRetransmittable {
+		// The reference estimator tracks the most recently sent packet even for
+		// non-retransmittable sends; only its byte accounting is gated on the flag.
+		b.model.ref.OnPacketSent(sentTime, packetNumber, bytes, bytesInFlight, false)
 		return
 	}
 	b.expireHint(sentTime)
 	b.model.bytesInFlight = bytesInFlight
-	b.model.onPacketSent(sentTime, packetNumber, bytes, b.model.bytesInFlight)
+	b.model.onPacketSent(sentTime, packetNumber, bytes, b.model.bytesInFlight, true)
 	b.pacer.SentPacket(sentTime, bytes)
 }
 
@@ -223,15 +226,7 @@ func (b *Bbr3Sender) onAckEvent(now time.Time, acked []congestion.AckedPacketInf
 		}
 	}
 
-	// App-limited is judged against what pacing would sustain, not against the
-	// congestion window: pacing deliberately holds about one BDP in flight
-	// while cwnd allows two, so a cwnd-relative test would mark every event
-	// app-limited and starve the bandwidth model of samples forever.
-	limit := congestion.ByteCount(b.cwnd.Load())
-	if p := m.pacingInFlight(b.PacingRate()); p < limit {
-		limit = p
-	}
-	m.appLimited = priorInFlight < limit*3/4
+	b.maybeApplimited(priorInFlight)
 
 	m.bytesInFlight = priorInFlight - ackedBytes - lostBytes
 	if m.bytesInFlight < 0 {
@@ -240,22 +235,21 @@ func (b *Bbr3Sender) onAckEvent(now time.Time, acked []congestion.AckedPacketInf
 
 	roundStart := m.accountEvent(ackedBytes, lostBytes, len(lost), maxPn)
 
-	// Delivery-rate samples. The maximum over the event is the bandwidth
-	// estimate candidate; app-limited samples must not raise it.
-	beforeDelivered := m.sampler.deliveredVolume()
-	var sample Bandwidth
-	for _, p := range acked {
-		if rate, ok := m.sampler.onPacketAcked(now, p.PacketNumber); ok && rate > sample {
-			sample = rate
-		}
-	}
-	for _, p := range lost {
-		m.sampler.onPacketLost(p.PacketNumber)
-	}
-	m.updateBandwidth(sample)
+	// One call into the shared reference estimator for the whole ack/loss
+	// vector: it owns the per-packet send records, the delivery-rate sample and
+	// the windowed-max filter the estimate is read from (bbr.RefSampler). This
+	// replaced a local per-packet sampler whose estimate sat well below the
+	// reference's on the same path.
+	//
+	// Only the bandwidth estimate comes from it. minRtt stays sourced from the
+	// QUIC stack (rttSample) because the hint gate below compares a raw RTT
+	// against it: feeding the estimator's per-event minimum here would move the
+	// bound out from under that comparison.
+	beforeDelivered := m.ref.TotalBytesAcked()
+	m.ref.OnCongestionEvent(now, acked, lost, m.round)
 
 	// Compare against the prior minimum before any filter refresh can hide a queue.
-	b.observeHint(now, m.sampler.deliveredVolume()-beforeDelivered, lostBytes)
+	b.observeHint(now, m.ref.TotalBytesAcked()-beforeDelivered, lostBytes)
 	minRttExpired := m.updateMinRtt(now, b.rttSample())
 
 	if lostBytes > 0 {
@@ -303,6 +297,28 @@ func (b *Bbr3Sender) onAckEvent(now time.Time, acked []congestion.AckedPacketInf
 	b.recalc()
 }
 
+// maxBurstPackets is the burst the sender tolerates before it considers itself
+// app-limited. It mirrors the reference sender's maxBbrBurstPackets so both
+// controllers mark app-limited phases on the same condition.
+const maxBurstPackets = 10
+
+// maybeApplimited mirrors bbrSender.maybeApplimited (bbr/bbr_sender.go): when
+// the sender is not cwnd-limited, the reference estimator is told so, and every
+// send up to the next ack of a packet sent after this call is then marked
+// app-limited. Without it, a sender that simply had nothing to send would feed
+// artificially low delivery rates into the shared estimate.
+func (b *Bbr3Sender) maybeApplimited(bytesInFlight congestion.ByteCount) {
+	cwnd := congestion.ByteCount(b.cwnd.Load())
+	if bytesInFlight >= cwnd {
+		return
+	}
+	availableBytes := cwnd - bytesInFlight
+	drainLimited := mode(b.mode.Load()) == modeDrain && bytesInFlight > cwnd/2
+	if !drainLimited || availableBytes > maxBurstPackets*b.model.maxDatagramSize {
+		b.model.ref.OnAppLimited()
+	}
+}
+
 // rttSample reads the most recent RTT the QUIC stack measured.
 func (b *Bbr3Sender) rttSample() time.Duration {
 	sample := b.rttStats.LatestRTT()
@@ -317,6 +333,9 @@ func (b *Bbr3Sender) rttSample() time.Duration {
 func (b *Bbr3Sender) maybeProbeRtt(now time.Time, roundStart, minRttExpired bool) {
 	cur := mode(b.mode.Load())
 	if cur == modeProbeRTT {
+		// PROBE_RTT deliberately empties the pipe; the reference estimator must
+		// not read the resulting low delivery rates as path capacity.
+		b.model.ref.OnAppLimited()
 		if b.probeRttExitAt.IsZero() {
 			if b.model.bytesInFlight <= b.model.probeRttTarget() {
 				b.probeRttExitAt = now.Add(b.params.ProbeRttDuration)
@@ -342,6 +361,21 @@ func (b *Bbr3Sender) maybeProbeRtt(now time.Time, roundStart, minRttExpired bool
 
 // recalc derives pacing rate and congestion window from the model, the current
 // mode, and the access hint.
+//
+// The pacer runs at the mode's pacing gain times the estimate, so CRUISE paces
+// at the estimate itself and PROBE_BW is what discovers capacity above it.
+//
+// This is the opposite of what an earlier revision of this file did, and the
+// measurement that settled it is the one the reference's convention hides: on a
+// path with NO bottleneck, goodput is just the pacing rate, so pacing at
+// congestionWindowGain (the reference's bandwidthForPacer convention) measured
+// faster (14.05 vs 11.90 MiB/s). On a path WITH a bottleneck - 4 MB/s shaper,
+// 256 KB queue, 40 ms one-way, 12 MiB upload, n=5 - that same convention
+// over-drove the link: 3.20 MiB/s at a 63.8 ms p95 with ~1130 drops, against
+// 3.44 MiB/s at 60.9 ms with ~70 drops for cruising at the estimate. Pacing
+// above the estimate cannot create bandwidth; on a real bottleneck it only fills
+// the queue, and the resulting loss costs more goodput than the extra pacing
+// buys.
 func (b *Bbr3Sender) recalc() {
 	m := b.model
 	est := b.hintEstimate(m.estimate())
@@ -352,7 +386,8 @@ func (b *Bbr3Sender) recalc() {
 		est = b.hint
 	}
 	cur := mode(b.mode.Load())
-	rate := Bandwidth(float64(est) * b.params.pacingGain(cur))
+	gain := b.params.pacingGain(cur)
+	rate := Bandwidth(float64(est) * gain)
 	if rate < b.params.MinPacingRate {
 		rate = b.params.MinPacingRate
 	}

@@ -13,7 +13,14 @@ type Params struct {
 	InitialCwndPackets int
 	MinCwndPackets     int
 
-	// Pacing and congestion-window gains.
+	// Pacing and congestion-window gains. The pacer runs at the mode's pacing
+	// gain times the estimate, so Cruise is the steady-state multiplier and must
+	// stay at 1: on a bottlenecked path (4 MB/s shaper, 256 KB queue, 40 ms
+	// one-way) cruising at 1x held ~90% utilisation with a 60.9 ms p95 and ~70
+	// drops, while pacing at CwndGain (the reference's bandwidthForPacer
+	// convention) over-drove the same bottleneck to ~1130 drops and 63.8 ms at
+	// LOWER goodput. Pacing above the estimate buys nothing on a real bottleneck;
+	// it only fills the queue.
 	HighGain     float64
 	DrainGain    float64
 	CwndGain     float64
@@ -56,21 +63,17 @@ type Params struct {
 	StrictHintCap bool
 
 	// Estimator windows.
-	MinRttFilterLen   time.Duration
-	DefaultMinRtt     time.Duration
-	MinPacingRate     Bandwidth
+	MinRttFilterLen time.Duration
+	DefaultMinRtt   time.Duration
+	MinPacingRate   Bandwidth
+	// MaxBwFilterRounds is the delivery-rate estimate's window, in packet-timed
+	// rounds, handed to the shared reference estimator (bbr.RefSampler). The
+	// reference sender sizes it as one gain cycle plus two rounds
+	// (bbr_sender.go: bandwidthWindowSize = gainCycleLength + 2). The window must
+	// span at least a full PROBE_BW probe cycle because the estimate is the
+	// windowed MAXIMUM: a shorter window forgets the probe's peak before the next
+	// probe refreshes it, and every dip then ratchets the estimate down for good.
 	MaxBwFilterRounds uint64
-	// PacketStateWindow is the packet-number SPAN, in packets, whose send
-	// records the sampler can still resolve: a record is retained while
-	// send head - packet number <= PacketStateWindow.
-	//
-	// It is not a memory of the last N packet numbers and it does not cap
-	// registration or throughput. When a send leaves the span its record is
-	// dropped - its ack can no longer be attributed to the right send time - and
-	// the slot it used becomes immediately reusable, so the next send registers
-	// normally however wide the span grows. Retained state stays bounded by
-	// PacketStateWindow + 1 slots at every span.
-	PacketStateWindow int
 }
 
 // DefaultParams returns the experimental preset. It does not enable hint
@@ -110,8 +113,7 @@ func DefaultParams() Params {
 		MinRttFilterLen:   10 * time.Second,
 		DefaultMinRtt:     100 * time.Millisecond,
 		MinPacingRate:     Bandwidth(65536),
-		MaxBwFilterRounds: 2,
-		PacketStateWindow: 4096,
+		MaxBwFilterRounds: 10,
 	}
 }
 
@@ -122,10 +124,10 @@ func (p Params) Validate() error {
 			return fmt.Errorf("bbr3: invalid %s", name)
 		}
 	}
-	if p.MinCwndPackets < 2 || p.InitialCwndPackets < p.MinCwndPackets || p.InitialCwndPackets > 10000 || p.FullBwRounds < 1 || p.FullBwRounds > 10000 || p.MinLossPackets < 1 || p.MinLossPackets > 1<<20 || p.MinLossSentPackets < 1 || p.MinLossSentPackets > 1<<20 || p.ProbeUpRounds < 1 || p.ProbeUpRounds > 16 || p.PacketStateWindow < 16 || p.PacketStateWindow > 1<<20 || p.MaxBwFilterRounds == 0 || p.MaxBwFilterRounds > 10000 {
+	if p.MinCwndPackets < 2 || p.InitialCwndPackets < p.MinCwndPackets || p.InitialCwndPackets > 10000 || p.FullBwRounds < 1 || p.FullBwRounds > 10000 || p.MinLossPackets < 1 || p.MinLossPackets > 1<<20 || p.MinLossSentPackets < 1 || p.MinLossSentPackets > 1<<20 || p.ProbeUpRounds < 1 || p.ProbeUpRounds > 16 || p.MaxBwFilterRounds == 0 || p.MaxBwFilterRounds > 10000 {
 		return fmt.Errorf("bbr3: invalid packet or round limits")
 	}
-	if p.HighGain <= 1 || p.DrainGain >= 1 || p.CwndGain < 1 || p.UpGain <= 1 || p.DownGain >= 1 || p.FullBwThreshold <= 1 || p.LossThreshold >= 1 || p.Beta >= 1 || p.LossBaselineWeight > 1 || p.LossBaselineFactor < 1 || p.MaxLossCorrection >= 1 || p.ProbeRttFraction >= 1 || p.HintProbeOvershoot < 1 || p.HintProbeOvershoot > 1.25 || p.ProbeUpGrowth > 1 {
+	if p.HighGain <= 1 || p.DrainGain >= 1 || p.CwndGain < 1 || p.UpGain <= 1 || p.DownGain >= 1 || p.CruiseGain <= 0 || p.FullBwThreshold <= 1 || p.LossThreshold >= 1 || p.Beta >= 1 || p.LossBaselineWeight > 1 || p.LossBaselineFactor < 1 || p.MaxLossCorrection >= 1 || p.ProbeRttFraction >= 1 || p.HintProbeOvershoot < 1 || p.HintProbeOvershoot > 1.25 || p.ProbeUpGrowth > 1 {
 		return fmt.Errorf("bbr3: invalid gains or fractions")
 	}
 	if p.MinRttFilterLen <= 0 || p.DefaultMinRtt <= 0 || p.ProbeRttDuration <= 0 || p.DefaultMinRtt > time.Minute || p.MinRttFilterLen > time.Hour || p.ProbeRttDuration > time.Minute || p.MinPacingRate == 0 || p.MinPacingRate > 1<<40 {

@@ -8,53 +8,44 @@ import (
 )
 
 // This file pins the DIRECTION of each documented parameter, not its value.
-// The audit's mutation matrix found that seven of eleven mutations survived the
-// existing suite (PacketStateWindow 4096->1<<20, CwndGain 2.0->3.0, Beta
-// 0.7->0.95/0.99, HintProbeOvershoot 1.25->1.01, ProbeRttDuration 200ms->20ms,
-// HighGain 2.77->1.5), because every assertion was either absent or written as
-// an equality against the current constants. Inequalities and monotonicity
-// survive a deliberate retune and still fail on an inverted mechanism.
+// The audit's mutation matrix found that several mutations survived the
+// existing suite (CwndGain 2.0->3.0, Beta 0.7->0.95/0.99, HintProbeOvershoot
+// 1.25->1.01, ProbeRttDuration 200ms->20ms, HighGain 2.77->1.5), because every
+// assertion was either absent or written as an equality against the current
+// constants. Inequalities and monotonicity survive a deliberate retune and
+// still fail on an inverted mechanism.
+//
+// The cases that pinned the local sampler's retention window (PacketStateWindow)
+// were removed with the sampler: the estimate now comes from the shared
+// reference estimator (bbr.RefSampler), whose window is MaxBwFilterRounds, and
+// the contract that matters for it is pinned by
+// TestEstimateIsTheWindowedMaximum below.
 
-// TestPacketStateWindowBoundsRetainedSamples pins that PacketStateWindow is an
-// upper bound on retained send records, and that raising it can only retain
-// more. A mutation to 1<<20 must not silently make the sampler unbounded.
-func TestPacketStateWindowBoundsRetainedSamples(t *testing.T) {
-	for _, window := range []int{16, 64, 4096} {
-		s := newSampler(window)
-		now := time.Now()
-		// Send strictly more packets than the window without acking any, so
-		// eviction is the only thing that can bound len(states).
-		for i := 0; i < window*3; i++ {
-			s.onPacketSent(now.Add(time.Duration(i)*time.Microsecond), congestion.PacketNumber(i), 1200, 0, false)
-		}
-		if got := len(s.states); got > window+1 {
-			t.Fatalf("window=%d: retained %d send records, want <= window+1 (%d)", window, got, window+1)
-		}
-		if got := len(s.states); got == 0 {
-			t.Fatalf("window=%d: sampler retained nothing, so the bound is vacuous", window)
-		}
-	}
-}
+// TestEstimateIsTheWindowedMaximum pins the contract that replaced the local
+// sampler: the delivery-rate estimate is the windowed MAXIMUM of the shared
+// reference estimator, so a dip inside the window cannot lower it. A local
+// filter short enough to forget the probe's peak before the next probe is
+// exactly the defect that made this controller pace below the reference.
+func TestEstimateIsTheWindowedMaximum(t *testing.T) {
+	m := newModel(DefaultParams(), 1200)
+	t0 := time.Unix(0, 0)
 
-// TestPacketStateWindowMonotonicity pins the direction: a larger window retains
-// at least as many records as a smaller one under the same send sequence.
-func TestPacketStateWindowMonotonicity(t *testing.T) {
-	const sends = 300
-	now := time.Now()
-	retained := func(window int) int {
-		s := newSampler(window)
-		for i := 0; i < sends; i++ {
-			s.onPacketSent(now.Add(time.Duration(i)*time.Microsecond), congestion.PacketNumber(i), 1200, 0, false)
-		}
-		return len(s.states)
+	// Packet 0: 1200 bytes acked after 1 ms -> ~9.6 Mbit/s.
+	m.ref.OnPacketSent(t0, 0, 1200, 0, true)
+	m.ref.OnCongestionEvent(t0.Add(time.Millisecond),
+		[]congestion.AckedPacketInfo{{PacketNumber: 0, BytesAcked: 1200}}, nil, 0)
+	high := m.estimate()
+	if high == 0 {
+		t.Fatal("the reference estimator produced no estimate for an acknowledged packet")
 	}
-	small := retained(32)
-	large := retained(256)
-	if large < small {
-		t.Fatalf("a larger PacketStateWindow retained fewer records: 32 -> %d, 256 -> %d", small, large)
-	}
-	if large > sends {
-		t.Fatalf("a larger PacketStateWindow retained more records than were sent: %d > %d", large, sends)
+
+	// Packet 1: 1200 bytes acked after 100 ms -> ~96 kbit/s, a deep dip well
+	// inside the window.
+	m.ref.OnPacketSent(t0.Add(2*time.Millisecond), 1, 1200, 0, true)
+	m.ref.OnCongestionEvent(t0.Add(102*time.Millisecond),
+		[]congestion.AckedPacketInfo{{PacketNumber: 1, BytesAcked: 1200}}, nil, 0)
+	if got := m.estimate(); got != high {
+		t.Fatalf("a dip inside the window lowered the estimate: %d -> %d", high, got)
 	}
 }
 
@@ -68,7 +59,7 @@ func TestCwndGainScalesTheWindow(t *testing.T) {
 		p.CwndGain = gain
 		s := NewBbr3SenderWithParams(1200, 0, p)
 		s.SetRTTStatsProvider(&fakeRTT{latest: 80 * time.Millisecond, smoothed: 80 * time.Millisecond})
-		s.model.bw.Update(10_000_000, 0)
+		seedEstimate(s.model, 10_000_000)
 		s.mode.Store(uint32(modeProbeBWCruise))
 		s.recalc()
 		return s.GetCongestionWindow()
@@ -92,20 +83,32 @@ func TestCwndGainScalesTheWindow(t *testing.T) {
 	}
 }
 
-// TestHighGainExceedsEveryOtherModeGain pins the STARTUP ramp direction: the
-// high gain must be the largest pacing gain, otherwise STARTUP cannot probe
-// faster than the steady state it is trying to leave.
-func TestHighGainExceedsEveryOtherModeGain(t *testing.T) {
+// TestPacingScheduleDirection pins the PROBE_BW schedule the pacer follows. The
+// ordering is the whole mechanism: STARTUP must out-pace everything, PROBE_UP
+// must probe above cruise (or it can never discover capacity), PROBE_DOWN must
+// drain below cruise (or it can never shed the queue a probe built), and cruise
+// must be exactly the estimate, because pacing above the estimate buys no
+// bandwidth on a bottleneck - measured, it only fills the queue (see recalc).
+func TestPacingScheduleDirection(t *testing.T) {
 	p := DefaultParams()
-	high := p.pacingGain(modeStartup)
-	for _, m := range []mode{modeDrain, modeProbeBWDown, modeProbeBWCruise, modeProbeBWRefill, modeProbeBWUp, modeProbeRTT} {
-		if got := p.pacingGain(m); got >= high {
-			t.Fatalf("HighGain (%v, mode %s = %v) is not above mode %s (%v)",
-				high, modeStartup, high, m, got)
-		}
+	startup := p.pacingGain(modeStartup)
+	up := p.pacingGain(modeProbeBWUp)
+	cruise := p.pacingGain(modeProbeBWCruise)
+	refill := p.pacingGain(modeProbeBWRefill)
+	down := p.pacingGain(modeProbeBWDown)
+	drain := p.pacingGain(modeDrain)
+
+	if cruise != 1 {
+		t.Fatalf("CruiseGain = %v, want exactly 1 so the pacer cruises at the estimate", cruise)
 	}
-	if p.DrainGain >= 1 {
-		t.Fatalf("DrainGain = %v, want below 1 so DRAIN actually drains", p.DrainGain)
+	if refill != cruise {
+		t.Fatalf("REFILL gain %v differs from CRUISE %v: they are the same phase family", refill, cruise)
+	}
+	if !(startup > up && up > cruise && cruise > down && down > 0) {
+		t.Fatalf("pacing schedule not ordered: startup=%v up=%v cruise=%v down=%v", startup, up, cruise, down)
+	}
+	if drain >= 1 {
+		t.Fatalf("DrainGain = %v, want below 1 so DRAIN actually drains", drain)
 	}
 	if p.CwndGain < 1 {
 		t.Fatalf("CwndGain = %v, want at least 1", p.CwndGain)
@@ -122,8 +125,7 @@ func TestBetaControlsTheLowerBoundDecay(t *testing.T) {
 		p.Beta = beta
 		m := newModel(p, 1200)
 		m.minRtt = 80 * time.Millisecond
-		m.bw = newRoundFilter(p.MaxBwFilterRounds)
-		m.bw.Update(10_000_000, 0)
+		seedEstimate(m, 10_000_000)
 		m.adaptLowerBounds()
 		return m.inflightLo
 	}
@@ -133,11 +135,12 @@ func TestBetaControlsTheLowerBoundDecay(t *testing.T) {
 		p.Beta = beta
 		m := newModel(p, 1200)
 		m.minRtt = 80 * time.Millisecond
+		seedEstimate(m, 10_000_000)
 		return bdpFrom(Bandwidth(float64(m.estimate())*beta), m.minRttValue())
 	}
 
 	low, mid, high := floor(0.7), floor(0.95), floor(0.99)
-	if !(low <= mid && mid <= high) {
+	if low > mid || mid > high {
 		t.Fatalf("the Beta-derived floor is not monotonic in Beta: 0.7 -> %d, 0.95 -> %d, 0.99 -> %d",
 			low, mid, high)
 	}
@@ -163,7 +166,7 @@ func TestHintProbeOvershootIsAboveOne(t *testing.T) {
 
 	const hint = 1_000_000
 	s := newTestSender(hint)
-	s.model.bw.Update(10_000_000, 0)
+	seedEstimate(s.model, 10_000_000)
 	s.model.round = 0
 	s.mode.Store(uint32(modeProbeBWUp))
 	s.recalc()
@@ -210,68 +213,5 @@ func TestProbeRttDurationIsAFloorNotAnInstant(t *testing.T) {
 	s.maybeProbeRtt(start.Add(p.ProbeRttDuration+time.Millisecond), true, false)
 	if mode(s.mode.Load()) == modeProbeRTT {
 		t.Fatal("PROBE_RTT did not advance after the dwell elapsed")
-	}
-}
-
-// TestPacketStateWindowDoesNotLowerTheEstimate pins the audit's suggested shape
-// directly: at a high BDP, raising PacketStateWindow must not make the
-// bandwidth estimate fall. The sampler's retention window is a memory bound, so
-// it must never act as a throughput ceiling.
-//
-// The sender is driven with the same realistic send/ack pipeline the other
-// tests use, because feeding the model ad hoc events leaves it app-limited and
-// starves the estimator of samples (which would make both estimates zero and
-// the comparison vacuous).
-func TestPacketStateWindowDoesNotLowerTheEstimate(t *testing.T) {
-	estimateWith := func(window int) Bandwidth {
-		p := DefaultParams()
-		p.PacketStateWindow = window
-		s := NewBbr3SenderWithParams(1200, 0, p)
-		s.SetRTTStatsProvider(&fakeRTT{latest: 80 * time.Millisecond, smoothed: 80 * time.Millisecond})
-		// A short RTT with a full pipeline per round produces a high sample
-		// rate, which is what makes the retention window observable at all.
-		drive(s, time.Now(), 40, 20*time.Millisecond)
-		return s.model.estimate()
-	}
-
-	small := estimateWith(64)
-	large := estimateWith(DefaultParams().PacketStateWindow)
-	if large == 0 {
-		t.Fatal("the default PacketStateWindow produced no estimate at all")
-	}
-	// The direction is the contract: a bigger memory bound may not lower the
-	// estimate. A tiny window legitimately produces zero samples, because a
-	// send record is evicted before its ack arrives - that is staleness, not a
-	// throughput ceiling, and it is bounded by the packet flight size rather
-	// than by the link rate.
-	if large < small {
-		t.Fatalf("raising PacketStateWindow lowered the estimate at a high BDP: 64 -> %d, default -> %d",
-			small, large)
-	}
-	if large <= small {
-		t.Logf("small window estimate=%d, default window estimate=%d (both bounded by the "+
-			"pipeline, as expected)", small, large)
-	}
-}
-
-// TestSamplerRetentionDoesNotChangeRateSamples pins the mechanism behind the
-// previous test: the sampler's per-packet rate is a function of the send record
-// alone, so the size of the retention window cannot influence it.
-func TestSamplerRetentionDoesNotChangeRateSamples(t *testing.T) {
-	now := time.Now()
-	sample := func(window int) (Bandwidth, bool) {
-		s := newSampler(window)
-		s.onPacketSent(now, 7, 1200, 0, false)
-		s.onPacketSent(now.Add(10*time.Millisecond), 8, 1200, 0, false)
-		// Acknowledge an older packet after a gap so the rate is well defined.
-		return s.onPacketAcked(now.Add(40*time.Millisecond), 7)
-	}
-	small, okSmall := sample(16)
-	large, okLarge := sample(4096)
-	if !okSmall || !okLarge {
-		t.Fatalf("sampler produced no rate sample (small ok=%v large ok=%v)", okSmall, okLarge)
-	}
-	if small != large {
-		t.Fatalf("the retention window changed the rate sample: 16 -> %d, 4096 -> %d", small, large)
 	}
 }

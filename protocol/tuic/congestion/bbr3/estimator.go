@@ -8,16 +8,23 @@ import (
 
 // estimator.go holds the delivery-rate, minimum-RTT and round accounting half of
 // the network model.
-func (m *model) estimate() Bandwidth { return m.bw.Max(m.round) }
+//
+// The delivery-rate estimate itself is not computed here: it comes from the
+// reference estimator (protocol/tuic/congestion/bbr), shared through
+// bbr.RefSampler, so this controller and bbr cannot drift apart on the single
+// measurement that decides throughput. This file only adapts that sample into
+// the model's BDP and round accounting.
+// The reference estimator reports bandwidth in bits per second (its package's
+// unit); this model works in bytes per second, so the estimate is converted
+// once, here, exactly as bbrSender.bandwidthForPacer does for the reference
+// sender itself.
+func (m *model) estimate() Bandwidth {
+	return Bandwidth(m.ref.MaxBandwidthBytesPerSecond())
+}
 
 // bdp is the bandwidth-delay product of the standing estimate.
 func (m *model) bdp() congestion.ByteCount {
 	return bdpFrom(m.estimate(), m.minRttValue())
-}
-
-// pacingInFlight is the volume a given pacing rate would keep on the path.
-func (m *model) pacingInFlight(rate Bandwidth) congestion.ByteCount {
-	return bdpFrom(rate, m.minRttValue())
 }
 
 // minRttValue substitutes a default before the first sample so BDP math never
@@ -44,21 +51,15 @@ func (m *model) updateRound(ackedPn congestion.PacketNumber) bool {
 }
 
 // onPacketSent records the send-side state a later delivery-rate sample needs.
-func (m *model) onPacketSent(sentTime time.Time, packetNumber congestion.PacketNumber, bytes, bytesInFlight congestion.ByteCount) {
+// isRetransmittable is forwarded verbatim: the reference estimator tracks the
+// last sent packet even for non-retransmittable sends, and only its byte
+// accounting is conditional on the flag.
+func (m *model) onPacketSent(sentTime time.Time, packetNumber congestion.PacketNumber, bytes, bytesInFlight congestion.ByteCount, isRetransmittable bool) {
 	m.lastSent = packetNumber
-	m.roundBytesSent += bytes
-	m.sampler.onPacketSent(sentTime, packetNumber, bytes, bytesInFlight, m.appLimited)
-}
-
-// accountEvent folds one ack/loss event into the round counters and returns
-// whether this event started a new round. The completed round is snapshotted
-// after the event's bytes are counted, then the counters restart; resetting
-// before accounting would discard sends that already belong to the new round.
-func (m *model) updateBandwidth(sample Bandwidth) {
-	if m.appLimited || sample == 0 {
-		return
+	if isRetransmittable {
+		m.roundBytesSent += bytes
 	}
-	m.bw.Update(sample, m.round)
+	m.ref.OnPacketSent(sentTime, packetNumber, bytes, bytesInFlight, isRetransmittable)
 }
 
 // updateMinRtt refreshes the minimum RTT sample and reports whether the filter

@@ -221,28 +221,3 @@ func TestFullBandwidthTestCountsRoundsNotAckEvents(t *testing.T) {
 		t.Fatal("STARTUP latched full bandwidth inside a single round")
 	}
 }
-
-// TestBandwidthFilterWindowIsDenominatedInRounds pins the other half of the
-// claim about round counting: the filter's two-round window is two *rounds*, so
-// its memory is worth two packet-timed round trips. A sample taken in round n is
-// still visible in rounds n+1 and n+2 and is dropped at n+3; two rounds of
-// non-growth is what the filter is specified to remember.
-func TestBandwidthFilterWindowIsDenominatedInRounds(t *testing.T) {
-	f := newRoundFilter(2)
-	f.Update(1000, 0)
-	f.Update(2000, 1)
-	f.Update(3000, 2)
-
-	if got := f.Max(2); got != 3000 {
-		t.Fatalf("Max(2) = %d, want 3000", got)
-	}
-	if got := f.Max(3); got != 3000 {
-		t.Fatalf("Max(3) = %d, want 3000: round 2's sample is still inside the 2-round window", got)
-	}
-	if got := f.Max(4); got != 3000 {
-		t.Fatalf("Max(4) = %d, want 3000: only the round-2 sample is still inside the window", got)
-	}
-	if got := f.Max(5); got != 0 {
-		t.Fatalf("Max(5) = %d, want 0: every sample is older than two rounds", got)
-	}
-}

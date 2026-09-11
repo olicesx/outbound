@@ -7,14 +7,17 @@ func TestDefaultParamsAreSane(t *testing.T) {
 	if p.HighGain <= 1 {
 		t.Fatalf("HighGain = %v, want > 1", p.HighGain)
 	}
-	if p.DrainGain <= 0 || p.DrainGain >= 1 {
-		t.Fatalf("DrainGain = %v, want in (0,1)", p.DrainGain)
-	}
 	if p.CwndGain < 1 {
 		t.Fatalf("CwndGain = %v, want >= 1", p.CwndGain)
 	}
+	if p.DrainGain <= 0 || p.DrainGain >= 1 {
+		t.Fatalf("DrainGain = %v, want in (0,1)", p.DrainGain)
+	}
 	if p.UpGain <= 1 || p.DownGain >= 1 {
 		t.Fatalf("probe gains out of order: up=%v down=%v", p.UpGain, p.DownGain)
+	}
+	if p.CruiseGain != 1 {
+		t.Fatalf("CruiseGain = %v, want exactly 1: the pacer cruises at the estimate", p.CruiseGain)
 	}
 	if p.FullBwThreshold <= 1 {
 		t.Fatalf("FullBwThreshold = %v, want > 1", p.FullBwThreshold)

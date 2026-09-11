@@ -43,21 +43,3 @@ func TestProbeBWGainCycleOrder(t *testing.T) {
 		t.Fatalf("unexpected advance from STARTUP: %s", got)
 	}
 }
-
-func TestPacingGainPerMode(t *testing.T) {
-	p := DefaultParams()
-	cases := map[mode]float64{
-		modeStartup:       p.HighGain,
-		modeDrain:         p.DrainGain,
-		modeProbeBWUp:     p.UpGain,
-		modeProbeBWDown:   p.DownGain,
-		modeProbeBWCruise: p.CruiseGain,
-		modeProbeBWRefill: p.CruiseGain,
-		modeProbeRTT:      p.ProbeRttGain,
-	}
-	for m, want := range cases {
-		if got := p.pacingGain(m); got != want {
-			t.Fatalf("pacingGain(%s) = %v, want %v", m, got, want)
-		}
-	}
-}

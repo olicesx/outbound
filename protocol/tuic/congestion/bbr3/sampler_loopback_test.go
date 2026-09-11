@@ -1,24 +1,20 @@
 package bbr3_test
 
-// sampler_loopback_test.go closes the gap the sampler's unit tests leave. They
-// feed synthetic ack vectors and inspect the sampler's own bookkeeping, so no
-// matter what they assert they never put a packet-number span wider than
-// PacketStateWindow through the real sending stack - which is how the
-// registration lockout shipped.
+// sampler_loopback_test.go drives the production upload path end to end instead
+// of feeding synthetic ack vectors: a real quic-go connection on loopback
+// through a one-way delay, with congestion.UseBbr3 installed on the live
+// connection after OpenStreamSync, exactly as the hysteria2 client installs it,
+// and a client that writes 24 MiB. The controller has to move all of it.
 //
-// This test drives the production upload path instead: a real quic-go connection
-// on loopback through a one-way delay, with congestion.UseBbr3 installed on the
-// live connection after OpenStreamSync, exactly as the hysteria2 client installs
-// it, and a client that writes 24 MiB. The controller has to move all of it.
-//
-// The delay matters. Without it the loopback RTT is microseconds and the
-// in-flight span stays far below the sampler window, so the lockout is only a
-// slow crawl - measured, the unfixed sender still finished 16 MiB in 14.4 s.
-// With a 50 ms one-way delay the unfixed sender is a hard fixed point: it
-// stopped at 14.8 MiB after 60 s at 48.9 KB/s (the cwnd=5120 / pacing=65536
-// floor), which is the user-visible "upload freezes". A healthy controller
-// moves 24 MiB over the same path in a couple of seconds, so completion inside
-// the deadline separates the two by an order of magnitude in both directions.
+// The history matters here. This test was written as the regression guard for a
+// local sampler that permanently stopped registering sends once the send head
+// passed its ring; that sampler has since been replaced by the shared reference
+// estimator (bbr.RefSampler), which is what the unit tests could never see
+// because they inspected bookkeeping rather than the sending stack. The
+// end-to-end assertion is kept as the guard that the controller sustains an
+// upload far past its own estimate window: the unfixed sender was a hard fixed
+// point at the cwnd/pacing floors (~50 KB/s), while a healthy controller moves
+// 24 MiB over the same 50 ms path in a couple of seconds.
 
 import (
 	"context"
@@ -36,7 +32,6 @@ import (
 	"time"
 
 	"github.com/daeuniverse/outbound/protocol/tuic/congestion"
-	"github.com/daeuniverse/outbound/protocol/tuic/congestion/bbr3"
 	"github.com/olicesx/quic-go"
 )
 
@@ -56,26 +51,22 @@ const (
 	maxPayloadPerPacket = 1400
 )
 
-// TestBbr3UploadPastTheSamplerWindowCompletes requires an upload whose
-// packet-number span is wider than PacketStateWindow to finish.
+// TestBbr3UploadPastTheSamplerWindowCompletes requires a full 24 MiB upload
+// through the production sender to finish. It was written as the regression
+// guard for the local sampler's registration lockout; the sampler is now the
+// shared reference estimator, and the assertion still holds as the end-to-end
+// guard that the controller can sustain an upload far past its estimate window.
 func TestBbr3UploadPastTheSamplerWindowCompletes(t *testing.T) {
-	window := bbr3.DefaultParams().PacketStateWindow
-	if packets := uploadBytes / maxPayloadPerPacket; packets <= window {
-		t.Fatalf("uploadBytes=%d carries at least %d packets, which does not exceed PacketStateWindow=%d: "+
-			"this test would no longer exercise a span wider than the sampler window",
-			uploadBytes, packets, window)
-	}
-
 	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatalf("net.ListenUDP() error = %v", err)
 	}
-	defer serverConn.Close()
+	defer func() { _ = serverConn.Close() }()
 	listener, err := quic.Listen(serverConn, serverTLSConfig(t), &quic.Config{})
 	if err != nil {
 		t.Fatalf("quic.Listen() error = %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	// The client dials the relay instead of the server, so its datagrams reach
 	// the server one way delay later.
@@ -90,7 +81,7 @@ func TestBbr3UploadPastTheSamplerWindowCompletes(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		defer conn.CloseWithError(0, "done")
+		defer func() { _ = conn.CloseWithError(0, "done") }()
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
 			serverDone <- err
@@ -118,7 +109,7 @@ func TestBbr3UploadPastTheSamplerWindowCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("quic.DialAddr() error = %v", err)
 	}
-	defer conn.CloseWithError(0, "done")
+	defer func() { _ = conn.CloseWithError(0, "done") }()
 
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
@@ -180,10 +171,10 @@ func TestBbr3UploadPastTheSamplerWindowCompletes(t *testing.T) {
 	}
 
 	elapsed := time.Since(start)
-	t.Logf("moved %d bytes in %v (%.1f MiB/s) across at least %d packet numbers with PacketStateWindow=%d",
+	t.Logf("moved %d bytes in %v (%.1f MiB/s) across at least %d packet numbers",
 		uploadBytes, elapsed.Round(time.Millisecond),
 		float64(uploadBytes)/(1<<20)/elapsed.Seconds(),
-		uploadBytes/maxPayloadPerPacket, window)
+		uploadBytes/maxPayloadPerPacket)
 }
 
 // startDelayRelay listens on a UDP socket the client can dial instead of the

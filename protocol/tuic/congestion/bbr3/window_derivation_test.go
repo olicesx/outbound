@@ -76,10 +76,9 @@ func TestAdaptLowerBoundsInvariant(t *testing.T) {
 	p := DefaultParams()
 	m := newModel(p, 1200)
 	m.minRtt = 80 * time.Millisecond
-	m.bw = newRoundFilter(p.MaxBwFilterRounds)
 
 	// Phase 1: a high, sustained estimate pulls bwLo up with it.
-	m.bw.Update(10_000_000, 0)
+	seedEstimate(m, 10_000_000)
 	for i := 0; i < 4; i++ {
 		m.adaptLowerBounds()
 	}
@@ -97,8 +96,7 @@ func TestAdaptLowerBoundsInvariant(t *testing.T) {
 	// the standing BDP of the CURRENT estimate, and the decayed bound must be
 	// what keeps it above that floor once it dominates.
 	collapsed := Bandwidth(50_000)
-	m.bw.Reset()
-	m.bw.Update(collapsed, 5)
+	setEstimate(m, collapsed)
 	m.adaptLowerBounds()
 	newEst := m.estimate()
 	floor := bdpFrom(newEst, m.minRttValue())
@@ -130,16 +128,18 @@ func TestInflightLoFloorIsLoadBearingWhenEstimateCollapses(t *testing.T) {
 	// A long RTT so BDP numbers are large and the floor is visible.
 	s.SetRTTStatsProvider(&fakeRTT{latest: 200 * time.Millisecond, smoothed: 200 * time.Millisecond})
 
-	// Establish a high bandwidth bound, then collapse the estimate so the
-	// decayed lower bound sits far above it: bwLo > 2 x estimate.
+	// Establish a high bandwidth bound, then let the estimate collapse so the
+	// decayed lower bound sits far above it: bwLo > 2 x estimate. The collapse
+	// comes from the estimator's window sliding past its peak, not from a loss
+	// event, so adaptLowerBounds is deliberately not called again: that leaves
+	// recalc's floor as the only thing holding the window up, which is exactly
+	// the branch this test exists to exercise.
 	s.model.minRtt = 200 * time.Millisecond
-	s.model.bw.Update(20_000_000, 0)
+	seedEstimate(s.model, 20_000_000)
 	for i := 0; i < 4; i++ {
 		s.model.adaptLowerBounds()
 	}
-	s.model.bw.Reset()
-	s.model.bw.Update(1_000_000, 5)
-	s.model.adaptLowerBounds()
+	setEstimate(s.model, 1_000_000)
 
 	if s.model.bwLo <= 2*s.model.estimate() {
 		t.Fatalf("precondition not met: bwLo=%d estimate=%d", s.model.bwLo, s.model.estimate())
@@ -186,8 +186,7 @@ func TestInflightLoFloorBetaSensitivity(t *testing.T) {
 		p.Beta = beta
 		m := newModel(p, 1200)
 		m.minRtt = 20 * time.Millisecond
-		m.bw = newRoundFilter(p.MaxBwFilterRounds)
-		m.bw.Update(10_000_000, 0)
+		seedEstimate(m, 10_000_000)
 		m.adaptLowerBounds()
 		return m.inflightLo, bdpFrom(Bandwidth(float64(m.estimate())*beta), m.minRttValue())
 	}
@@ -206,8 +205,7 @@ func TestInflightLoFloorBetaSensitivity(t *testing.T) {
 		p := DefaultParams()
 		m := newModel(p, 1200)
 		m.minRtt = 20 * time.Millisecond
-		m.bw = newRoundFilter(p.MaxBwFilterRounds)
-		m.bw.Update(10_000_000, 0)
+		seedEstimate(m, 10_000_000)
 		return bdpFrom(m.estimate(), m.minRttValue())
 	}()
 	minCwnd := congestion.ByteCount(DefaultParams().MinCwndPackets) * 1200

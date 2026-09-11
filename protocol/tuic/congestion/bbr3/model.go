@@ -3,6 +3,7 @@ package bbr3
 import (
 	"time"
 
+	"github.com/daeuniverse/outbound/protocol/tuic/congestion/bbr"
 	"github.com/olicesx/quic-go/congestion"
 )
 
@@ -10,7 +11,7 @@ import (
 // It owns no policy about modes; the sender reads it and decides.
 type model struct {
 	params          Params
-	sampler         *sampler
+	ref             *bbr.RefSampler
 	maxDatagramSize congestion.ByteCount
 	initialCwnd     congestion.ByteCount
 	minCwnd         congestion.ByteCount
@@ -21,10 +22,8 @@ type model struct {
 	lastSent congestion.PacketNumber
 
 	bytesInFlight congestion.ByteCount
-	appLimited    bool
 
-	// Delivery-rate estimate and its loss-driven lower bound.
-	bw   *roundFilter
+	// Loss-driven lower bound on the delivery-rate estimate.
 	bwLo Bandwidth
 
 	// inflight_hi / inflight_lo: the upper and lower bounds the sender keeps on
@@ -69,8 +68,7 @@ func newModel(params Params, maxDatagramSize congestion.ByteCount) *model {
 		minCwnd:         congestion.ByteCount(params.MinCwndPackets) * maxDatagramSize,
 		roundEnd:        -1,
 		lastSent:        -1,
-		bw:              newRoundFilter(params.MaxBwFilterRounds),
-		sampler:         newSampler(params.PacketStateWindow),
+		ref:             bbr.NewRefSampler(params.MaxBwFilterRounds),
 	}
 }
 

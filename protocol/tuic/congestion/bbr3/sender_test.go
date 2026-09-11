@@ -10,7 +10,7 @@ import (
 func TestAccessHintCapsSteadyStatePacingAndWindow(t *testing.T) {
 	const hint = 1_000_000 // bytes per second
 	s := newTestSender(hint)
-	s.model.bw.Update(10_000_000, 0) // path estimate far above the access link
+	seedEstimate(s.model, 10_000_000) // path estimate far above the access link
 	s.model.round = 0
 	s.mode.Store(uint32(modeProbeBWCruise))
 	s.recalc()
@@ -27,7 +27,7 @@ func TestAccessHintCapsSteadyStatePacingAndWindow(t *testing.T) {
 func TestAccessHintAllowsBoundedProbeOvershoot(t *testing.T) {
 	const hint = 1_000_000
 	s := newTestSender(hint)
-	s.model.bw.Update(10_000_000, 0)
+	seedEstimate(s.model, 10_000_000)
 	s.model.round = 0
 
 	// A probe may exceed the hint, but only by the configured factor: otherwise
@@ -51,7 +51,7 @@ func TestAccessHintAllowsBoundedProbeOvershoot(t *testing.T) {
 
 func TestNoHintDoesNotCapPacing(t *testing.T) {
 	s := newTestSender(0)
-	s.model.bw.Update(10_000_000, 0)
+	seedEstimate(s.model, 10_000_000)
 	s.model.round = 0
 	s.recalc()
 

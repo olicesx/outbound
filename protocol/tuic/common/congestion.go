@@ -48,21 +48,39 @@ var supportedCongestionControllers = map[string]struct{}{
 }
 
 // DefaultCongestionController is installed when a link carries no explicit
-// cc_override. bbr3 is the experimental default under active evaluation; set
+// cc_override and no fixed rate to send at. bbr3 is the experimental probe; set
 // cc_override=bbr on a link to restore the previous stable default.
 const DefaultCongestionController = "bbr3"
 
+// FixedRateCongestionController is installed instead of the default when the
+// negotiation actually supplies a rate to send at.
+const FixedRateCongestionController = "brutal"
+
 // SelectCongestionController resolves the congestion controller to install.
+//
 // serverCC is the value echoed by the server during the handshake; override is
 // the optional client-local cc_override value, already normalized (lowercased
-// and trimmed) by the link parser. An empty override selects
-// DefaultCongestionController (bbr3): the experiment runs by default on every
-// QUIC-protocol link, while an explicit override still wins — including
-// cc_override=bbr to restore the previous default. A non-empty override must
-// be in the allowlist, otherwise an error is returned so a typo fails fast
-// instead of being silently downgraded to BBR.
-func SelectCongestionController(serverCC, override string) (string, error) {
+// and trimmed) by the link parser; brutalTarget is the fixed rate in bytes per
+// second the link declared (protocol.Header.Feature2), zero when unset.
+//
+// An empty override chooses between the two measured regimes:
+//
+//   - The server negotiated brutal AND a target rate exists: brutal. A
+//     fixed-rate sender paces exactly at the declared rate, which on a
+//     bottlenecked path (4 MB/s shaper, 256 KB queue, 40 ms one-way, 12 MiB,
+//     n=5) delivered 3.82 MiB/s at a 19.9 ms p95; the probing default managed
+//     3.31 MiB/s at 61.0 ms, and the BBR this table used to fall back to 2.99
+//     MiB/s at 63.8 ms with ~17x the packet loss.
+//   - Anything else: DefaultCongestionController, which measured better than
+//     that BBR whenever no rate is known.
+//
+// A non-empty override still wins, and must be in the allowlist, otherwise an
+// error is returned so a typo fails fast instead of being silently downgraded.
+func SelectCongestionController(serverCC, override string, brutalTarget uint64) (string, error) {
 	if override == "" {
+		if serverCC == FixedRateCongestionController && brutalTarget > 0 {
+			return FixedRateCongestionController, nil
+		}
 		return DefaultCongestionController, nil
 	}
 	if _, ok := supportedCongestionControllers[override]; !ok {

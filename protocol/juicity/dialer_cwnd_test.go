@@ -29,7 +29,7 @@ func TestNewDialerWiresCWNDFromFeature2(t *testing.T) {
 	if cli.CWND != 80000000 {
 		t.Fatalf("CWND = %d, want 80000000", cli.CWND)
 	}
-	if cli.CongestionController != "bbr3" {
-		t.Fatalf("CongestionController = %q, want bbr3 (default; Feature2 CWND is the hint)", cli.CongestionController)
+	if cli.CongestionController != "brutal" {
+		t.Fatalf("CongestionController = %q, want brutal (negotiated brutal with a declared rate)", cli.CongestionController)
 	}
 }

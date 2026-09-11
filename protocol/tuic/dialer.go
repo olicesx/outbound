@@ -43,14 +43,15 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	// stay for API compatibility.
 	udpRelayMode := common.NATIVE
 	// cwnd doubles as the brutal congestion controller's target bandwidth
-	// (bytes per second) when congestion_control=brutal; 0 lets the
-	// controller fall back to BBR.
+	// (bytes per second) when congestion_control=brutal, and is what selects it
+	// when the server negotiated brutal and the link declared a rate; 0 means no
+	// rate is known, so the probing default is installed.
 	cwnd := common.CWNDFromFeature(header.Feature2)
 	// Feature1 is the congestion controller echoed by the server. A non-string
 	// value (a caller mistake) must degrade instead of panicking; the override,
 	// when present, takes precedence over whatever the server echoed.
 	serverCC, _ := header.Feature1.(string)
-	cc, err := common.SelectCongestionController(serverCC, header.CongestionOverride)
+	cc, err := common.SelectCongestionController(serverCC, header.CongestionOverride, cwnd)
 	if err != nil {
 		return nil, err
 	}

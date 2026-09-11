@@ -38,15 +38,21 @@ func ValidateCongestionOverride(override string) error {
 // table is unit-testable without a QUIC connection.
 //
 // override is the normalized (lowercased, trimmed) cc_override value. An empty
-// override installs defaultCongestionController (bbr3) — the experimental
-// default — ignoring the historical server-driven table entirely:
+// override chooses between the two measured regimes:
 //
-//   - rxAuto: previously BBR, now bbr3 (serverRx is irrelevant to the sender);
-//   - otherwise the min(serverRx, clientTx) Brutal target is computed and
-//     handed to bbr3 as its access-link ceiling hint, so the bandwidth fields
-//     still bound pacing and inflight.
+//   - rxAuto: the server asked for bandwidth detection, so a fixed-rate sender
+//     would ignore that request; use defaultCongestionController and keep a
+//     declared clientTx as its access-link ceiling (a hint caps, it is never a
+//     target, so it cannot distort the detection the server asked for).
+//   - otherwise min(serverRx, clientTx) is the rate the link declared. When it
+//     is positive, install Brutal at exactly that rate: on a bottlenecked path
+//     (4 MB/s shaper, 256 KB queue, 40 ms one-way, 12 MiB, n=5) the fixed-rate
+//     sender delivered 3.82 MiB/s at a 19.9 ms p95, against 3.31 MiB/s at
+//     61.0 ms for the probing default and 2.99 MiB/s at 63.8 ms with ~17x the
+//     packet loss for the BBR this table used to fall back to. When it is zero
+//     no rate is known, and the probing default measured better than that BBR.
 //
-// A non-empty override keeps the historical semantics:
+// A non-empty override keeps its own semantics:
 //
 //   - bbr forces BBR and reports no target;
 //   - brutal runs the same min(serverRx, clientTx) computation and keeps the
@@ -62,8 +68,13 @@ func resolveCongestion(override string, rxAuto bool, serverRx, clientTx uint64) 
 		return "", 0, err
 	}
 	if override == "" {
-		_, tx := brutalTarget(serverRx, clientTx)
-		return defaultCongestionController, tx, nil
+		if rxAuto {
+			return defaultCongestionController, clientTx, nil
+		}
+		if name, tx := brutalTarget(serverRx, clientTx); name == ccBrutal {
+			return name, tx, nil
+		}
+		return defaultCongestionController, 0, nil
 	}
 	switch override {
 	case ccBbr3:

@@ -30,11 +30,12 @@ func TestSelectCongestionController(t *testing.T) {
 		name     string
 		serverCC string
 		override string
+		target   uint64
 		want     string
 		wantErr  bool
 	}{
 		{
-			name:     "empty override selects the default (bbr3), ignoring server value",
+			name:     "empty override selects the default (bbr3) when the server negotiated bbr",
 			serverCC: "bbr",
 			override: "",
 			want:     "bbr3",
@@ -44,6 +45,36 @@ func TestSelectCongestionController(t *testing.T) {
 			serverCC: "",
 			override: "",
 			want:     "bbr3",
+		},
+		{
+			// The one case where the fixed-rate sender beats every prober on both
+			// throughput and latency: the link declared a rate to send at.
+			name:     "negotiated brutal with a declared rate selects the fixed-rate sender",
+			serverCC: "brutal",
+			override: "",
+			target:   4 << 20,
+			want:     "brutal",
+		},
+		{
+			name:     "negotiated brutal without a rate falls back to the default",
+			serverCC: "brutal",
+			override: "",
+			target:   0,
+			want:     "bbr3",
+		},
+		{
+			name:     "a declared rate alone does not select brutal when the server did not negotiate it",
+			serverCC: "bbr",
+			override: "",
+			target:   4 << 20,
+			want:     "bbr3",
+		},
+		{
+			name:     "override wins over the negotiated brutal",
+			serverCC: "brutal",
+			override: "bbr",
+			target:   4 << 20,
+			want:     "bbr",
 		},
 		{
 			name:     "override wins over server value",
@@ -93,7 +124,7 @@ func TestSelectCongestionController(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := SelectCongestionController(tc.serverCC, tc.override)
+			got, err := SelectCongestionController(tc.serverCC, tc.override, tc.target)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("SelectCongestionController(%q, %q) = %q, want error",

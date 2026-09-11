@@ -13,12 +13,27 @@ func TestNewDialerWiresCongestionOverride(t *testing.T) {
 	cases := []struct {
 		name     string
 		serverCC string
+		target   uint64
 		override string
 		want     string
 	}{
 		{
-			name:     "no override selects the default (bbr3), ignoring server value",
+			name:     "no override selects the default (bbr3) when no rate is known",
 			serverCC: "cubic",
+			override: "",
+			want:     "bbr3",
+		},
+		{
+			name:     "negotiated brutal with a declared rate selects the fixed-rate sender",
+			serverCC: "brutal",
+			target:   80000000,
+			override: "",
+			want:     "brutal",
+		},
+		{
+			name:     "negotiated brutal without a rate falls back to the default",
+			serverCC: "brutal",
+			target:   0,
 			override: "",
 			want:     "bbr3",
 		},
@@ -35,7 +50,7 @@ func TestNewDialerWiresCongestionOverride(t *testing.T) {
 			d, err := NewDialer(direct.SymmetricDirect, protocol.Header{
 				ProxyAddress: "127.0.0.1:443",
 				Feature1:     tc.serverCC,
-				Feature2:     0,
+				Feature2:     tc.target,
 				TlsConfig: &tls.Config{
 					NextProtos: []string{"h3"},
 					MinVersion: tls.VersionTLS13,

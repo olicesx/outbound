@@ -2,10 +2,12 @@ package client
 
 import "testing"
 
-// TestResolveCongestion pins the whole decision table, including the
-// default-on behavior: an empty override now selects bbr3 (the experimental
-// default), with the historical min(serverRx, clientTx) value kept as its
-// access-link ceiling hint.
+// TestResolveCongestion pins the whole decision table. An empty override now
+// splits on whether the link actually declared a rate to send at: a positive
+// min(serverRx, clientTx) installs the fixed-rate sender at exactly that rate
+// (measured best on both throughput and latency on a bottlenecked path), while
+// everything else - including the rxAuto case where the server asked for
+// bandwidth detection - installs the probing default.
 func TestResolveCongestion(t *testing.T) {
 	const (
 		mbps5  = uint64(5_000_000)
@@ -23,40 +25,45 @@ func TestResolveCongestion(t *testing.T) {
 		wantErr  bool
 	}{
 		{
-			name:     "empty override with RxAuto uses bbr3 with min-target hint",
+			// The server asked for detection, so a fixed rate would ignore the
+			// request; serverRx is not meaningful here and a declared clientTx
+			// only caps the prober.
+			name:     "empty override with RxAuto probes and caps at clientTx",
 			rxAuto:   true,
 			serverRx: mbps5,
 			clientTx: mbps10,
 			wantName: ccBbr3,
-			wantTx:   mbps5,
+			wantTx:   mbps10,
 		},
 		{
-			name:     "empty override without RxAuto uses bbr3 with server limit hint",
+			name:     "empty override with a server limit sends at the fixed rate",
 			serverRx: mbps5,
 			clientTx: mbps10,
-			wantName: ccBbr3,
+			wantName: ccBrutal,
 			wantTx:   mbps5,
 		},
 		{
-			name:     "empty override without RxAuto hints at clientTx cap",
+			name:     "empty override caps the fixed rate at clientTx",
 			serverRx: mbps20,
 			clientTx: mbps10,
-			wantName: ccBbr3,
+			wantName: ccBrutal,
 			wantTx:   mbps10,
 		},
 		{
-			name:     "empty override without server limit hints at clientTx",
+			name:     "empty override with only a client rate sends at the fixed rate",
 			serverRx: 0,
 			clientTx: mbps10,
-			wantName: ccBbr3,
+			wantName: ccBrutal,
 			wantTx:   mbps10,
 		},
 		{
-			name:     "empty override without any bandwidth uses bbr3 purely probing",
+			name:     "empty override without any bandwidth probes purely",
 			wantName: ccBbr3,
 			wantTx:   0,
 		},
 		{
+			// clientTx is the hard cap on the historical computation, so a server
+			// limit alone does not produce a rate to send at.
 			name:     "empty override ignores server limit when clientTx is unset",
 			serverRx: mbps5,
 			clientTx: 0,

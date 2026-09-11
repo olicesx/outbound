@@ -46,7 +46,10 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	// value (a caller mistake) must degrade instead of panicking; the override,
 	// when present, takes precedence over whatever the server echoed.
 	serverCC, _ := header.Feature1.(string)
-	cc, err := common.SelectCongestionController(serverCC, header.CongestionOverride)
+	// The declared fixed rate selects the brutal sender when the server
+	// negotiated brutal; 0 means no rate is known and the probing default runs.
+	brutalTarget := common.CWNDFromFeature(header.Feature2)
+	cc, err := common.SelectCongestionController(serverCC, header.CongestionOverride, brutalTarget)
 	if err != nil {
 		return nil, err
 	}

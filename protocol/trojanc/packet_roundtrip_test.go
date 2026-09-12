@@ -2,6 +2,8 @@ package trojanc
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"net/netip"
 	"testing"
@@ -187,3 +189,62 @@ func (c *bufferConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *bufferConn) SetWriteDeadline(time.Time) error { return nil }
 
 var _ netproxy.Conn = (*bufferConn)(nil)
+
+// TestPacketConnReadFromKeepsFramingWhenResolutionFails pins the read ordering
+// that makes an unresolvable peer address survivable. The datagram body must be
+// consumed before the resolution can fail: otherwise the next read starts inside
+// the previous payload, and a caller that drops one datagram -- exactly what the
+// ErrDomainResolution sentinel exists to let it do -- would silently desync the
+// session. The read loop is per association, so that desync would corrupt every
+// destination sharing it.
+func TestPacketConnReadFromKeepsFramingWhenResolutionFails(t *testing.T) {
+	protocol.SetDatapathResolver(func(context.Context, string) (netip.Addr, error) {
+		return netip.Addr{}, errors.New("test resolver: no answer")
+	})
+	t.Cleanup(func() { protocol.SetDatapathResolver(nil) })
+
+	badMD := Metadata{
+		Metadata: protocol.Metadata{Type: protocol.MetadataTypeDomain, Hostname: "unresolvable.invalid", Port: 53},
+		Network:  "udp",
+	}
+	goodMD := Metadata{
+		Metadata: protocol.Metadata{
+			Type:     protocol.MetadataTypeIPv4,
+			Hostname: "192.0.2.8",
+			Port:     53,
+			IP:       netip.MustParseAddr("192.0.2.8"),
+		},
+		Network: "udp",
+	}
+	const dropped, kept = "dropped-payload", "kept-payload"
+	raw := &bytes.Buffer{}
+	bad := make([]byte, badMD.Len()+4+len(dropped))
+	SealUDP(badMD, bad, []byte(dropped))
+	good := make([]byte, goodMD.Len()+4+len(kept))
+	SealUDP(goodMD, good, []byte(kept))
+	raw.Write(bad)
+	raw.Write(good)
+
+	rawConn := &Conn{
+		Conn:     &bufferConn{Buffer: raw},
+		metadata: Metadata{Metadata: protocol.Metadata{IsClient: true}, Network: "udp"},
+	}
+	rawConn.onceWrite.Store(true)
+	pc := &PacketConn{Conn: rawConn}
+
+	buf := make([]byte, 64)
+	if _, _, err := pc.ReadFrom(buf); !errors.Is(err, protocol.ErrDomainResolution) {
+		t.Fatalf("first ReadFrom err = %v, want it to wrap ErrDomainResolution", err)
+	}
+
+	n, addr, err := pc.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("second ReadFrom: %v (the failed resolution desynced the stream)", err)
+	}
+	if string(buf[:n]) != kept {
+		t.Fatalf("second payload = %q, want %q", buf[:n], kept)
+	}
+	if addr.String() != "192.0.2.8:53" {
+		t.Fatalf("second addr = %s, want 192.0.2.8:53", addr)
+	}
+}

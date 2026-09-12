@@ -106,16 +106,23 @@ func (r *RefSampler) OnCongestionEvent(
 		infBandwidth,
 		round,
 	)
-	// Drop the send records this event made obsolete. This is the maintenance
-	// obligation of the connection-state map, and it lives here rather than at
-	// each call site because a call site can forget it: bbr3 did, and retained
-	// one 136-byte record per retransmittable send for the life of the
-	// connection (measured: 524,288 records = 71.3 MiB on a single hysteria2
-	// connection, 85.7% of the live heap). A consumer of this adapter now gets
-	// the reclamation whether it asks for it or not.
-	if leastUnacked := leastUnacked(ackedPackets, lostPackets); leastUnacked != invalidPacketNumber {
-		r.sampler.RemoveObsoletePackets(leastUnacked)
-	}
+	// Reclamation is NOT driven from this event vector. Estimating the
+	// first-outstanding packet number as "highest ack minus the reorder margin",
+	// the reference sender's rule (bbr_sender.go:487-492), deletes records for
+	// packets that are still outstanding whenever the ack frontier sits more
+	// than that margin ahead of a hole; onPacketAcknowledged then skips those
+	// packets' delivered bytes (bandwidth_sampler.go:781-784), so a reordering
+	// or spurious-loss recovery under-counts delivery and depresses the
+	// estimate. Measured with that trim in place, on a lossy path: 1.50 GB
+	// delivered against 2.39 GB, max bandwidth 487 KB/s against 1.19 MB/s, cwnd
+	// 78 KB against 191 KB.
+	//
+	// The sampler reclaims by consumption instead. A record is marked when its
+	// packet is acked or declared lost, and the queue drops the consumed front
+	// (bandwidthSampler.reclaimConsumed), so a record for an outstanding packet
+	// is never dropped and the map follows the outstanding window rather than
+	// its high-water mark. maxConnectionStateMapSlots stays as the backstop for
+	// a caller that stops feeding acks at all.
 	if r.sampler.TotalBytesAcked() != totalAckedBefore {
 		if !event.sampleIsAppLimited || event.sampleMaxBandwidth > r.maxBandwidth.GetBest() {
 			r.maxBandwidth.Update(event.sampleMaxBandwidth, round)
@@ -128,41 +135,6 @@ func (r *RefSampler) OnCongestionEvent(
 		ExtraAcked: event.extraAcked,
 		Sample:     event.sampleMaxBandwidth,
 	}
-}
-
-// leastUnacked is the first packet number whose send record can still produce a
-// sample, i.e. the trim point for the connection-state map. The true
-// first-outstanding number is not carried through OnCongestionEventEx, so it is
-// estimated from the event vector the same way the reference sender estimates
-// it (bbr_sender.go:487-492). Fast retransmission declares a packet lost once
-// it falls `packetThreshold` (3) behind the largest ack, so the two-packet
-// margin is already conservative; trimming further would drop records for
-// packets that are still in flight, and onPacketAcknowledged skips the
-// delivered-byte accounting when a record is missing, so an over-aggressive
-// trim would under-count delivery and depress the bandwidth estimate.
-//
-// The highest packet number of the vector is used rather than its last element:
-// the vector's ordering is not part of the interface.
-func leastUnacked(ackedPackets []congestion.AckedPacketInfo, lostPackets []congestion.LostPacketInfo) congestion.PacketNumber {
-	if len(ackedPackets) > 0 {
-		highest := ackedPackets[0].PacketNumber
-		for _, p := range ackedPackets[1:] {
-			if p.PacketNumber > highest {
-				highest = p.PacketNumber
-			}
-		}
-		return highest - 2
-	}
-	if len(lostPackets) > 0 {
-		highest := lostPackets[0].PacketNumber
-		for _, p := range lostPackets[1:] {
-			if p.PacketNumber > highest {
-				highest = p.PacketNumber
-			}
-		}
-		return highest + 1
-	}
-	return invalidPacketNumber
 }
 
 // MaxBandwidth reports the current windowed maximum delivery rate, in bits per
@@ -190,16 +162,20 @@ func (r *RefSampler) TotalBytesLost() congestion.ByteCount { return r.sampler.To
 // samples (bandwidth_sampler.go:406-410).
 func (r *RefSampler) OnAppLimited() { r.sampler.OnAppLimited() }
 
-// RemoveObsoletePackets drops send records below leastUnacked. OnCongestionEvent
-// already trims, so this is only needed by a caller that knows the true
-// first-outstanding packet number and wants a tighter bound.
+// RemoveObsoletePackets drops send records below leastUnacked.
+//
+// The map bounds itself (see OnCongestionEvent), so this is only for a caller
+// that knows the true first-outstanding packet number and wants a tighter
+// bound. Do not pass an estimate: dropping a record for a packet that is still
+// outstanding makes onPacketAcknowledged skip that packet's delivered bytes,
+// which under-counts delivery and depresses the bandwidth estimate.
 func (r *RefSampler) RemoveObsoletePackets(leastUnacked congestion.PacketNumber) {
 	r.sampler.RemoveObsoletePackets(leastUnacked)
 }
 
 // EntrySlotsUsed reports how many send records the connection-state map holds.
-// It should track the in-flight window: a value that grows with the number of
-// packets ever sent means the trim has stopped happening.
+// It should track the outstanding window: a value that grows with the number of
+// packets ever sent means reclamation has stopped happening.
 func (r *RefSampler) EntrySlotsUsed() int {
 	return r.sampler.connectionStateMap.EntrySlotsUsed()
 }
@@ -208,6 +184,13 @@ func (r *RefSampler) EntrySlotsUsed() int {
 // memory footprint divided by the record size.
 func (r *RefSampler) EntrySlotsCapacity() int {
 	return r.sampler.connectionStateMap.EntrySlotsCapacity()
+}
+
+// EntrySlotsBudget reports the hard slot budget the map enforces on itself when
+// reclamation stops happening. Retention should sit near the outstanding
+// window, far below this.
+func (r *RefSampler) EntrySlotsBudget() int {
+	return r.sampler.connectionStateMap.Budget()
 }
 
 // TruncatedRecords reports how many records the map's hard slot budget has

@@ -162,6 +162,38 @@ func (p *packetNumberIndexedQueue[T]) dropFront(n int) {
 	}
 }
 
+// DropConsumedFront pops the front of the queue while it holds nothing that is
+// still needed: absent slots hold no record at all, and a present slot is
+// dropped only when isConsumed reports it. It stops at the first record that is
+// still live, so a record for an outstanding packet always survives and its
+// later ack or loss still finds it.
+//
+// This is not the budget backstop: what it drops has already been consumed, so
+// it does not count as truncation. It is what lets the queue's size follow the
+// outstanding window instead of its high-water mark.
+func (p *packetNumberIndexedQueue[T]) DropConsumedFront(isConsumed func(*T) bool) (n int) {
+	for !p.entries.Empty() {
+		ew := p.entries.Front()
+		if ew == nil {
+			break
+		}
+		if ew.present {
+			if !isConsumed(&ew.entry) {
+				break
+			}
+			p.numberOfPresentEntries--
+		}
+		p.entries.PopFront()
+		p.firstPacket++
+		n++
+	}
+	if p.entries.Empty() {
+		p.firstPacket = invalidPacketNumber
+	}
+	p.reclaim()
+	return n
+}
+
 // restart drops every record and re-anchors the queue at packetNumber. The
 // discarded records are counted so a missing trim shows up as telemetry instead
 // of as an out-of-memory kill. The caller pushes the new entry and owns
@@ -242,6 +274,12 @@ func (p *packetNumberIndexedQueue[T]) EntrySlotsUsed() int {
 // not EntrySlotsUsed, is the queue's memory footprint.
 func (p *packetNumberIndexedQueue[T]) EntrySlotsCapacity() int {
 	return p.entries.Cap()
+}
+
+// Budget returns the hard slot budget, the cap the queue enforces on itself
+// when a caller stops reclaiming.
+func (p *packetNumberIndexedQueue[T]) Budget() int {
+	return p.maxSlots
 }
 
 // TruncatedSlots returns how many records the slot budget has discarded over

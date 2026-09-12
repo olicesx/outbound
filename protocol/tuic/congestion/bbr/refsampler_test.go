@@ -76,22 +76,63 @@ func TestRefSamplerTrimKeepsDeliveredAccounting(t *testing.T) {
 	}
 }
 
-// TestRefSamplerTrimUsesTheReorderMarginForLossOnlyEvents covers the loss-only
-// branch of the trim point: the reference rule is the highest lost packet plus
-// one, so the lost packets' own records are released and nothing newer is.
-func TestRefSamplerTrimUsesTheReorderMarginForLossOnlyEvents(t *testing.T) {
+// TestRefSamplerReclaimsOnlyConsumedRecords pins both halves of the reclamation
+// rule: a record whose packet has been acked or lost gives its slot back, and a
+// record whose packet is still outstanding is never passed over even when the
+// records ahead of it are gone.
+func TestRefSamplerReclaimsOnlyConsumedRecords(t *testing.T) {
+	const packets = 10
+	s := NewRefSampler(10)
+	now := time.Now()
+	for pn := congestion.PacketNumber(1); pn <= packets; pn++ {
+		s.OnPacketSent(now, pn, 1200, packets*1200, true)
+	}
+	acked := make([]congestion.AckedPacketInfo, 0, 8)
+	for pn := congestion.PacketNumber(1); pn <= 8; pn++ {
+		acked = append(acked, congestion.AckedPacketInfo{PacketNumber: pn, BytesAcked: 1200})
+	}
+	s.OnCongestionEvent(now, acked, nil, 1)
+
+	if got := s.sampler.connectionStateMap.GetEntry(8); got != nil {
+		t.Fatal("a consumed record was retained")
+	}
+	for _, pn := range []congestion.PacketNumber{9, 10} {
+		if got := s.sampler.connectionStateMap.GetEntry(pn); got == nil {
+			t.Fatalf("record for outstanding packet %d was dropped", pn)
+		}
+	}
+
+	// The outstanding records must still be usable, or their acks go unaccounted.
+	s.OnCongestionEvent(now, []congestion.AckedPacketInfo{
+		{PacketNumber: 9, BytesAcked: 1200},
+		{PacketNumber: 10, BytesAcked: 1200},
+	}, nil, 1)
+	if got, want := s.TotalBytesAcked(), congestion.ByteCount(packets*1200); got != want {
+		t.Fatalf("TotalBytesAcked() = %d, want %d", got, want)
+	}
+}
+
+// TestRefSamplerKeepsRecordsBehindALiveFront pins the prefix semantics: a
+// consumed record behind a still-live front record is not passed over, because
+// the map can only give back a prefix. That is why the budget below exists as
+// the backstop for a connection whose oldest record never gets consumed.
+func TestRefSamplerKeepsRecordsBehindALiveFront(t *testing.T) {
 	s := NewRefSampler(10)
 	now := time.Now()
 	for pn := congestion.PacketNumber(1); pn <= 50; pn++ {
 		s.OnPacketSent(now, pn, 1200, 50*1200, true)
 	}
-	lost := []congestion.LostPacketInfo{{PacketNumber: 20, BytesLost: 1200}}
-	s.OnCongestionEvent(now, nil, lost, 1)
-	if got := s.sampler.connectionStateMap.GetEntry(20); got != nil {
-		t.Fatal("a lost packet's record below the trim point was retained")
+	// Only packet 20 is declared lost; 1..19 are still unconsumed.
+	s.OnCongestionEvent(now, nil, []congestion.LostPacketInfo{{PacketNumber: 20, BytesLost: 1200}}, 1)
+
+	if got := s.sampler.connectionStateMap.GetEntry(1); got == nil {
+		t.Fatal("the live front record was dropped")
 	}
-	if got := s.sampler.connectionStateMap.GetEntry(21); got == nil {
-		t.Fatal("an in-flight record above the trim point was released")
+	if got := s.sampler.connectionStateMap.GetEntry(20); got == nil {
+		t.Fatal("a consumed record behind a live front was dropped; only a prefix may be reclaimed")
+	}
+	if got := s.EntrySlotsUsed(); got == 0 {
+		t.Fatal("the map reclaimed records it could not prove were consumed")
 	}
 }
 

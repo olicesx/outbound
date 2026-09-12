@@ -368,14 +368,16 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 				}
 				prefix := []byte("https://" + uConn.ServerName)
 				maps.Lock()
-				if maps.maps == nil {
+				if maps.maps == nil || maps.bytes == nil {
 					maps.maps = make(map[string]map[string]bool)
+					maps.bytes = make(map[string]int)
 				}
 				paths := maps.maps[uConn.ServerName]
 				if paths == nil {
 					paths = make(map[string]bool)
 					paths[x.spiderX] = true
 					maps.maps[uConn.ServerName] = paths
+					maps.bytes[uConn.ServerName] = len(x.spiderX)
 				}
 				firstURL := string(prefix) + getPathLocked(paths)
 				maps.Unlock()
@@ -436,8 +438,9 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 						maps.Lock()
 						for _, m := range href.FindAllSubmatch(body, -1) {
 							m[1] = bytes.TrimPrefix(m[1], prefix)
-							if !bytes.Contains(m[1], dot) && len(paths) < maxSpiderPaths {
+							if spiderPathRetained(paths, maps.bytes[uConn.ServerName], m[1]) {
 								paths[string(m[1])] = true
+								maps.bytes[uConn.ServerName] += len(m[1])
 							}
 						}
 						req.URL.Path = getPathLocked(paths)
@@ -480,6 +483,12 @@ var (
 var maps struct {
 	sync.Mutex
 	maps map[string]map[string]bool
+	// bytes is the retained href bytes per serverName. maxSpiderPaths bounds the
+	// entry count but not the entry sizes: each key is an href harvested from a
+	// body read with a 1 MiB limit, so the entry cap alone leaves room for
+	// 4096 * 1 MiB of peer-fed keys per serverName, kept for the process
+	// lifetime.
+	bytes map[string]int
 }
 
 const (
@@ -490,7 +499,20 @@ const (
 	// maxSpiderPaths bounds the harvested-path set per serverName; the peer
 	// controls how many hrefs it can feed the harvester.
 	maxSpiderPaths = 4096
+	// maxSpiderBytes bounds the harvested-path bytes per serverName. A real
+	// backdrop's paths sit well below it -- reaching it would take 4096 entries
+	// of 256 bytes each -- so it only binds on the overlength keys that
+	// maxSpiderPaths alone cannot bound.
+	maxSpiderBytes = 1 << 20
 )
+
+// spiderPathRetained decides whether one harvested href joins the set. It is a
+// named function so the bound is testable without a live REALITY handshake.
+func spiderPathRetained(paths map[string]bool, retainedBytes int, key []byte) bool {
+	return !bytes.Contains(key, dot) &&
+		len(paths) < maxSpiderPaths &&
+		retainedBytes+len(key) <= maxSpiderBytes
+}
 
 func getPathLocked(paths map[string]bool) string {
 	stopAt := int(randBetween(0, int64(len(paths)-1)))

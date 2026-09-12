@@ -11,6 +11,38 @@ type RingBuffer[T any] struct {
 // Init preallocs a buffer with a certain size.
 func (r *RingBuffer[T]) Init(size int) {
 	r.ring = make([]T, size)
+	r.headPos, r.tailPos, r.full = 0, 0, false
+}
+
+// Cap returns the number of elements the backing array can hold. Len() is the
+// live set; Cap() is what is being held for it, which is what a reclaimer has
+// to reason about.
+func (r *RingBuffer[T]) Cap() int {
+	return len(r.ring)
+}
+
+// ShrinkTo reallocates the backing array to size elements, preserving the live
+// elements in order. Sizes below Len() or at/above the current capacity are
+// ignored, so a caller can pass a computed target without re-deriving the
+// invariant itself.
+func (r *RingBuffer[T]) ShrinkTo(size int) {
+	n := r.Len()
+	if size < 1 || size < n || size >= len(r.ring) {
+		return
+	}
+	shrunk := make([]T, size)
+	if n > 0 {
+		if r.headPos+n <= len(r.ring) {
+			copy(shrunk, r.ring[r.headPos:r.headPos+n])
+		} else {
+			head := copy(shrunk, r.ring[r.headPos:])
+			copy(shrunk[head:], r.ring[:n-head])
+		}
+	}
+	r.ring = shrunk
+	r.headPos = 0
+	r.tailPos = n % size
+	r.full = n == size
 }
 
 // Len returns the number of elements in the ring buffer.

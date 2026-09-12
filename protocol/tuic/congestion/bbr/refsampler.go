@@ -22,6 +22,12 @@ import (
 // the same filter from its own round counter, and a caller that re-implemented
 // the update rule would be re-introducing the divergence this type exists to
 // remove.
+//
+// It owns the send-record reclamation for the same reason. Removing records
+// that can no longer produce a sample is an obligation of the connection-state
+// map, not a decision of the caller, so OnCongestionEvent performs it: a
+// consumer that forgot would retain one record per send for the life of the
+// connection.
 type RefSampler struct {
 	sampler      *bandwidthSampler
 	maxBandwidth *WindowedFilter[Bandwidth, roundTripCount]
@@ -100,6 +106,16 @@ func (r *RefSampler) OnCongestionEvent(
 		infBandwidth,
 		round,
 	)
+	// Drop the send records this event made obsolete. This is the maintenance
+	// obligation of the connection-state map, and it lives here rather than at
+	// each call site because a call site can forget it: bbr3 did, and retained
+	// one 136-byte record per retransmittable send for the life of the
+	// connection (measured: 524,288 records = 71.3 MiB on a single hysteria2
+	// connection, 85.7% of the live heap). A consumer of this adapter now gets
+	// the reclamation whether it asks for it or not.
+	if leastUnacked := leastUnacked(ackedPackets, lostPackets); leastUnacked != invalidPacketNumber {
+		r.sampler.RemoveObsoletePackets(leastUnacked)
+	}
 	if r.sampler.TotalBytesAcked() != totalAckedBefore {
 		if !event.sampleIsAppLimited || event.sampleMaxBandwidth > r.maxBandwidth.GetBest() {
 			r.maxBandwidth.Update(event.sampleMaxBandwidth, round)
@@ -112,6 +128,41 @@ func (r *RefSampler) OnCongestionEvent(
 		ExtraAcked: event.extraAcked,
 		Sample:     event.sampleMaxBandwidth,
 	}
+}
+
+// leastUnacked is the first packet number whose send record can still produce a
+// sample, i.e. the trim point for the connection-state map. The true
+// first-outstanding number is not carried through OnCongestionEventEx, so it is
+// estimated from the event vector the same way the reference sender estimates
+// it (bbr_sender.go:487-492). Fast retransmission declares a packet lost once
+// it falls `packetThreshold` (3) behind the largest ack, so the two-packet
+// margin is already conservative; trimming further would drop records for
+// packets that are still in flight, and onPacketAcknowledged skips the
+// delivered-byte accounting when a record is missing, so an over-aggressive
+// trim would under-count delivery and depress the bandwidth estimate.
+//
+// The highest packet number of the vector is used rather than its last element:
+// the vector's ordering is not part of the interface.
+func leastUnacked(ackedPackets []congestion.AckedPacketInfo, lostPackets []congestion.LostPacketInfo) congestion.PacketNumber {
+	if len(ackedPackets) > 0 {
+		highest := ackedPackets[0].PacketNumber
+		for _, p := range ackedPackets[1:] {
+			if p.PacketNumber > highest {
+				highest = p.PacketNumber
+			}
+		}
+		return highest - 2
+	}
+	if len(lostPackets) > 0 {
+		highest := lostPackets[0].PacketNumber
+		for _, p := range lostPackets[1:] {
+			if p.PacketNumber > highest {
+				highest = p.PacketNumber
+			}
+		}
+		return highest + 1
+	}
+	return invalidPacketNumber
 }
 
 // MaxBandwidth reports the current windowed maximum delivery rate, in bits per
@@ -139,9 +190,31 @@ func (r *RefSampler) TotalBytesLost() congestion.ByteCount { return r.sampler.To
 // samples (bandwidth_sampler.go:406-410).
 func (r *RefSampler) OnAppLimited() { r.sampler.OnAppLimited() }
 
-// RemoveObsoletePackets drops send records below leastUnacked.
+// RemoveObsoletePackets drops send records below leastUnacked. OnCongestionEvent
+// already trims, so this is only needed by a caller that knows the true
+// first-outstanding packet number and wants a tighter bound.
 func (r *RefSampler) RemoveObsoletePackets(leastUnacked congestion.PacketNumber) {
 	r.sampler.RemoveObsoletePackets(leastUnacked)
+}
+
+// EntrySlotsUsed reports how many send records the connection-state map holds.
+// It should track the in-flight window: a value that grows with the number of
+// packets ever sent means the trim has stopped happening.
+func (r *RefSampler) EntrySlotsUsed() int {
+	return r.sampler.connectionStateMap.EntrySlotsUsed()
+}
+
+// EntrySlotsCapacity reports the send-record map's slot capacity, i.e. its
+// memory footprint divided by the record size.
+func (r *RefSampler) EntrySlotsCapacity() int {
+	return r.sampler.connectionStateMap.EntrySlotsCapacity()
+}
+
+// TruncatedRecords reports how many records the map's hard slot budget has
+// discarded. Non-zero means the trim is not running and the estimate is being
+// fed by a truncated send history.
+func (r *RefSampler) TruncatedRecords() uint64 {
+	return r.sampler.connectionStateMap.TruncatedSlots()
 }
 
 // SetWindowLength changes the filter window without touching current samples.

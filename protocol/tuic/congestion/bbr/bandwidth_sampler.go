@@ -8,9 +8,30 @@ import (
 )
 
 const (
-	infRTT                             = time.Duration(math.MaxInt64)
-	defaultConnectionStateMapQueueSize = 256
-	defaultCandidatesBufferSize        = 256
+	infRTT = time.Duration(math.MaxInt64)
+
+	// initialConnectionStateMapSlots is the send-record capacity a fresh
+	// connection starts with. The initial congestion window is 10 packets, so
+	// this covers it plus the first probe-up burst; growth is amortised O(1)
+	// per send. The reference implementation's 256 slots would reserve 34.8 KiB
+	// per connection for a window that rarely exceeds it, and a relay holds
+	// thousands of connections, not one.
+	initialConnectionStateMapSlots = 64
+
+	// maxConnectionStateMapSlots is the hard per-connection budget for the
+	// send-record map, and it is derived rather than guessed: it is quic-go's
+	// own bound on how many sent packets it can still ack or lose, namely
+	// internal/protocol.MaxTrackedSentPackets = MaxOutstandingSentPackets * 5/4
+	// = (2 * MaxCongestionWindowPackets) * 5/4. Once the ackhandler stops
+	// tracking a packet, its record can never produce a sample again, so no
+	// correct connection needs more slots than this. At 136 bytes per record
+	// that is ~6.8 MiB, against the 71.3 MiB (524,288 records) the untrimmed
+	// map reached on a single hysteria2 connection.
+	maxConnectionStateMapSlots = 5 * congestion.MaxCongestionWindowPackets / 2
+
+	// defaultCandidatesBufferSize is the A0-candidate ring, used only while
+	// overestimate avoidance is enabled; see EnableOverestimateAvoidance.
+	defaultCandidatesBufferSize = 256
 )
 
 type roundTripCount uint64
@@ -494,14 +515,13 @@ type bandwidthSampler struct {
 
 func newBandwidthSampler(maxAckHeightTrackerWindowLength roundTripCount) *bandwidthSampler {
 	b := &bandwidthSampler{
-		maxAckHeightTracker:  newMaxAckHeightTracker(maxAckHeightTrackerWindowLength),
-		connectionStateMap:   newPacketNumberIndexedQueue[connectionStateOnSentPacket](defaultConnectionStateMapQueueSize),
+		maxAckHeightTracker: newMaxAckHeightTracker(maxAckHeightTrackerWindowLength),
+		connectionStateMap: newPacketNumberIndexedQueue[connectionStateOnSentPacket](
+			initialConnectionStateMapSlots, maxConnectionStateMapSlots),
 		lastSentPacket:       invalidPacketNumber,
 		lastAckedPacket:      invalidPacketNumber,
 		endOfAppLimitedPhase: invalidPacketNumber,
 	}
-
-	b.a0Candidates.Init(defaultCandidatesBufferSize)
 
 	return b
 }
@@ -540,6 +560,10 @@ func (b *bandwidthSampler) EnableOverestimateAvoidance() {
 	}
 
 	b.overestimateAvoidance = true
+	// a0Candidates and recentAckPoints only participate while this is enabled,
+	// so the ring is allocated here instead of reserving 8 KiB in every
+	// sampler that never turns it on.
+	b.a0Candidates.Init(defaultCandidatesBufferSize)
 	b.maxAckHeightTracker.SetAckAggregationBandwidthThreshold(2.0)
 }
 

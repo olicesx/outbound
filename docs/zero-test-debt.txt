@@ -22,5 +22,4 @@ github.com/daeuniverse/outbound/protocol/hysteria2/internal/utils
 github.com/daeuniverse/outbound/protocol/infra/bench
 github.com/daeuniverse/outbound/protocol/infra/socks
 github.com/daeuniverse/outbound/protocol/tuic/congestion
-github.com/daeuniverse/outbound/protocol/tuic/congestion/bbr
 github.com/daeuniverse/outbound/transport/shadowsocksr/internal/crypto

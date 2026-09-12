@@ -30,6 +30,12 @@ type Bbr3Sender struct {
 	pacingRate atomic.Uint64
 	cwnd       atomic.Int64
 
+	// Send-record map health, published by recalc for the same reason as the
+	// fields above: telemetry reads them from an unsynchronised goroutine.
+	recordRetained  atomic.Int64
+	recordCapacity  atomic.Int64
+	recordTruncated atomic.Uint64
+
 	// PROBE_RTT bookkeeping.
 	probeRttExitAt time.Time
 	probeRttRound  bool
@@ -456,4 +462,30 @@ func (b *Bbr3Sender) recalc() {
 	}
 
 	b.cwnd.Store(int64(cwnd))
+
+	// Publish the send-record map's health on the same terms as cwnd: written
+	// here on the packet path, read from wherever telemetry lives, stale values
+	// acceptable and torn ones not. See SendRecordStats.
+	b.recordRetained.Store(int64(b.model.ref.EntrySlotsUsed()))
+	b.recordCapacity.Store(int64(b.model.ref.EntrySlotsCapacity()))
+	b.recordTruncated.Store(b.model.ref.TruncatedRecords())
+}
+
+// SendRecordStats reports the connection-state map's health, which is where the
+// delivery-rate estimator keeps one record per in-flight send:
+//
+//   - retained is the number of records held. It should track the congestion
+//     window, in packets. A value that climbs with the number of packets ever
+//     sent means the reference sampler's trim has stopped running, which is the
+//     leak that put 71.3 MB (524,288 records) into one connection's heap.
+//   - capacity is the backing array's slot size; retained*136 B is the map's
+//     live footprint.
+//   - truncated counts records the hard budget discarded. Non-zero means the
+//     map is being trimmed by its backstop rather than by acks, so the estimate
+//     is running on a truncated send history.
+//
+// Safe to call from any goroutine; the values may lag the newest recalc by one
+// event.
+func (b *Bbr3Sender) SendRecordStats() (retained, capacity int, truncated uint64) {
+	return int(b.recordRetained.Load()), int(b.recordCapacity.Load()), b.recordTruncated.Load()
 }

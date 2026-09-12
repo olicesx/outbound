@@ -45,4 +45,12 @@ func TestSenderDoesNotRetainSendRecords(t *testing.T) {
 	if got := s.model.ref.EntrySlotsCapacity(); got > bound {
 		t.Fatalf("send-record capacity = %d, want <= %d", got, bound)
 	}
+
+	// The telemetry accessor must report what the map actually holds.
+	capacity := s.model.ref.EntrySlotsCapacity()
+	statRetained, statCapacity, statTruncated := s.SendRecordStats()
+	if statRetained != retained || statCapacity != capacity || statTruncated != 0 {
+		t.Fatalf("SendRecordStats() = (%d, %d, %d), want (%d, %d, 0)",
+			statRetained, statCapacity, statTruncated, retained, capacity)
+	}
 }

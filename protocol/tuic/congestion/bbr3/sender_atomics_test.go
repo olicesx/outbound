@@ -70,6 +70,14 @@ func TestSenderAccessorsTolerateConcurrentRecalc(t *testing.T) {
 				_ = s.CanSend(12000)
 				_ = s.InSlowStart()
 				_ = s.InRecovery()
+				// SendRecordStats is read by telemetry, so it must be as safe as
+				// the rest. The two values are separate atomic loads and recalc
+				// can run between them, so they may not agree with each other;
+				// only impossible values are a failure.
+				if retained, capacity, _ := s.SendRecordStats(); retained < 0 || capacity < 1 {
+					t.Errorf("impossible send-record stats: retained=%d capacity=%d", retained, capacity)
+					return
+				}
 				if got := s.Mode(); got == "" {
 					t.Error("empty mode string")
 					return

@@ -30,8 +30,7 @@ import (
 type UdpConn struct {
 	*SS2022Core
 
-	net.Conn
-
+	netproxy.Conn
 	sessionID [8]byte
 	packetID  atomic.Uint64
 	ctx       context.Context
@@ -78,7 +77,7 @@ type udpSessionReplayState struct {
 }
 
 // NewUdpConn creates a new UDP connection bound to a shared SS2022 profile.
-func NewUdpConn(conn net.Conn, core *SS2022Core, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
+func NewUdpConn(conn netproxy.Conn, core *SS2022Core, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
 	return NewUdpConnWithContext(context.Background(), conn, core, bloom)
 }
 
@@ -86,7 +85,7 @@ func NewUdpConn(conn net.Conn, core *SS2022Core, bloom *disk_bloom.FilterGroup) 
 // For UDP, the context is only used to check for cancellation during the initial setup,
 // not for ongoing I/O operations. UDP connections are long-lived and should not be
 // bound to the dial context's timeout.
-func NewUdpConnWithContext(ctx context.Context, conn net.Conn, core *SS2022Core, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
+func NewUdpConnWithContext(ctx context.Context, conn netproxy.Conn, core *SS2022Core, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
 	u := &UdpConn{
 		SS2022Core:     core,
 		Conn:           conn,
@@ -478,11 +477,28 @@ func (c *UdpConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) 
 
 // WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
 // forwarding the declaration of the wrapped conn: the exported
-// SetWriteDeadline is the promoted delegate of the embedded net.Conn, so the
+// SetWriteDeadline is the promoted delegate of the embedded netproxy.Conn, so the
 // semantics — and the declaration — belong to that conn. A plain UDP socket
 // reports false; a marker-bearing wrapper in its place reports true.
 func (c *UdpConn) WriteDeadlineClosesSession() bool {
 	return netproxy.WriteDeadlineClosesSession(c.Conn)
+}
+
+// LocalAddr forwards the underlying connection's local address when available.
+// This allows UdpConn to satisfy net.Conn for callers that assert it.
+func (c *UdpConn) LocalAddr() net.Addr {
+	if a, ok := c.Conn.(interface{ LocalAddr() net.Addr }); ok {
+		return a.LocalAddr()
+	}
+	return nil
+}
+
+// RemoteAddr forwards the underlying connection's remote address when available.
+func (c *UdpConn) RemoteAddr() net.Addr {
+	if a, ok := c.Conn.(interface{ RemoteAddr() net.Addr }); ok {
+		return a.RemoteAddr()
+	}
+	return nil
 }
 
 func (c *UdpConn) mapReceivedPacket(packet *netproxy.ReceivedPacket) (*netproxy.ReceivedPacket, bool) {

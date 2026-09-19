@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 
 	"github.com/daeuniverse/outbound/ciphers"
@@ -38,6 +39,31 @@ func (c *FakeNetPacketConn) Read(p []byte) (int, error) {
 // the declaration — belong to that transport, not to this wrapper.
 func (c *FakeNetPacketConn) WriteDeadlineClosesSession() bool {
 	return netproxy.WriteDeadlineClosesSession(c.PacketConn)
+}
+
+// LocalAddr forwards the underlying connection's local address when available.
+// This allows FakeNetPacketConn to satisfy net.Conn for callers that assert it.
+func (c *FakeNetPacketConn) LocalAddr() net.Addr {
+	if a, ok := c.PacketConn.(interface{ LocalAddr() net.Addr }); ok {
+		if addr := a.LocalAddr(); addr != nil {
+			return addr
+		}
+	}
+	return nil
+}
+
+// RemoteAddr forwards the underlying connection's remote address when available,
+// or parses the configured target address.
+func (c *FakeNetPacketConn) RemoteAddr() net.Addr {
+	if a, ok := c.PacketConn.(interface{ RemoteAddr() net.Addr }); ok {
+		if addr := a.RemoteAddr(); addr != nil {
+			return addr
+		}
+	}
+	if ap, err := netip.ParseAddrPort(c.Addr); err == nil {
+		return net.UDPAddrFromAddrPort(ap)
+	}
+	return nil
 }
 
 func init() {
@@ -154,5 +180,5 @@ func (d *Dialer) ListenPacket(ctx context.Context, network string, addr string) 
 	if err != nil {
 		return nil, err
 	}
-	return NewUdpConnWithContext(ctx, conn.(net.Conn), d.core, nil)
+	return NewUdpConnWithContext(ctx, conn, d.core, nil)
 }

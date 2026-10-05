@@ -223,7 +223,7 @@ func tlsCloseNotifyPair(t *testing.T) (*FlushConn, *teeConn, <-chan error, <-cha
 			tlsRead <- err
 			return
 		}
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		tee.Conn = c
 		tc := tls.Server(tee, &tls.Config{Certificates: []tls.Certificate{tlsCloseNotifySelfSigned(t)}})
 		if err := tc.Handshake(); err != nil {

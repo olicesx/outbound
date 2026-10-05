@@ -129,3 +129,61 @@ func TestWriteBatchRejectsOversizedAllOrNothing(t *testing.T) {
 		t.Fatalf("%d writes left despite validation failure", len(rc.writes))
 	}
 }
+
+// TestWriteToMalformedAddrDoesNotPinUnconnectedFraming pins the mode-flag
+// contract: the switch to unconnected framing must only happen after the
+// first address actually parses. A malformed first address used to flip the
+// flag before the parse, so every later datagram silently went out without
+// an address the server had never learned, making the whole UDP session
+// unparseable. The write after the failure must produce framing identical
+// to a stream whose first write succeeded.
+func TestWriteToMalformedAddrDoesNotPinUnconnectedFraming(t *testing.T) {
+	const sid = uint32(7)
+	addr := "1.2.3.4:443"
+	payload := []byte("hello")
+
+	refConn := &batchRecConn{}
+	refPacket := &packetStream{stream: &stream{session: newBatchTestSession(t, refConn), id: sid}, addr: addr}
+	if _, err := refPacket.WriteTo(payload, addr); err != nil {
+		t.Fatalf("reference WriteTo: %v", err)
+	}
+
+	conn := &batchRecConn{}
+	ps := &packetStream{stream: &stream{session: newBatchTestSession(t, conn), id: sid}, addr: addr}
+	if _, err := ps.WriteTo(payload, "malformed-no-colon"); err == nil {
+		t.Fatal("WriteTo with a malformed address must be rejected")
+	}
+	if _, err := ps.WriteTo(payload, addr); err != nil {
+		t.Fatalf("WriteTo after a malformed address: %v", err)
+	}
+	if !bytes.Equal(refConn.bytes(), conn.bytes()) {
+		t.Fatal("write after a malformed address lost connected framing: the stream was pinned to unconnected framing")
+	}
+}
+
+// TestWriteBatchMalformedAddrDoesNotPinUnconnectedFraming verifies the same
+// contract for the batched path: a batch whose first address is malformed
+// must fail as a whole without flipping the mode flag.
+func TestWriteBatchMalformedAddrDoesNotPinUnconnectedFraming(t *testing.T) {
+	const sid = uint32(8)
+	addr := "1.2.3.4:443"
+	payload := []byte("hello")
+
+	refConn := &batchRecConn{}
+	refPacket := &packetStream{stream: &stream{session: newBatchTestSession(t, refConn), id: sid}, addr: addr}
+	if _, err := refPacket.WriteTo(payload, addr); err != nil {
+		t.Fatalf("reference WriteTo: %v", err)
+	}
+
+	conn := &batchRecConn{}
+	ps := &packetStream{stream: &stream{session: newBatchTestSession(t, conn), id: sid}, addr: addr}
+	if _, err := ps.WriteBatch([]netproxy.BatchItem{{Data: payload, Addr: "malformed-no-colon"}}); err == nil {
+		t.Fatal("WriteBatch with a malformed address must be rejected")
+	}
+	if _, err := ps.WriteTo(payload, addr); err != nil {
+		t.Fatalf("WriteTo after a malformed batch: %v", err)
+	}
+	if !bytes.Equal(refConn.bytes(), conn.bytes()) {
+		t.Fatal("write after a malformed batch lost connected framing: the stream was pinned to unconnected framing")
+	}
+}

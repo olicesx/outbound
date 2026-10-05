@@ -228,7 +228,14 @@ func (c *Conn) writePacket(b []byte, preWrite []byte) (n int, err error) {
 	// stream instead of failing the write; reject it up front, mirroring the
 	// mux path's guard for the same field.
 	if int64(len(b))+int64(c.writeBodyCipher.Overhead())+int64(c.writePaddingGenerator.MaxPaddingLen()) > 0xFFFF {
-		return 0, fmt.Errorf("vmess: udp datagram of %d bytes exceeds the 16-bit chunk length field", len(b))
+		// This one datagram cannot be serialized into the 16-bit chunk
+		// length field, but the session itself stays usable. The typed
+		// datagram-dropped contract (with io.ErrShortBuffer as the cause
+		// for legacy errors.Is consumers) tells the endpoint to drop the
+		// datagram and keep the session; an untyped error reads as a
+		// session failure and retires the endpoint.
+		return 0, fmt.Errorf("vmess: udp datagram of %d bytes exceeds the 16-bit chunk length field: %w",
+			len(b), netproxy.DatagramDropped(io.ErrShortBuffer))
 	}
 	data := c.sealFromPool(b)
 	if preWrite != nil {

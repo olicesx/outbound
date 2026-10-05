@@ -7,14 +7,17 @@ var _ error = (*ErrDatagramDropped)(nil)
 
 // ErrDatagramDropped is the typed contract for a packet-oriented read that
 // consumed and discarded exactly one datagram while leaving the session
-// usable.
+// usable, and for the write-side mirror: a single datagram that was refused
+// (e.g. it cannot be serialized into a protocol length field) while the
+// session stays usable and subsequent datagrams can still be written.
 //
 // Producers return it (wrapping io.ErrShortBuffer in the common case) when a
-// received datagram is larger than the caller's buffer, or its source address
-// cannot be attributed. The reader has already drained the frame, so the
-// stream stays aligned: the next ReadFrom returns the next datagram. Consumers
-// must treat it as a per-datagram event — do not retire the connection, do not
-// close the endpoint, and do not report the dialer unavailable.
+// received datagram is larger than the caller's buffer, its source address
+// cannot be attributed, or a write-side length field cannot carry the
+// datagram. The reader has already drained the frame, so the stream stays
+// aligned: the next ReadFrom returns the next datagram. Consumers must treat
+// it as a per-datagram event — do not retire the connection, do not close the
+// endpoint, and do not report the dialer unavailable.
 //
 // The Cause chain is preserved, so legacy consumers matching
 // errors.Is(err, io.ErrShortBuffer) keep working across pins. The

@@ -210,3 +210,44 @@ func TestWritePacketRejectsDatagramBeyondChunkLengthField(t *testing.T) {
 		t.Fatalf("n = %d, want %d", n, len(fit))
 	}
 }
+
+// TestWritePacketRejectionIsDatagramDropped pins the typed contract of the
+// oversize rejection: the endpoint must read it as one dropped datagram with
+// the session still usable, not as a session failure that retires it.
+func TestWritePacketRejectionIsDatagramDropped(t *testing.T) {
+	block, err := aes.NewCipher(make([]byte, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shake := NewShakeSizeParser(make([]byte, 16))
+	c := &Conn{
+		Conn:                  &bufferConn{Buffer: bytes.NewBuffer(nil)},
+		writeBodyCipher:       aead,
+		writeNonceGenerator:   GenerateChunkNonce(make([]byte, aead.NonceSize()), uint32(aead.NonceSize())),
+		writeChunkSizeParser:  shake,
+		writePaddingGenerator: shake,
+	}
+
+	oversize := make([]byte, 0xFFFF-aead.Overhead()-int(shake.MaxPaddingLen())+1)
+	_, err = c.writePacket(oversize, nil)
+	if err == nil {
+		t.Fatal("expected the oversize datagram to be rejected")
+	}
+	var dropped *netproxy.ErrDatagramDropped
+	if !errors.As(err, &dropped) {
+		t.Fatalf("oversize rejection must carry the datagram-dropped contract, got %T: %v", err, err)
+	}
+	if !errors.Is(err, io.ErrShortBuffer) {
+		t.Fatal("legacy io.ErrShortBuffer consumers must still match the rejection")
+	}
+	// The session stays usable: the next, small enough datagram writes.
+	small := make([]byte, 64)
+	n, werr := c.writePacket(small, nil)
+	if werr != nil || n != len(small) {
+		t.Fatalf("session unusable after a dropped datagram: n=%d err=%v", n, werr)
+	}
+}

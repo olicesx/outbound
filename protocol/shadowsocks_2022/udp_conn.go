@@ -690,6 +690,14 @@ func (c *UdpConn) decodePacketPayload(buf, payload []byte, now time.Time) ([]byt
 		addr = netip.AddrPortFrom(ipAddr, uint16(udpAddr.Port))
 	}
 	out := buf[:reader.Len()]
+	if len(out) == 0 {
+		// A server datagram whose header and address consumed the whole
+		// payload is legitimate: the address itself is the message (e.g.
+		// some DNS/IP-ECHO style services reply with an empty body).
+		// bytes.Reader would surface io.EOF for the empty read, which the
+		// UDP endpoint treats as a stream close and retires itself on.
+		return out, addr, nil
+	}
 	n, err := reader.Read(out)
 	return out[:n], addr, err
 }

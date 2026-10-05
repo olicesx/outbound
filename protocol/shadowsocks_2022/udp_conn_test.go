@@ -530,3 +530,46 @@ func TestUdpConn_ReadFromChachaSurfacesOversizeAsDropped(t *testing.T) {
 		t.Fatalf("unexpected addr on the dropped datagram: got %v want %v", addr, wantAddr)
 	}
 }
+
+// TestUdpConn_ReadFromEmptyPayloadIsADatagram pins the empty-body contract: a
+// server datagram whose framing header and address consumed the entire
+// payload decodes as a zero-length datagram with its address, not as an
+// error. io.EOF from the empty read used to retire the whole UDP endpoint.
+func TestUdpConn_ReadFromEmptyPayloadIsADatagram(t *testing.T) {
+	conf := ciphers.Aead2022CiphersConf["2022-blake3-aes-256-gcm"]
+	if conf == nil {
+		t.Fatal("missing ss2022 cipher config")
+	}
+
+	psk := make([]byte, conf.KeyLen)
+	for i := range psk {
+		psk[i] = 0x23
+	}
+	core, err := NewSS2022Core(conf, [][]byte{psk}, psk)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	localSessionID := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	remoteSessionID := [8]byte{8, 7, 6, 5, 4, 3, 2, 1}
+	wantAddr := netip.MustParseAddrPort("203.0.113.9:853")
+
+	packet := buildServerPacket(t, core, remoteSessionID, localSessionID, 1, wantAddr.String(), nil)
+	conn, err := NewUdpConn(&udpReadBufferConn{packet: packet}, core, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.sessionID = localSessionID
+
+	buf := make([]byte, 128)
+	n, addr, err := conn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom of an empty-payload datagram: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("payload length = %d, want 0", n)
+	}
+	if addr != wantAddr {
+		t.Fatalf("unexpected addr: got %v want %v", addr, wantAddr)
+	}
+}

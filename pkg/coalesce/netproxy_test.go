@@ -7,8 +7,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
+	"io"
 	"math/big"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -167,43 +171,70 @@ func tlsCloseNotifySelfSigned(t *testing.T) tls.Certificate {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }
 
+// teeConn records every byte read off the socket once the handshake has
+// completed. crypto/tls may pre-read records past the handshake into its own
+// buffer, so observing on the raw socket would miss exactly those bytes; the
+// tee sees them all.
+type teeConn struct {
+	net.Conn
+	handshakeDone *atomic.Bool
+	mu            sync.Mutex
+	post          []byte
+}
+
+func (c *teeConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 && c.handshakeDone.Load() {
+		c.mu.Lock()
+		c.post = append(c.post, p[:n]...)
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+func (c *teeConn) postHandshakeBytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.post...)
+}
+
 // tlsCloseNotifyPair builds the fae1e14 client stack (coalescer below a TLS
 // conn wrapped in an UnderlyingConnForwarder below a FlushConn) against an
-// in-test TLS server, and reports what the server's socket observed after the
-// client half-closed: 21 (0x15, TLS alert record) means a close_notify
-// arrived, -1 means a raw TCP FIN with no alert.
-func tlsCloseNotifyPair(t *testing.T) (*FlushConn, <-chan int) {
+// in-test TLS server. The returned channel reports the TLS-layer outcome of
+// the server's next Read after the client half-closes; the returned tee
+// holds every post-handshake byte that actually arrived on the wire. The
+// caller must wait for the extra channel (closed once the server's handshake
+// completed) before half-closing, so the alert cannot be swallowed by the
+// handshake's own read-ahead.
+func tlsCloseNotifyPair(t *testing.T) (*FlushConn, *teeConn, <-chan error, <-chan struct{}) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	observed := make(chan int, 1)
+
+	tee := &teeConn{handshakeDone: &atomic.Bool{}}
+	tlsRead := make(chan error, 1)
+	serverReady := make(chan struct{})
 	go func() {
 		c, err := ln.Accept()
 		if err != nil {
-			observed <- -2
+			tlsRead <- err
 			return
 		}
 		defer c.Close()
-		tc := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{tlsCloseNotifySelfSigned(t)}})
+		tee.Conn = c
+		tc := tls.Server(tee, &tls.Config{Certificates: []tls.Certificate{tlsCloseNotifySelfSigned(t)}})
 		if err := tc.Handshake(); err != nil {
-			observed <- -3
+			tlsRead <- err
 			return
 		}
-		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
-		buf := make([]byte, 64)
-		n, err := c.Read(buf)
-		if n > 0 {
-			observed <- int(buf[0])
-			return
-		}
-		if err != nil {
-			observed <- -1
-			return
-		}
-		observed <- -4
+		tee.handshakeDone.Store(true)
+		close(serverReady)
+		_ = tc.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, rerr := tc.Read(make([]byte, 64))
+		tlsRead <- rerr
 	}()
 
 	raw, err := net.Dial("tcp", ln.Addr().String())
@@ -221,27 +252,45 @@ func tlsCloseNotifyPair(t *testing.T) (*FlushConn, <-chan int) {
 		t.Fatalf("flush: %v", err)
 	}
 	fwd := netproxy.NewUnderlyingConnForwarder(tlsConn, func() net.Conn { return tcp })
-	return NewFlushConn(fwd, co), observed
+	return NewFlushConn(fwd, co), tee, tlsRead, serverReady
 }
 
 // TestFlushConnCloseWriteSendsCloseNotifyThroughForwarder pins the relay
 // half-close contract of the fae1e14 TLS stack: CloseWrite must reach
-// tls.Conn.CloseWrite so the peer receives a close_notify alert, not a bare
-// TCP FIN. Before the forwarder learned to forward CloseWrite,
-// ForwardCloseWrite peeled straight to the forwarder's raw socket and the
-// record layer's alert was never sent; a TLS server saw EOF without a
-// graceful shutdown record.
+// tls.Conn.CloseWrite so a close_notify record actually goes out on the
+// wire, and the peer's TLS layer observes a clean half-close. Before the
+// forwarder learned to forward CloseWrite, ForwardCloseWrite peeled
+// straight to the forwarder's raw socket and the record layer's alert was
+// never sent: a bare FIN, and the peer saw EOF without a graceful shutdown
+// record. The tee distinguishes the two even when crypto/tls pre-reads the
+// alert into its own buffer.
 func TestFlushConnCloseWriteSendsCloseNotifyThroughForwarder(t *testing.T) {
-	fc, observed := tlsCloseNotifyPair(t)
+	fc, tee, tlsRead, serverReady := tlsCloseNotifyPair(t)
+	// Half-close only after the server's handshake fully drained: an alert
+	// racing the handshake can be pre-read into the TLS layer's buffer and
+	// would then never appear on the observable wire.
+	<-serverReady
 	if err := fc.CloseWrite(); err != nil {
 		t.Fatalf("CloseWrite: %v", err)
 	}
-	// The alert record type depends on the negotiated version: TLS 1.2 sends
-	// it as a plaintext alert record (21, 0x15), TLS 1.3 wraps the encrypted
-	// close_notify in an application_data record (23, 0x17). Both prove the
-	// record layer participated; only -1 (a bare TCP FIN with no record at
-	// all) is the regression.
-	if got := <-observed; got != 21 && got != 23 {
-		t.Fatalf("server observed first post-close byte = %d, want 21 (TLS 1.2 alert) or 23 (TLS 1.3 app-data close_notify); -1 would mean a bare FIN", got)
+	// A close_notify surfaces to the peer TLS layer as a clean half-close.
+	// A bare FIN also reads as EOF there, so the wire-level tee below is
+	// the discriminator; this assertion alone only rules out corruption.
+	if err := <-tlsRead; !errors.Is(err, io.EOF) {
+		t.Fatalf("server TLS layer did not observe a clean half-close: %v", err)
 	}
+	got := tee.postHandshakeBytes()
+	if len(got) == 0 || (got[0] != 21 && got[0] != 23) {
+		// 21 (0x15): TLS 1.2 plaintext alert record; 23 (0x17): TLS 1.3
+		// close_notify wrapped in an application_data record. An empty tee
+		// means no record was sent at all — the bare-FIN regression.
+		t.Fatalf("no close_notify record on the wire (first byte = %d, %d bytes recorded); an empty tee is the bare-FIN regression", firstByteOr(got, -1), len(got))
+	}
+}
+
+func firstByteOr(b []byte, or int) int {
+	if len(b) == 0 {
+		return or
+	}
+	return int(b[0])
 }

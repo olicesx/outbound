@@ -9,6 +9,7 @@ package pool
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -170,13 +171,21 @@ func (a *JumboBufferArena) Trim(threshold int) (int, bool) {
 	return 0, false
 }
 
-// Close unmaps the arena memory. Further Get and Trim calls will safely fail.
+// Close unmaps the arena memory once every buffer it handed out has been
+// returned. Further Get and Trim calls will safely fail. Closing with
+// buffers still outstanding is refused — the outstanding slices point into
+// the mapping, so munmapping under them turns their next touch into
+// SIGSEGV — and the error reports how many are still held so the caller can
+// drain and retry.
 func (a *JumboBufferArena) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if a.closed {
 		return nil
+	}
+	if a.inUse > 0 {
+		return fmt.Errorf("pool: jumbo buffer arena still has %d buffers outstanding", a.inUse)
 	}
 	a.closed = true
 

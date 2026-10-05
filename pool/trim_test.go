@@ -122,3 +122,29 @@ func TestPool_JumboBufferArena_LifecycleHardening(t *testing.T) {
 	err = arena.Close()
 	require.NoError(t, err)
 }
+
+// TestJumboBufferArenaCloseRefusedWithBuffersOutstanding pins the unmap
+// guard: Close must refuse while buffers are still checked out, because the
+// outstanding slices point into the mapping and munmapping under them turns
+// their next touch into SIGSEGV. After the buffers return, Close succeeds.
+func TestJumboBufferArenaCloseRefusedWithBuffersOutstanding(t *testing.T) {
+	arena, err := NewJumboBufferArena(8, 8192)
+	if err != nil {
+		t.Skipf("arena allocation unavailable: %v", err)
+	}
+	defer func() { _ = arena.Close() }()
+
+	_, idx1, ok := arena.Get()
+	if !ok {
+		t.Fatal("Get failed")
+	}
+
+	if err := arena.Close(); err == nil {
+		t.Fatal("Close with a buffer outstanding must be refused, not munmap under live slices")
+	}
+
+	arena.Put(idx1)
+	if err := arena.Close(); err != nil {
+		t.Fatalf("Close after buffers returned: %v", err)
+	}
+}

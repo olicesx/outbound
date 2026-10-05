@@ -50,3 +50,14 @@ func (f *UnderlyingConnForwarder) IntrinsicConn() Conn {
 func (f *UnderlyingConnForwarder) WriteDeadlineClosesSession() bool {
 	return WriteDeadlineClosesSession(f.Conn)
 }
+
+// CloseWrite half-closes the wrapped conn instead of the raw socket
+// underneath. Embedding the Conn interface does not promote this optional
+// method, so a WriteCloser probe on the forwarder would fall through to
+// UnwrapTCPConn, which this forwarder itself feeds the raw socket: a bare
+// TCP FIN that skips the close_notify the wrapped record layer (TLS) must
+// send first. Forwarding to ForwardCloseWrite keeps the wrapped conn's own
+// half-close preferred and preserves the TCP fallback for conns without one.
+func (f *UnderlyingConnForwarder) CloseWrite() error {
+	return ForwardCloseWrite(f.Conn)
+}

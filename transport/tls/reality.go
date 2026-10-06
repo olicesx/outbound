@@ -42,10 +42,11 @@ import (
 	"golang.org/x/net/http2"
 )
 
-var (
-	Reality_Version_x byte = 1
-	Reality_Version_y byte = 8
-	Reality_Version_z byte = 10
+// Reality protocol version bytes embedded in the ClientHello session ID.
+const (
+	realityVersionX byte = 1
+	realityVersionY byte = 8
+	realityVersionZ byte = 10
 )
 
 // realityHelloAttempts bounds how many ClientHellos the dialer generates before
@@ -404,9 +405,9 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 			hello := uConn.HandshakeState.Hello
 			hello.SessionId = make([]byte, 32)
 			copy(hello.Raw[39:], hello.SessionId) // the fixed location of `Session ID`
-			hello.SessionId[0] = Reality_Version_x
-			hello.SessionId[1] = Reality_Version_y
-			hello.SessionId[2] = Reality_Version_z
+			hello.SessionId[0] = realityVersionX
+			hello.SessionId[1] = realityVersionY
+			hello.SessionId[2] = realityVersionZ
 			hello.SessionId[3] = 0 // reserved
 			binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
 			copy(hello.SessionId[8:], x.shortId[:])
@@ -502,6 +503,18 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 				firstURL := string(prefix) + getPathLocked(paths)
 				maps.Unlock()
 				get := func(first bool) {
+					// The !first requests each run on their own goroutine and
+					// outlive the handshake, so a panic here would take the
+					// whole process down; contain it and report it instead.
+					defer func() {
+						if r := recover(); r != nil {
+							logger.Logger.WithFields(map[string]any{
+								"server_name": uConn.ServerName,
+								"panic":       fmt.Sprint(r),
+								"stack":       string(debug.Stack()),
+							}).Error("REALITY: panic in spider request")
+						}
+					}()
 					var (
 						req  *http.Request
 						resp *http.Response

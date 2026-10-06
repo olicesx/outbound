@@ -256,7 +256,7 @@ func (conn *fakeNetPacketConn) SetWriteBuffer(size int) error {
 func (conn *fakeNetPacketConn) SetReadBuffer(size int) error {
 	c, ok := conn.PacketConn.(interface{ SetReadBuffer(int) error })
 	if !ok {
-		return fmt.Errorf("connection doesn't allow setting of send buffer size. Not a *net.UDPConn? : %T", conn.PacketConn)
+		return fmt.Errorf("connection doesn't allow setting of receive buffer size. Not a *net.UDPConn? : %T", conn.PacketConn)
 	}
 	return c.SetReadBuffer(size)
 }

@@ -375,18 +375,18 @@ func (d *StickyIpDialer) InvalidateProtocolAndIpVersionCache(proxyAddr, protocol
 	}
 }
 
-// GetCachedProxyAddr returns the cached IP for the proxy address and network type.
+// getCachedProxyAddr returns the cached IP for the proxy address and network type.
 // network should be "tcp" or "udp".
-func (d *StickyIpDialer) GetCachedProxyAddr(network string) string {
+func (d *StickyIpDialer) getCachedProxyAddr(network string) string {
 	if d == nil {
 		return ""
 	}
 	return d.cache.GetWithCycle(d.proxyAddr, network, d.checkCycle.Load())
 }
 
-// GetCachedProxyAddrWithIpVersion returns the cached IP for the proxy address, network type and IP version.
+// getCachedProxyAddrWithIpVersion returns the cached IP for the proxy address, network type and IP version.
 // network should be "tcp" or "udp", ipVersion should be "4" or "6".
-func (d *StickyIpDialer) GetCachedProxyAddrWithIpVersion(network, ipVersion string) string {
+func (d *StickyIpDialer) getCachedProxyAddrWithIpVersion(network, ipVersion string) string {
 	if d == nil {
 		return ""
 	}
@@ -418,12 +418,17 @@ func (d *StickyIpDialer) DialContext(ctx context.Context, network, addr string) 
 
 	// Check if we should use a cached proxy IP for this connection
 	if d.isProxyAddress(addr) {
-		cachedAddr := d.GetCachedProxyAddr(baseNetwork)
+		// Query only the getter that matches the requested IP family: a
+		// family-specific request must not pay for (and discard) the
+		// family-agnostic cache lookup first.
+		var cachedAddr string
 		if requestedIPVersion != "" {
-			cachedAddr = d.GetCachedProxyAddrWithIpVersion(baseNetwork, requestedIPVersion)
+			cachedAddr = d.getCachedProxyAddrWithIpVersion(baseNetwork, requestedIPVersion)
+		} else {
+			cachedAddr = d.getCachedProxyAddr(baseNetwork)
 		}
 		// Only use cached IP if it's different from proxy address (i.e., it's a resolved IP)
-		// GetCachedProxyAddr returns proxyAddr when cache is empty/expired, so we need to check
+		// getCachedProxyAddr returns proxyAddr when cache is empty/expired, so we need to check
 		if cachedAddr != "" && cachedAddr != d.proxyAddr {
 			targetAddr := rewriteAddrPort(cachedAddr, addr)
 			// Try with cached IP first

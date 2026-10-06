@@ -85,5 +85,5 @@ func (c *Conn) writeTargetAddrPort(addr string) (*net.UDPAddr, error) {
 	}
 	addrPort := unmapAddrPort(target.AddrPort())
 	c.writeCache.Store(addr, addrPort)
-	return target, nil
+	return net.UDPAddrFromAddrPort(addrPort), nil
 }

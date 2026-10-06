@@ -173,6 +173,32 @@ func GenerateChunkNonce(nonce []byte, size uint32) BytesGenerator {
 	}
 }
 
+// initChunkCodecs derives the chunk-stream codec state shared by every
+// connection direction: the size parser selected by the negotiated options
+// (shake-masked under OptionChunkLengthMasking, plain otherwise), the padding
+// generator (the shake parser under OptionGlobalPadding, plain otherwise),
+// and the nonce generator seeded from the direction IV. The returned encoder
+// and decoder are the same parser instance, so the caller keeps only the one
+// its direction needs; each call yields fresh stateful parsers.
+func initChunkCodecs(options byte, iv []byte, nonceSize int) (sizeEncoder ChunkSizeEncoder, sizeDecoder ChunkSizeDecoder, paddingGen PaddingLengthGenerator, nonceGen BytesGenerator) {
+	if ContainOption(options, OptionChunkLengthMasking) {
+		sizeParser := NewShakeSizeParser(iv)
+		sizeEncoder = sizeParser
+		sizeDecoder = sizeParser
+		if ContainOption(options, OptionGlobalPadding) {
+			paddingGen = sizeParser
+		}
+	} else {
+		sizeEncoder = PlainChunkSizeParser{}
+		sizeDecoder = PlainChunkSizeParser{}
+	}
+	if paddingGen == nil {
+		paddingGen = PlainPaddingGenerator{}
+	}
+	nonceGen = GenerateChunkNonce(iv, uint32(nonceSize))
+	return
+}
+
 // seal packs the b. The overhead is sizeParser.SizeBytes() + auth.Overhead() + paddingSize(no more than maxPadding).
 func (c *Conn) sealFromPool(b []byte) (data []byte) {
 	sizeSize := c.writeChunkSizeParser.SizeBytes()
@@ -307,18 +333,7 @@ func (c *Conn) WriteReqHeader() (err error) {
 			return
 		}
 
-		if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
-			c.writeChunkSizeParser = NewShakeSizeParser(c.requestBodyIV[:])
-			if ContainOption(c.requestOptions, OptionGlobalPadding) {
-				c.writePaddingGenerator = c.writeChunkSizeParser.(PaddingLengthGenerator)
-			}
-		} else {
-			c.writeChunkSizeParser = PlainChunkSizeParser{}
-		}
-		if c.writePaddingGenerator == nil {
-			c.writePaddingGenerator = PlainPaddingGenerator{}
-		}
-		c.writeNonceGenerator = GenerateChunkNonce(c.requestBodyIV[:], uint32(c.writeBodyCipher.NonceSize()))
+		c.writeChunkSizeParser, _, c.writePaddingGenerator, c.writeNonceGenerator = initChunkCodecs(c.requestOptions, c.requestBodyIV[:], c.writeBodyCipher.NonceSize())
 		_, err = c.Conn.Write(header)
 	})
 	return err
@@ -357,19 +372,7 @@ func (c *Conn) write(b []byte) (n int, err error) {
 				c.writeInitErr = err
 				return
 			}
-			if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
-				c.writeChunkSizeParser = NewShakeSizeParser(c.responseBodyIV[:])
-
-				if ContainOption(c.requestOptions, OptionGlobalPadding) {
-					c.writePaddingGenerator = c.writeChunkSizeParser.(PaddingLengthGenerator)
-				}
-			} else {
-				c.writeChunkSizeParser = PlainChunkSizeParser{}
-			}
-			if c.writePaddingGenerator == nil {
-				c.writePaddingGenerator = PlainPaddingGenerator{}
-			}
-			c.writeNonceGenerator = GenerateChunkNonce(c.responseBodyIV[:], uint32(c.writeBodyCipher.NonceSize()))
+			c.writeChunkSizeParser, _, c.writePaddingGenerator, c.writeNonceGenerator = initChunkCodecs(c.requestOptions, c.responseBodyIV[:], c.writeBodyCipher.NonceSize())
 		}
 	})
 	if len(encRespHeader) != 0 {
@@ -458,19 +461,7 @@ func (c *Conn) read(b []byte) (n int, err error) {
 				return
 			}
 
-			if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
-				c.readChunkSizeParser = NewShakeSizeParser(c.responseBodyIV[:])
-
-				if ContainOption(c.requestOptions, OptionGlobalPadding) {
-					c.readPaddingGenerator = c.readChunkSizeParser.(PaddingLengthGenerator)
-				}
-			} else {
-				c.readChunkSizeParser = PlainChunkSizeParser{}
-			}
-			if c.readPaddingGenerator == nil {
-				c.readPaddingGenerator = PlainPaddingGenerator{}
-			}
-			c.readNonceGenerator = GenerateChunkNonce(c.responseBodyIV[:], uint32(c.readBodyCipher.NonceSize()))
+			_, c.readChunkSizeParser, c.readPaddingGenerator, c.readNonceGenerator = initChunkCodecs(c.requestOptions, c.responseBodyIV[:], c.readBodyCipher.NonceSize())
 		} else {
 			// assume that EAuthID has been read
 			buf := pool.Get(26) // len(2) + tag(16) + connection_nonce(8)
@@ -515,19 +506,7 @@ func (c *Conn) read(b []byte) (n int, err error) {
 			if c.readBodyCipher, err = c.NewAEAD(c.requestBodyKey[:]); err != nil {
 				return
 			}
-			if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
-				c.readChunkSizeParser = NewShakeSizeParser(c.requestBodyIV[:])
-
-				if ContainOption(c.requestOptions, OptionGlobalPadding) {
-					c.readPaddingGenerator = c.readChunkSizeParser.(PaddingLengthGenerator)
-				}
-			} else {
-				c.readChunkSizeParser = PlainChunkSizeParser{}
-			}
-			if c.readPaddingGenerator == nil {
-				c.readPaddingGenerator = PlainPaddingGenerator{}
-			}
-			c.readNonceGenerator = GenerateChunkNonce(c.requestBodyIV[:], uint32(c.readBodyCipher.NonceSize()))
+			_, c.readChunkSizeParser, c.readPaddingGenerator, c.readNonceGenerator = initChunkCodecs(c.requestOptions, c.requestBodyIV[:], c.readBodyCipher.NonceSize())
 		}
 	})
 	if err != nil {

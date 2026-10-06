@@ -13,10 +13,8 @@ import (
 	"hash/fnv"
 	"time"
 
-	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/daeuniverse/outbound/pool"
-	"github.com/daeuniverse/outbound/protocol"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -123,31 +121,6 @@ func PutEAuthID(dst []byte, cmdKey []byte) []byte {
 	blk, _ := aes.NewCipher(KDF(cmdKey, []byte(KDFSaltConstAuthIDEncryptionKey))[:16])
 	blk.Encrypt(dst[:16], dst[:16])
 	return dst[:16]
-}
-
-func AuthEAuthID(blk cipher.Block, eAuthID []byte, doubleCuckoo *ReplayFilter, startTimestamp int64) error {
-	buf := pool.Get(16)
-	defer pool.Put(buf)
-	blk.Decrypt(buf, eAuthID)
-	if crc32.ChecksumIEEE(buf[:12]) != binary.BigEndian.Uint32(buf[12:16]) {
-		return fmt.Errorf("incorrect checksum")
-	}
-
-	t := int64(binary.BigEndian.Uint64(buf[:8]))
-	now := time.Now().Unix()
-	var threshold int64 = 120
-	if now-startTimestamp <= 40 {
-		threshold = 3 * (now - startTimestamp)
-	}
-	if common.Abs64(now-t) > threshold {
-		return fmt.Errorf("%w: time exceed", protocol.ErrFailAuth)
-	}
-
-	if !doubleCuckoo.Check(eAuthID) {
-		return fmt.Errorf("%w: repeated EAuthID", protocol.ErrReplayAttack)
-	}
-
-	return nil
 }
 
 func ReqInstructionDataFromPool(metadata Metadata) []byte {

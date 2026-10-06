@@ -237,22 +237,14 @@ func (c *directPacketConn) Write(b []byte) (int, error) {
 		return c.UDPConn.Write(b)
 	}
 
-	// Lazy target resolution with thread-safe initialization.
-	// Thread-safety guarantees:
-	// 1. cacheMu in resolveTarget() provides happens-before relationship
-	// 2. atomic.Value.Load/Store provides atomic access to the cached value
-	// 3. The netip.AddrPort value is stored directly in atomic.Value (heap-allocated)
-	if c.cachedDialTgt.Load() == nil {
-		if err := c.resolveTarget(); err != nil {
-			return 0, err
-		}
+	target, err := c.writeTargetAddrPort(c.dialTgt)
+	if err != nil {
+		return 0, err
 	}
-
 	// No lock needed: Go's net.UDPConn.WriteToUDPAddrPort() is thread-safe.
 	// From Go's net package documentation:
 	// "Multiple goroutines may invoke methods on a PacketConn simultaneously."
-	cached := c.cachedDialTgt.Load().(netip.AddrPort)
-	return c.WriteToUDPAddrPort(b, cached)
+	return c.WriteToUDPAddrPort(b, target)
 }
 
 func (c *directPacketConn) Read(b []byte) (int, error) {

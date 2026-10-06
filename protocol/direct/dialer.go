@@ -33,10 +33,6 @@ type DirectDialers struct {
 	Fullcone  netproxy.Dialer
 }
 
-// Dialers is the generation-scoped pair name used by callers that want a
-// snapshot rather than the process-wide lazy globals.
-type Dialers = DirectDialers
-
 // NewDirectDialers builds a generation-scoped pair. It does not modify the
 // exported globals; call InitDirectDialers to publish a pair process-wide.
 func NewDirectDialers(fallbackDNS string) DirectDialers {

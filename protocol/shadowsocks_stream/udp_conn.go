@@ -112,17 +112,29 @@ func (c *UdpConn) ReadFrom(b []byte) (n int, from netip.AddrPort, err error) {
 	return n, from, nil
 }
 
-func (c *UdpConn) writeTo(p []byte, addr socks.Addr) (n int, err error) {
+// sealToPool seals one datagram (IV + socks address + payload, stream-cipher
+// keystream) into a pool buffer owned by the caller. Shared by WriteTo and
+// WriteBatch so the two send paths cannot drift.
+func (c *UdpConn) sealToPool(p []byte, addr socks.Addr) (pool.PB, error) {
 	infoIvLen := c.cipher.InfoIVLen()
 	buf := pool.Get(infoIvLen + len(addr) + len(p))
-	defer pool.Put(buf)
 	enc, err := c.cipher.NewEncryptorInto(buf)
 	if err != nil {
-		return 0, err
+		pool.Put(buf)
+		return nil, err
 	}
 	copy(buf[infoIvLen:], addr)
 	copy(buf[infoIvLen+len(addr):], p)
 	enc.XORKeyStream(buf[infoIvLen:], buf[infoIvLen:])
+	return buf, nil
+}
+
+func (c *UdpConn) writeTo(p []byte, addr socks.Addr) (n int, err error) {
+	buf, err := c.sealToPool(p, addr)
+	if err != nil {
+		return 0, err
+	}
+	defer pool.Put(buf)
 	if _, err = c.PacketConn.WriteTo(buf, c.proxyAddr); err != nil {
 		return 0, err
 	}
@@ -135,6 +147,63 @@ func (c *UdpConn) WriteTo(p []byte, to string) (n int, err error) {
 		return 0, err
 	}
 	return c.writeTo(p, addr)
+}
+
+// WriteBatch implements netproxy.PacketBatchWriter: seal every datagram
+// independently (each is its own UDP datagram with its own IV) and hand the
+// sealed batch to the underlying transport's batched writer in one call,
+// amortizing the per-item syscall. When the underlay has no batched writer
+// the items fall back to sequential synchronous sends, preserving order.
+// Every destination is resolved and sealed before anything is sent, so a
+// pre-send failure is all-or-nothing (n == 0).
+func (c *UdpConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+	addrs := make([]socks.Addr, len(items))
+	for i, item := range items {
+		addr, err := c.cachedTargetAddr(item.Addr)
+		if err != nil {
+			return 0, err
+		}
+		addrs[i] = addr
+	}
+	sealed := make([]pool.PB, len(items))
+	for i, item := range items {
+		s, err := c.sealToPool(item.Data, addrs[i])
+		if err != nil {
+			for _, prev := range sealed[:i] {
+				pool.Put(prev)
+			}
+			return 0, err
+		}
+		sealed[i] = s
+	}
+	if bw, ok := c.PacketConn.(netproxy.PacketBatchWriter); ok {
+		defer func() {
+			for _, s := range sealed {
+				pool.Put(s)
+			}
+		}()
+		enc := make([]netproxy.BatchItem, len(items))
+		for i, s := range sealed {
+			enc[i] = netproxy.BatchItem{Data: s, Addr: c.proxyAddr}
+		}
+		return bw.WriteBatch(enc)
+	}
+	// No batched underlay: sequential synchronous sends in order. Each sealed
+	// datagram returns to the pool right after its send.
+	sent := 0
+	for i := range items {
+		_, err := c.PacketConn.WriteTo(sealed[i], c.proxyAddr)
+		pool.Put(sealed[i])
+		sealed[i] = nil
+		if err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
 }
 
 func (c *UdpConn) cachedTargetAddr(addr string) (socks.Addr, error) {
@@ -155,19 +224,31 @@ func (c *UdpConn) Write(b []byte) (n int, err error) {
 }
 
 func (c *UdpConn) WriteTransport(p []byte) (n int, err error) {
-	infoIvLen := c.cipher.InfoIVLen()
-	buf := pool.Get(infoIvLen + len(p))
-	defer pool.Put(buf)
-	enc, err := c.cipher.NewEncryptorInto(buf)
+	buf, err := c.sealTransportToPool(p)
 	if err != nil {
 		return 0, err
 	}
-	copy(buf[infoIvLen:], p)
-	enc.XORKeyStream(buf[infoIvLen:], buf[infoIvLen:])
+	defer pool.Put(buf)
 	if _, err = c.PacketConn.WriteTo(buf, c.proxyAddr); err != nil {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+// sealTransportToPool seals one transport-mode datagram (IV + payload, no
+// socks address: the tunnel target is fixed at dial time) into a pool buffer
+// owned by the caller.
+func (c *UdpConn) sealTransportToPool(p []byte) (pool.PB, error) {
+	infoIvLen := c.cipher.InfoIVLen()
+	buf := pool.Get(infoIvLen + len(p))
+	enc, err := c.cipher.NewEncryptorInto(buf)
+	if err != nil {
+		pool.Put(buf)
+		return nil, err
+	}
+	copy(buf[infoIvLen:], p)
+	enc.XORKeyStream(buf[infoIvLen:], buf[infoIvLen:])
+	return buf, nil
 }
 
 func (c *UdpConn) Read(b []byte) (n int, err error) {
@@ -235,6 +316,51 @@ func (c *UdpTransportConn) mapTransportPacket(packet *netproxy.ReceivedPacket) (
 
 func (c *UdpTransportConn) WriteTo(p []byte, to string) (n int, err error) {
 	return c.WriteTransport(p)
+}
+
+// WriteBatch implements netproxy.PacketBatchWriter for transport mode: seal
+// every datagram independently (its own IV) and hand the sealed batch to the
+// underlying transport's batched writer when it has one, else send them
+// sequentially. The tunnel target is fixed at dial time, so item addresses
+// are irrelevant here exactly as in WriteTo.
+func (c *UdpTransportConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+	sealed := make([]pool.PB, len(items))
+	for i, item := range items {
+		s, err := c.sealTransportToPool(item.Data)
+		if err != nil {
+			for _, prev := range sealed[:i] {
+				pool.Put(prev)
+			}
+			return 0, err
+		}
+		sealed[i] = s
+	}
+	if bw, ok := c.PacketConn.(netproxy.PacketBatchWriter); ok {
+		defer func() {
+			for _, s := range sealed {
+				pool.Put(s)
+			}
+		}()
+		enc := make([]netproxy.BatchItem, len(items))
+		for i, s := range sealed {
+			enc[i] = netproxy.BatchItem{Data: s, Addr: c.proxyAddr}
+		}
+		return bw.WriteBatch(enc)
+	}
+	sent := 0
+	for i := range items {
+		_, err := c.PacketConn.WriteTo(sealed[i], c.proxyAddr)
+		pool.Put(sealed[i])
+		sealed[i] = nil
+		if err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
 }
 
 func (c *UdpTransportConn) Write(b []byte) (n int, err error) {

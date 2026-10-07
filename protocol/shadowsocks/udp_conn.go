@@ -166,13 +166,16 @@ func (c *UdpConn) Write(b []byte) (n int, err error) {
 // maxMetadataLen returns the maximum possible metadata length for pre-allocation.
 // IPv6 (1 + 16 + 2) = 19 bytes is the maximum.
 
-func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
+// metadataForWrite resolves the per-datagram destination into the session's
+// write metadata. Shared by WriteTo and WriteBatch so the two send paths
+// cannot drift.
+func (c *UdpConn) metadataForWrite(addr string) (Metadata, error) {
 	metadata := Metadata{
 		Metadata: c.metadata,
 	}
 	mdata, err := c.metadataForAddr(addr)
 	if err != nil {
-		return 0, err
+		return Metadata{}, err
 	}
 	metadata.Hostname = mdata.Hostname
 	metadata.Port = mdata.Port
@@ -182,15 +185,18 @@ func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
 	if metadata.Type == protocol.MetadataTypeDomain && len(metadata.Hostname) > 255 {
 		// Reject rather than truncate: a silently shortened domain would send
 		// the datagram to the wrong host.
-		return 0, fmt.Errorf("domain name too long: %d", len(metadata.Hostname))
+		return Metadata{}, fmt.Errorf("domain name too long: %d", len(metadata.Hostname))
 	}
+	return metadata, nil
+}
 
-	// Pre-calculate total size to allocate once
+// sealToPool seals one datagram (salt + metadata + payload, AEAD tag) into a
+// pool buffer that the caller owns and must pool.Put. Shared by WriteTo and
+// WriteBatch.
+func (c *UdpConn) sealToPool(metadata *Metadata, b []byte) (out pool.PB, err error) {
 	// Layout: [salt][metadata][payload][tag]
 	prefixLen := metadataLen(metadata.Type)
 	totalLen := c.cipherConf.SaltLen + prefixLen + len(b) + c.cipherConf.TagLen
-
-	// Single allocation for the entire packet
 	buf := pool.Get(totalLen)
 	defer func() {
 		if err != nil {
@@ -205,7 +211,7 @@ func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
 
 	// Write metadata inline after salt
 	offset := c.cipherConf.SaltLen
-	offset += writeMetadataInline(buf[offset:], &metadata)
+	offset += writeMetadataInline(buf[offset:], metadata)
 
 	// Write payload
 	copy(buf[offset:], b)
@@ -216,8 +222,19 @@ func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
 		CipherConf: c.cipherConf,
 		MasterKey:  c.masterKey,
 	}
-
 	toWrite, err := encryptUDPInPlace(key, buf, payloadEnd, ShadowsocksReusedInfo)
+	if err != nil {
+		return nil, err
+	}
+	return toWrite, nil
+}
+
+func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
+	metadata, err := c.metadataForWrite(addr)
+	if err != nil {
+		return 0, err
+	}
+	toWrite, err := c.sealToPool(&metadata, b)
 	if err != nil {
 		return 0, err
 	}
@@ -227,6 +244,72 @@ func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
 		c.bloom.ExistOrAdd(toWrite[:c.cipherConf.SaltLen])
 	}
 	return c.PacketConn.WriteTo(toWrite, c.proxyAddress)
+}
+
+// WriteBatch implements netproxy.PacketBatchWriter: seal every datagram
+// independently (each is its own UDP datagram with its own salt) and hand the
+// sealed batch to the underlying transport's batched writer in one call,
+// amortizing the per-item syscall the same way the socks5 wrapper does. When
+// the underlay has no batched writer the items fall back to sequential
+// synchronous sends, preserving order. Every destination is resolved and
+// sealed before anything is sent, so a pre-send failure is all-or-nothing
+// (n == 0).
+func (c *UdpConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+	metadatas := make([]Metadata, len(items))
+	for i, item := range items {
+		metadata, err := c.metadataForWrite(item.Addr)
+		if err != nil {
+			return 0, err
+		}
+		metadatas[i] = metadata
+	}
+	sealed := make([]pool.PB, len(items))
+	for i, item := range items {
+		s, err := c.sealToPool(&metadatas[i], item.Data)
+		if err != nil {
+			for _, prev := range sealed[:i] {
+				pool.Put(prev)
+			}
+			return 0, err
+		}
+		sealed[i] = s
+	}
+	if bw, ok := c.PacketConn.(netproxy.PacketBatchWriter); ok {
+		defer func() {
+			for _, s := range sealed {
+				pool.Put(s)
+			}
+		}()
+		if c.bloom != nil {
+			for _, s := range sealed {
+				c.bloom.ExistOrAdd(s[:c.cipherConf.SaltLen])
+			}
+		}
+		enc := make([]netproxy.BatchItem, len(items))
+		for i, s := range sealed {
+			enc[i] = netproxy.BatchItem{Data: s, Addr: c.proxyAddress}
+		}
+		return bw.WriteBatch(enc)
+	}
+	// No batched underlay: sequential synchronous sends in order. Each sealed
+	// datagram returns to the pool right after its send.
+	sent := 0
+	for i := range items {
+		if c.bloom != nil {
+			c.bloom.ExistOrAdd(sealed[i][:c.cipherConf.SaltLen])
+		}
+		_, err := c.PacketConn.WriteTo(sealed[i], c.proxyAddress)
+		pool.Put(sealed[i])
+		sealed[i] = nil
+		if err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
 }
 
 func (c *UdpConn) metadataForAddr(addr string) (protocol.Metadata, error) {

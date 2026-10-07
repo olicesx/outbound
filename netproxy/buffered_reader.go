@@ -66,7 +66,10 @@ type AlreadyReadBuffered interface {
 // timeout-retry loops keep their buffer. A connection abandoned without Close
 // or a terminal read keeps its buffer for GC, which is the pre-pooling
 // behavior. Every release requires an empty buffered window, so no readable
-// byte is ever discarded.
+// byte is ever discarded. A panic raised inside reader.Read by a misbehaving
+// underlay leaves the reader count raised, so the array is never returned:
+// that failure mode loses one array to GC, it can never recycle one that a
+// read might still be touching.
 //
 // Read and ReadBuffered share the connection's reader side — bufio.Reader
 // itself is not safe for concurrent use — while Close may be called from any

@@ -67,9 +67,9 @@ type AlreadyReadBuffered interface {
 // or a terminal read keeps its buffer for GC, which is the pre-pooling
 // behavior. Every release requires an empty buffered window, so no readable
 // byte is ever discarded. A panic raised inside reader.Read by a misbehaving
-// underlay leaves the reader count raised, so the array is never returned:
-// that failure mode loses one array to GC, it can never recycle one that a
-// read might still be touching.
+// underlay counts like any other exit: the read is dropped from the in-flight
+// count, but nothing is released until a terminal state exists (a terminal
+// error or Close), so a window the panic left behind is never recycled.
 //
 // Read and ReadBuffered share the connection's reader side — bufio.Reader
 // itself is not safe for concurrent use — while Close may be called from any
@@ -155,16 +155,34 @@ func (b *BufferedReaderConn) Read(p []byte) (int, error) {
 	b.readers++
 	b.mu.Unlock()
 
-	n, err := b.reader.Read(p)
+	// The exit is deferred so that a panic from the underlying reader cannot
+	// leave the count raised: the count describes reads still inside
+	// reader.Read, and an unwound stack is not one. A stale count would make
+	// every later release impossible (Close included), so restoring it is
+	// correctness, not bookkeeping. The release itself still goes through the
+	// full gate, so the deferred call can only return a drained connection.
+	defer b.exitRead()
 
+	n, err := b.reader.Read(p)
+	if isTerminalReadErr(err) {
+		b.mu.Lock()
+		if b.termErr == nil {
+			b.termErr = err
+		}
+		b.mu.Unlock()
+	}
+	return n, err
+}
+
+// exitRead drops one in-flight read and re-runs the release gate. It is
+// deferred from Read, so it also runs while a panic unwinds; the gate short
+// circuits on the unset terminal error before it touches the reader, which
+// keeps an unwinding reader's window out of the decision.
+func (b *BufferedReaderConn) exitRead() {
 	b.mu.Lock()
 	b.readers--
-	if isTerminalReadErr(err) && b.termErr == nil {
-		b.termErr = err
-	}
 	b.releaseIfDrainedLocked()
 	b.mu.Unlock()
-	return n, err
 }
 
 // Close closes the underlying Conn and returns the pooled buffer when the

@@ -11,6 +11,7 @@ import (
 
 	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/trojanc"
 )
@@ -86,6 +87,49 @@ func (c *PacketConn) WriteTo(p []byte, addr string) (n int, err error) {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+// WriteBatch implements netproxy.PacketBatchWriter: seal every datagram with
+// its own juicity UDP frame (metadata + length) and push the whole batch
+// through one QUIC stream write. Each frame carries its destination address,
+// so full-cone Addr alternation keeps working. Addresses are resolved for
+// every item before the first byte is written, so a parse failure is
+// all-or-nothing (n == 0).
+func (c *PacketConn) WriteBatch(items []netproxy.BatchItem) (n int, err error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+	metadatas := make([]trojanc.Metadata, 0, len(items))
+	total := 0
+	for _, item := range items {
+		if len(item.Data) > 0xffff {
+			return 0, fmt.Errorf("juicity udp payload too large: %d > %d", len(item.Data), 0xffff)
+		}
+		_metadata, err := c.metadataForAddr(item.Addr)
+		if err != nil {
+			return 0, err
+		}
+		metadata := trojanc.Metadata{
+			Metadata: _metadata,
+			Network:  "udp",
+		}
+		metadatas = append(metadatas, metadata)
+		total += metadata.Len() + 2 + len(item.Data)
+	}
+	c.Conn.writeMutex.Lock()
+	defer c.Conn.writeMutex.Unlock()
+	buf := pool.Get(total)
+	defer pool.Put(buf)
+	offset := 0
+	for i, item := range items {
+		offset += len(SealUDP(metadatas[i], buf[offset:], item.Data))
+	}
+	if _, err = c.Conn.writeLocked(buf); err != nil {
+		// One stream write carries every frame; a failure cannot be split
+		// per datagram, so report none instead of guessing.
+		return 0, err
+	}
+	return len(items), nil
 }
 
 func (c *PacketConn) metadataForAddr(addr string) (protocol.Metadata, error) {

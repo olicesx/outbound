@@ -485,7 +485,15 @@ func TestDirectPacketConnUsesProductionResolver(t *testing.T) {
 		t.Skipf("cannot bind a loopback peer for %v", addrs)
 	}
 
-	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	// The production write path resolves the name and sends to whatever
+	// address the resolver returns first, so the client socket must be bound
+	// on that family: on hosts where "localhost" resolves to ::1 first (the
+	// GitHub runners), a udp4 socket cannot carry the write.
+	clientNetwork, clientIP := "udp4", net.ParseIP("127.0.0.1")
+	if first := addrs[0].Unmap(); first.Is6() {
+		clientNetwork, clientIP = "udp6", net.ParseIP("::1")
+	}
+	client, err := net.ListenUDP(clientNetwork, &net.UDPAddr{IP: clientIP, Port: 0})
 	if err != nil {
 		t.Fatalf("ListenUDP(client): %v", err)
 	}

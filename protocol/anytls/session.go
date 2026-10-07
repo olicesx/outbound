@@ -58,6 +58,15 @@ type session struct {
 	// without overflowing the pool cliff.
 	writeBuf []byte
 
+	// wq feeds the session's dedicated writer goroutine (writer.go): every
+	// outgoing frame is queued here so stream writers return immediately
+	// while the TLS write path runs on one goroutine per session.
+	wq *writerQueue
+	// payloadRecycle hands flushed frame payload buffers straight back to
+	// the next enqueue (writer.go) instead of ping-ponging sync.Pool
+	// between the two goroutines.
+	payloadRecycle chan []byte
+
 	// flusher drains the TLS record coalescing layer after each framed write
 	// burst. Nil when the transport writes through directly (tests, non-TLS).
 	flusher flusher
@@ -81,8 +90,11 @@ func newSessionWithPadding(conn net.Conn, seq uint64, padding *atomic.Pointer[pa
 		closeStreamChan: make(chan uint32, 2),
 		heartResponseCh: make(chan struct{}, 1),
 		sendPadding:     true,
+		wq:              newWriterQueue(),
+		payloadRecycle:  make(chan []byte, payloadRecycleSlots),
 	}
 	s.state.Store(sessionStateActive)
+	go s.runWriter()
 	return s
 }
 
@@ -113,15 +125,15 @@ func (s *session) newStream(addr string) (*stream, error) {
 	initialData := newFrame(cmdPSH, sid)
 	initialData.data = tgtAddr
 
+	// The opening group rides the writer queue atomically: settings (first
+	// stream only) + SYN + address PSH leave as one burst and cannot be
+	// interleaved with another stream's frames.
 	if sid == 1 {
 		if _, err := writeFrames(s, settings, syn, initialData); err != nil {
 			return nil, err
 		}
 	} else {
-		if _, err := writeFrame(s, syn); err != nil {
-			return nil, err
-		}
-		if _, err := writeFrame(s, initialData); err != nil {
+		if _, err := writeFrames(s, syn, initialData); err != nil {
 			return nil, err
 		}
 	}
@@ -324,6 +336,10 @@ func (s *session) Close() error {
 	if s.closed.CompareAndSwap(false, true) {
 		s.state.Store(sessionStateClosing)
 		close(s.done)
+		// Stop accepting frames and release every producer and the writer.
+		// Frames still queued are dropped with the session, exactly like
+		// the in-flight write a synchronous close used to break.
+		s.wq.close(net.ErrClosed, s.releaseFrame)
 		s.streamLock.Lock()
 		streams := make([]*stream, 0, len(s.streams))
 		for _, stream := range s.streams {
@@ -342,9 +358,14 @@ func (s *session) Close() error {
 			_ = s.flusher.Flush()
 		}
 		_ = s.conn.Close()
-		s.connLock.Lock()
-		s.writeBuf = nil
-		s.connLock.Unlock()
+		// Release the encode buffer only when the writer is not mid-batch:
+		// a stuck physical write must not delay teardown (the conn close
+		// above already unblocks it), and the writer never borrows again
+		// once the queue is closed.
+		if s.connLock.TryLock() {
+			s.writeBuf = nil
+			s.connLock.Unlock()
+		}
 		s.state.Store(sessionStateClosed)
 		return nil
 	}

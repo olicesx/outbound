@@ -149,12 +149,21 @@ func TestWriteToMalformedAddrDoesNotPinUnconnectedFraming(t *testing.T) {
 
 	refConn := &batchRecConn{}
 	refPacket := &packetStream{stream: &stream{session: newBatchTestSession(t, refConn), id: sid}, addr: addr}
+	// A write deadline keeps each write synchronous (confirmed flush through
+	// the session writer), so the byte comparison below cannot race the
+	// writer goroutine on a slow CI runner.
+	if err := refPacket.SetWriteDeadline(time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
 	if _, err := refPacket.WriteTo(payload, addr); err != nil {
 		t.Fatalf("reference WriteTo: %v", err)
 	}
 
 	conn := &batchRecConn{}
 	ps := &packetStream{stream: &stream{session: newBatchTestSession(t, conn), id: sid}, addr: addr}
+	if err := ps.SetWriteDeadline(time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
 	if _, err := ps.WriteTo(payload, "malformed-no-colon"); err == nil {
 		t.Fatal("WriteTo with a malformed address must be rejected")
 	}
@@ -176,12 +185,19 @@ func TestWriteBatchMalformedAddrDoesNotPinUnconnectedFraming(t *testing.T) {
 
 	refConn := &batchRecConn{}
 	refPacket := &packetStream{stream: &stream{session: newBatchTestSession(t, refConn), id: sid}, addr: addr}
+	// Same synchronous-flush rationale as the WriteTo variant above.
+	if err := refPacket.SetWriteDeadline(time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
 	if _, err := refPacket.WriteTo(payload, addr); err != nil {
 		t.Fatalf("reference WriteTo: %v", err)
 	}
 
 	conn := &batchRecConn{}
 	ps := &packetStream{stream: &stream{session: newBatchTestSession(t, conn), id: sid}, addr: addr}
+	if err := ps.SetWriteDeadline(time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
 	if _, err := ps.WriteBatch([]netproxy.BatchItem{{Data: payload, Addr: "malformed-no-colon"}}); err == nil {
 		t.Fatal("WriteBatch with a malformed address must be rejected")
 	}

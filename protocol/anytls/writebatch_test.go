@@ -50,13 +50,10 @@ func (r *batchRecConn) bytes() []byte {
 
 func newBatchTestSession(t *testing.T, rc *batchRecConn) *session {
 	t.Helper()
-	s := &session{
-		conn:            rc,
-		streams:         make(map[uint32]*stream),
-		done:            make(chan struct{}),
-		closeStreamChan: make(chan uint32, 4),
-		probeMu:         sync.Mutex{},
-	}
+	s := newSession(rc, 1)
+	// The framing-equivalence comparison below needs the byte-exact bursts
+	// the padding scheme would otherwise reshape per burst count.
+	s.sendPadding = false
 	return s
 }
 
@@ -72,12 +69,17 @@ func TestWriteBatchMatchesSequentialWriteTo(t *testing.T) {
 		bytes.Repeat([]byte{0xCC}, 4500), // crosses maxFramePayloadSize split
 	}
 
-	// Sequential reference.
+	// Sequential reference. The write deadline keeps each WriteTo
+	// synchronous (confirmed flush through the session writer), so the
+	// reference emits one burst per call deterministically.
 	seqConn := &batchRecConn{}
 	seqSession := newBatchTestSession(t, seqConn)
 	seqPacket := &packetStream{
 		stream: &stream{session: seqSession, id: sid},
 		addr:   addr,
+	}
+	if err := seqPacket.SetWriteDeadline(time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
 	}
 	for _, p := range payloads {
 		if _, err := seqPacket.WriteTo(p, addr); err != nil {
@@ -91,6 +93,9 @@ func TestWriteBatchMatchesSequentialWriteTo(t *testing.T) {
 	batPacket := &packetStream{
 		stream: &stream{session: batSession, id: sid},
 		addr:   addr,
+	}
+	if err := batPacket.SetWriteDeadline(time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
 	}
 	if n, err := batPacket.WriteBatch([]netproxy.BatchItem{
 		{Data: payloads[0], Addr: addr},

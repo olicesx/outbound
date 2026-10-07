@@ -290,13 +290,23 @@ func TestStreamWriteSplitsOversizedPayload(t *testing.T) {
 	if n != len(payload) {
 		t.Fatalf("Write() n = %d, want %d", n, len(payload))
 	}
-	if len(conn.writes) != 2 {
-		t.Fatalf("writes = %d, want 2", len(conn.writes))
+	// The write is asynchronous through the session writer: wait for the
+	// flush, then check the frame split on the concatenated wire bytes.
+	s.wq.waitDrain()
+	var wire []byte
+	conn.mu.Lock()
+	for _, w := range conn.writes {
+		wire = append(wire, w...)
 	}
-	if got := binary.BigEndian.Uint16(conn.writes[0][5:7]); got != maxFramePayloadSize {
+	conn.mu.Unlock()
+	frames := decodeTestFrames(t, wire)
+	if len(frames) != 2 {
+		t.Fatalf("frames = %d, want 2", len(frames))
+	}
+	if got := len(frames[0].data); got != maxFramePayloadSize {
 		t.Fatalf("first frame length = %d, want %d", got, maxFramePayloadSize)
 	}
-	if got := binary.BigEndian.Uint16(conn.writes[1][5:7]); got != 10 {
+	if got := len(frames[1].data); got != 10 {
 		t.Fatalf("second frame length = %d, want 10", got)
 	}
 }

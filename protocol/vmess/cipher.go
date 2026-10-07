@@ -133,9 +133,20 @@ const kdfMaxChainLen = 8
 // 16 bytes everywhere; longer keys fall back to the reference construction.
 const kdfMaxKeyLen = 256
 
-// kdfScratchSize budgets the concat buffer for the worst chain: the message
-// grows by one pad (64B) per level, so a chain of L levels over a K-byte key
-// consumes 64*L*(L+1)/2 + K*L bytes.
+// kdfMaxPathElemLen bounds the path-element budget of the stack-scratch fast
+// path. An over-sized path element is RFC 2104 pre-hashed through the child
+// chain, and that pre-hash spends scratch proportional to the element length
+// on every level below it; elements past this budget stay on the reference
+// construction, exactly like an over-sized key. Production salts are far
+// below it.
+const kdfMaxPathElemLen = 256
+
+// kdfScratchSize budgets the concat buffer for the worst fast-path chain: the
+// message grows by one pad (64B) per level, so a chain of L levels over a
+// K-byte key consumes at most 64*L*(L+1)/2 + K*L bytes. With
+// L = kdfMaxChainLen and K = kdfMaxKeyLen that is 4352 bytes, which also
+// covers the RFC 2104 pre-hash of a kdfMaxPathElemLen element at the deepest
+// node (at most 64*7*8/2 + 256*7 = 3584 bytes).
 const kdfScratchSize = kdfMaxChainLen*(kdfMaxChainLen+1)/2*sha256.BlockSize + kdfMaxChainLen*kdfMaxKeyLen
 
 // kdfChainNode is one level of the nested-HMAC tree: an HMAC keyed with padKey
@@ -206,10 +217,21 @@ func (n *kdfChainNode) sum(msg, buf []byte) [sha256.Size]byte {
 // 2^(len(path)+1)-1 constructors and turns each handshake into ~250 heap
 // objects; this evaluator walks the identical tree with nodes on the
 // caller's stack and sha256 states from a pool, so a derivation allocates
-// only its result slice.
+// only its result slice. Inputs outside the stack-scratch budget (an empty or
+// too deep path, or a key or path element longer than kdfMaxKeyLen /
+// kdfMaxPathElemLen) fall back to kdfReference, which is unbounded.
 func KDF(key []byte, path ...[]byte) []byte {
 	if len(path) == 0 || len(path) >= kdfMaxChainLen || len(key) > kdfMaxKeyLen {
 		return kdfReference(key, path...)
+	}
+	// An over-sized path element drives its RFC 2104 pre-hash through the
+	// child chain with the same fixed scratch; past the budget that pre-hash
+	// would slice beyond the buffer, so those elements take the reference
+	// construction like an over-sized key does.
+	for _, v := range path {
+		if len(v) > kdfMaxPathElemLen {
+			return kdfReference(key, path...)
+		}
 	}
 	var nodes [kdfMaxChainLen]kdfChainNode
 	var buf [kdfScratchSize]byte

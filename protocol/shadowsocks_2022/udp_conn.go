@@ -250,57 +250,24 @@ func (c *UdpConn) evictOldestIfNeeded() {
 }
 
 func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
-	if !c.IsUsingBlockCipher() {
-		return c.writeToChacha(b, addr)
-	}
-
 	if err := c.ensureCipher(); err != nil {
 		return 0, err
 	}
-
-	packetID := c.nextPacketID()
-	var separateHeader [16]byte
-	copy(separateHeader[:8], c.sessionID[:])
-	binary.BigEndian.PutUint64(separateHeader[8:], packetID)
-
-	var separateHeaderEncrypted [16]byte
-	c.BlockCipherEncrypt().Encrypt(separateHeaderEncrypted[:], separateHeader[:])
-
 	addrInfo, err := c.targetAddrInfo(addr)
 	if err != nil {
 		return 0, oops.Wrapf(err, "fail to parse target address")
 	}
-	addrLen, err := addrInfoEncodedLen(&addrInfo)
-	if err != nil {
-		return 0, oops.Wrapf(err, "fail to calculate address length")
+	packetID := c.nextPacketID()
+	var packet pool.PB
+	if c.IsUsingBlockCipher() {
+		packet, err = c.sealBlockPacket(b, &addrInfo, packetID)
+	} else {
+		packet, err = c.sealChachaPacket(b, &addrInfo, packetID)
 	}
-	messageLen := 1 + 8 + 2 + addrLen + len(b)
-	totalPacketLen := len(separateHeaderEncrypted) + c.IdentityHeaderLen() + messageLen + c.CipherConf().TagLen
-	packet := pool.Get(totalPacketLen)
+	if err != nil {
+		return 0, err
+	}
 	defer pool.Put(packet)
-	offset := 0
-	copy(packet[offset:], separateHeaderEncrypted[:])
-	offset += len(separateHeaderEncrypted)
-
-	identityHeaderLen, err := c.WriteIdentityHeader(packet[offset:], separateHeader[:])
-	if err != nil {
-		return 0, oops.Wrapf(err, "fail to write identity header")
-	}
-	offset += identityHeaderLen
-
-	messageOffset := offset
-	message := packet[messageOffset : messageOffset+messageLen]
-	message[0] = HeaderTypeClientStream
-	binary.BigEndian.PutUint64(message[1:9], uint64(time.Now().Unix()))
-	binary.BigEndian.PutUint16(message[9:11], 0)
-	addrWritten, err := writeAddrInfoTo(message[11:], &addrInfo)
-	if err != nil {
-		return 0, oops.Wrapf(err, "fail to encode request address")
-	}
-	copy(message[11+addrWritten:], b)
-
-	// Use session-level cipher (no cache lookup needed)
-	packet = c.cipher.Seal(packet[:messageOffset], separateHeader[4:16], message, nil)
 
 	n, err := c.Write(packet)
 	if err != nil {
@@ -312,20 +279,62 @@ func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
 	return len(b), nil
 }
 
-func (c *UdpConn) writeToChacha(b []byte, addr string) (int, error) {
-	if err := c.ensureCipher(); err != nil {
-		return 0, err
+// sealBlockPacket seals one datagram for the AES-based ciphers into a pool
+// buffer owned by the caller. Shared by WriteTo and WriteBatch so the two
+// send paths cannot drift.
+func (c *UdpConn) sealBlockPacket(b []byte, addrInfo *socks5.AddressInfo, packetID uint64) (out pool.PB, err error) {
+	addrLen, err := addrInfoEncodedLen(addrInfo)
+	if err != nil {
+		return nil, oops.Wrapf(err, "fail to calculate address length")
 	}
 
-	packetID := c.nextPacketID()
+	var separateHeader [16]byte
+	copy(separateHeader[:8], c.sessionID[:])
+	binary.BigEndian.PutUint64(separateHeader[8:], packetID)
 
-	addrInfo, err := c.targetAddrInfo(addr)
+	var separateHeaderEncrypted [16]byte
+	c.BlockCipherEncrypt().Encrypt(separateHeaderEncrypted[:], separateHeader[:])
+
+	messageLen := 1 + 8 + 2 + addrLen + len(b)
+	totalPacketLen := len(separateHeaderEncrypted) + c.IdentityHeaderLen() + messageLen + c.CipherConf().TagLen
+	packet := pool.Get(totalPacketLen)
+	defer func() {
+		if err != nil {
+			pool.Put(packet)
+		}
+	}()
+	offset := 0
+	copy(packet[offset:], separateHeaderEncrypted[:])
+	offset += len(separateHeaderEncrypted)
+
+	identityHeaderLen, err := c.WriteIdentityHeader(packet[offset:], separateHeader[:])
 	if err != nil {
-		return 0, oops.Wrapf(err, "fail to parse target address")
+		return nil, oops.Wrapf(err, "fail to write identity header")
 	}
-	addrLen, err := addrInfoEncodedLen(&addrInfo)
+	offset += identityHeaderLen
+
+	messageOffset := offset
+	message := packet[messageOffset : messageOffset+messageLen]
+	message[0] = HeaderTypeClientStream
+	binary.BigEndian.PutUint64(message[1:9], uint64(time.Now().Unix()))
+	binary.BigEndian.PutUint16(message[9:11], 0)
+	addrWritten, err := writeAddrInfoTo(message[11:], addrInfo)
 	if err != nil {
-		return 0, oops.Wrapf(err, "fail to calculate address length")
+		return nil, oops.Wrapf(err, "fail to encode request address")
+	}
+	copy(message[11+addrWritten:], b)
+
+	// Use session-level cipher (no cache lookup needed)
+	return c.cipher.Seal(packet[:messageOffset], separateHeader[4:16], message, nil), nil
+}
+
+// sealChachaPacket seals one datagram for the chacha-based ciphers into a
+// pool buffer owned by the caller. Shared by WriteTo and WriteBatch so the
+// two send paths cannot drift.
+func (c *UdpConn) sealChachaPacket(b []byte, addrInfo *socks5.AddressInfo, packetID uint64) (out pool.PB, err error) {
+	addrLen, err := addrInfoEncodedLen(addrInfo)
+	if err != nil {
+		return nil, oops.Wrapf(err, "fail to calculate address length")
 	}
 
 	// Packet structure: nonce + message. EIH never applies here: multi-PSK is
@@ -334,7 +343,11 @@ func (c *UdpConn) writeToChacha(b []byte, addr string) (int, error) {
 	messageLen := 16 + 1 + 8 + 2 + addrLen + len(b)
 	totalPacketLen := udpPacketNonceSize + messageLen + c.CipherConf().TagLen
 	packet := pool.Get(totalPacketLen)
-	defer pool.Put(packet)
+	defer func() {
+		if err != nil {
+			pool.Put(packet)
+		}
+	}()
 
 	nonce := packet[:udpPacketNonceSize]
 	_, _ = fastrand.Read(nonce)
@@ -346,22 +359,85 @@ func (c *UdpConn) writeToChacha(b []byte, addr string) (int, error) {
 	binary.BigEndian.PutUint64(message[17:25], uint64(time.Now().Unix()))
 	binary.BigEndian.PutUint16(message[25:27], 0)
 
-	addrWritten, err := writeAddrInfoTo(message[27:], &addrInfo)
+	addrWritten, err := writeAddrInfoTo(message[27:], addrInfo)
 	if err != nil {
-		return 0, oops.Wrapf(err, "fail to encode request address")
+		return nil, oops.Wrapf(err, "fail to encode request address")
 	}
 	copy(message[27+addrWritten:], b)
 
 	// Seal the entire message
-	packet = c.cipher.Seal(packet[:udpPacketNonceSize], nonce, message, nil)
-	n, err := c.Write(packet)
-	if err != nil {
+	return c.cipher.Seal(packet[:udpPacketNonceSize], nonce, message, nil), nil
+}
+
+// WriteBatch implements netproxy.PacketBatchWriter: seal every datagram
+// independently (each is its own UDP datagram with its own packet ID or
+// nonce) and hand the sealed batch to the underlay's batched writer when it
+// has one (sendmmsg on a direct UDP socket), else send them sequentially.
+// Every destination is resolved and sealed before anything is sent, so a
+// pre-send failure is all-or-nothing (n == 0). Items leave with an empty
+// Addr on the batched underlay path, matching WriteTo's connected write.
+func (c *UdpConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+	if err := c.ensureCipher(); err != nil {
 		return 0, err
 	}
-	if n < len(packet) {
-		return 0, io.ErrShortWrite
+	addrInfos := make([]socks5.AddressInfo, len(items))
+	for i, item := range items {
+		addrInfo, err := c.targetAddrInfo(item.Addr)
+		if err != nil {
+			return 0, oops.Wrapf(err, "fail to parse target address")
+		}
+		addrInfos[i] = addrInfo
 	}
-	return len(b), nil
+	packets := make([]pool.PB, len(items))
+	for i, item := range items {
+		packetID := c.nextPacketID()
+		var packet pool.PB
+		var err error
+		if c.IsUsingBlockCipher() {
+			packet, err = c.sealBlockPacket(item.Data, &addrInfos[i], packetID)
+		} else {
+			packet, err = c.sealChachaPacket(item.Data, &addrInfos[i], packetID)
+		}
+		if err != nil {
+			for _, prev := range packets[:i] {
+				pool.Put(prev)
+			}
+			return 0, err
+		}
+		packets[i] = packet
+	}
+	if bw, ok := c.Conn.(netproxy.PacketBatchWriter); ok {
+		defer func() {
+			for _, packet := range packets {
+				pool.Put(packet)
+			}
+		}()
+		enc := make([]netproxy.BatchItem, len(items))
+		for i, packet := range packets {
+			enc[i] = netproxy.BatchItem{Data: packet}
+		}
+		return bw.WriteBatch(enc)
+	}
+	// No batched underlay: sequential synchronous sends in order. Each sealed
+	// datagram returns to the pool right after its send.
+	sent := 0
+	for i := range items {
+		packet := packets[i]
+		n, err := c.Write(packet)
+		if err == nil && n < len(packet) {
+			err = io.ErrShortWrite
+		}
+		pool.Put(packet)
+		packets[i] = nil
+		if err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
 }
 
 func (c *UdpConn) targetAddrInfo(addr string) (socks5.AddressInfo, error) {

@@ -40,6 +40,26 @@ func (c *FakeNetPacketConn) WriteDeadlineClosesSession() bool {
 	return netproxy.WriteDeadlineClosesSession(c.PacketConn)
 }
 
+// WriteBatch forwards the optional batched writer through this net.Conn
+// compatibility wrapper: embedding the netproxy.PacketConn interface does
+// not promote methods the dynamic type has beyond it, so without this
+// forward the dae aggregator would not see the capability. A wrapped conn
+// without the capability falls back to ordered synchronous sends.
+func (c *FakeNetPacketConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
+	bw, ok := c.PacketConn.(netproxy.PacketBatchWriter)
+	if !ok {
+		sent := 0
+		for _, item := range items {
+			if _, err := c.WriteTo(item.Data, item.Addr); err != nil {
+				return sent, err
+			}
+			sent++
+		}
+		return sent, nil
+	}
+	return bw.WriteBatch(items)
+}
+
 func init() {
 	protocol.Register("shadowsocks_2022", NewDialer)
 }

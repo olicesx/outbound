@@ -415,6 +415,101 @@ func TestBufferedReaderPanicInUnderlayReleasesOnClose(t *testing.T) {
 	}
 }
 
+// closeThenPanicConn blocks inside Read until Close runs, then panics instead
+// of returning the close error: a reader that dies on a session which Close
+// already made terminal.
+type closeThenPanicConn struct {
+	readStarted chan struct{}
+	release     chan struct{}
+	startOnce   sync.Once
+	closeOnce   sync.Once
+}
+
+func newCloseThenPanicConn() *closeThenPanicConn {
+	return &closeThenPanicConn{readStarted: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (c *closeThenPanicConn) Read([]byte) (int, error) {
+	c.startOnce.Do(func() { close(c.readStarted) })
+	<-c.release
+	panic("reader died while the session was already closing")
+}
+
+func (c *closeThenPanicConn) Write([]byte) (int, error) { return 0, nil }
+
+func (c *closeThenPanicConn) Close() error {
+	c.closeOnce.Do(func() { close(c.release) })
+	return nil
+}
+
+func (c *closeThenPanicConn) SetDeadline(time.Time) error      { return nil }
+func (c *closeThenPanicConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *closeThenPanicConn) SetWriteDeadline(time.Time) error { return nil }
+
+// overlongReadConn returns one byte more than the reader asked for. bufio
+// records that oversized window and then panics slicing it, so this is the one
+// panic shape that leaves a non-empty window behind - readable bytes as far as
+// the wrapper can tell.
+type overlongReadConn struct{ scriptConn }
+
+func (*overlongReadConn) Read(p []byte) (int, error) { return len(p) + 1, nil }
+
+// A panic that unwinds a session Close already made terminal must still return
+// the array: every release condition holds (terminal state, no reader in
+// flight, empty window), and this exit is exactly what the deferred accounting
+// exists to reach. Close itself must not have released anything while the read
+// was still inside the reader.
+func TestBufferedReaderPanicAfterTerminalStateReleases(t *testing.T) {
+	raw := newCloseThenPanicConn()
+	c := ForceBufferedReaderConn(raw, 0)
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }()
+		_, _ = c.Read(make([]byte, 8))
+	}()
+	<-raw.readStarted
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if released, _ := lifecycleState(c); released {
+		t.Fatal("Close released the array while a read was still inside the reader")
+	}
+	if r := <-panicked; r == nil {
+		t.Fatal("the reader panic was swallowed")
+	}
+	if released, size := lifecycleState(c); !released || size != 0 {
+		t.Fatalf("the panic did not release the terminal session: released=%v buffer size=%d", released, size)
+	}
+}
+
+// A panic that leaves the window dirty keeps the array, Close included. The
+// wrapper cannot tell those bytes from readable ones, and recycling the array
+// would hand another connection memory this reader still claims to hold; the
+// cost of being wrong here is cross-connection corruption, so the failure mode
+// is losing one array to GC.
+func TestBufferedReaderPanicLeavingDirtyWindowKeepsArray(t *testing.T) {
+	c := ForceBufferedReaderConn(&overlongReadConn{}, 0)
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("the pooled reader did not panic on an overlong read count")
+			}
+		}()
+		_, _ = c.Read(make([]byte, 8))
+	}()
+
+	if released, size := lifecycleState(c); released || size == 0 {
+		t.Fatalf("a corrupt window was released: released=%v buffer size=%d", released, size)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if released, size := lifecycleState(c); released || size == 0 {
+		t.Fatalf("Close recycled an array whose window still reports buffered bytes: released=%v buffer size=%d", released, size)
+	}
+}
+
 // A proxied session on the pooled wrapper: read the payload, drain to the
 // terminal error (which returns the array to the pool), then Close. The plain
 // baseline below keeps the pooling win visible: without it every session pays

@@ -69,7 +69,8 @@ type AlreadyReadBuffered interface {
 // byte is ever discarded. A panic raised inside reader.Read by a misbehaving
 // underlay counts like any other exit: the read is dropped from the in-flight
 // count, but nothing is released until a terminal state exists (a terminal
-// error or Close), so a window the panic left behind is never recycled.
+// error or Close) with a drained window, so a window the panic left behind is
+// never recycled - not even by a later Close.
 //
 // Read and ReadBuffered share the connection's reader side — bufio.Reader
 // itself is not safe for concurrent use — while Close may be called from any

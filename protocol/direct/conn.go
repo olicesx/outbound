@@ -25,12 +25,20 @@ type directPacketConn struct {
 	receiverStop       func()
 	receiverGeneration uint64
 	cachedDialTgt      atomic.Value // stores netip.AddrPort
-	writeTgtCache      common.LastStringValue[netip.AddrPort]
-	cacheMu            sync.Mutex // serializes lazy dial-target resolution in resolveTarget
-	resolver           *net.Resolver
-	batchOnce          sync.Once
-	batchWriter        packetBatchWriter
+	// writeTgtCache remembers resolved non-dial targets so a FullCone socket
+	// relaying to several peers does not re-resolve on every datagram. It is
+	// bounded: a pathological many-peer relay must not grow it without limit,
+	// and eviction only costs one re-resolve.
+	writeTgtCache map[string]netip.AddrPort
+	cacheMu       sync.Mutex // serializes lazy dial-target resolution and the bounded target cache
+	resolver      *net.Resolver
+	batchOnce     sync.Once
+	batchWriter   packetBatchWriter
 }
+
+// writeTgtCacheCapacity bounds the resolved-target cache on one FullCone
+// socket; realistic relays stay well below it.
+const writeTgtCacheCapacity = 8
 
 // Close unregisters the socket from the shared packet receiver before closing
 // its underlying UDP descriptor.
@@ -219,7 +227,10 @@ func (c *directPacketConn) writeTargetAddrPort(addr string) (netip.AddrPort, err
 		}
 		return c.cachedDialTgt.Load().(netip.AddrPort), nil
 	}
-	if cached, ok := c.writeTgtCache.Load(addr); ok {
+	c.cacheMu.Lock()
+	cached, ok := c.writeTgtCache[addr]
+	c.cacheMu.Unlock()
+	if ok {
 		return cached, nil
 	}
 	uAddr, err := resolveUDPAddr(c.resolver, addr)
@@ -228,8 +239,25 @@ func (c *directPacketConn) writeTargetAddrPort(addr string) (netip.AddrPort, err
 	}
 	resolved := uAddr.AddrPort()
 	target := netip.AddrPortFrom(resolved.Addr().Unmap(), resolved.Port())
-	c.writeTgtCache.Store(addr, target)
+	c.cacheMu.Lock()
+	c.storeWriteTgtLocked(addr, target)
+	c.cacheMu.Unlock()
 	return target, nil
+}
+
+// storeWriteTgtLocked inserts into the bounded target cache, evicting an
+// arbitrary entry when full (map iteration order); the caller holds cacheMu.
+func (c *directPacketConn) storeWriteTgtLocked(addr string, target netip.AddrPort) {
+	if c.writeTgtCache == nil {
+		c.writeTgtCache = make(map[string]netip.AddrPort, writeTgtCacheCapacity)
+	}
+	if len(c.writeTgtCache) >= writeTgtCacheCapacity {
+		for victim := range c.writeTgtCache {
+			delete(c.writeTgtCache, victim)
+			break
+		}
+	}
+	c.writeTgtCache[addr] = target
 }
 
 func (c *directPacketConn) Write(b []byte) (int, error) {

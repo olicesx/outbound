@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -362,4 +363,160 @@ func BenchmarkDirectWriteBatchAlternatingPeers(b *testing.B) {
 			b.ReportMetric(float64(calls.Load())/float64(b.N), "resolves/op")
 		})
 	}
+}
+
+// TestDirectPacketConnSlowResolveDoesNotBlockManyTargets is the multi-peer
+// version of TestDirectPacketConnSlowResolveDoesNotBlockOtherTargets: a
+// full-cone relay serves one client per peer, so a parked dial-target lookup
+// must not serialise the writes of every other peer behind it.
+func TestDirectPacketConnSlowResolveDoesNotBlockManyTargets(t *testing.T) {
+	const (
+		slowTarget = "slow-many.example:53"
+		prompt     = 2 * time.Second
+		peers      = 8
+	)
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP(server): %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP(client): %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	serverAddr := server.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	oldResolve := resolveUDPAddr
+	defer func() { resolveUDPAddr = oldResolve }()
+	var parked sync.Once
+	resolving, release := make(chan struct{}), make(chan struct{})
+	resolveUDPAddr = func(_ *net.Resolver, hostport string) (*net.UDPAddr, error) {
+		if host, _, _ := net.SplitHostPort(hostport); host == "slow-many.example" {
+			parked.Do(func() { close(resolving) })
+			<-release
+		}
+		return net.UDPAddrFromAddrPort(serverAddr), nil
+	}
+
+	conn := &directPacketConn{
+		UDPConn:  client,
+		FullCone: true,
+		dialTgt:  slowTarget,
+		resolver: net.DefaultResolver,
+	}
+	slowDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte("slow"))
+		slowDone <- err
+	}()
+	select {
+	case <-resolving:
+	case <-time.After(prompt):
+		t.Fatal("the dial-target resolution never started")
+	}
+
+	blocked := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		errs := make(chan error, peers)
+		for i := range peers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, err := conn.WriteTo([]byte("peer"), fmt.Sprintf("peer-%d.example:53", i))
+				errs <- err
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Errorf("WriteTo(peer) error = %v, want nil", err)
+			}
+		}
+		close(blocked)
+	}()
+	select {
+	case <-blocked:
+	case <-time.After(prompt):
+		t.Fatal("peer writes blocked behind the parked dial-target resolution")
+	}
+
+	close(release)
+	select {
+	case err := <-slowDone:
+		if err != nil {
+			t.Fatalf("Write() to the dial target error = %v, want nil", err)
+		}
+	case <-time.After(prompt):
+		t.Fatal("the dial-target write did not finish after the resolution was released")
+	}
+}
+
+// TestDirectPacketConnUsesProductionResolver keeps the injected-resolver tests
+// honest: a hostname write must resolve through common.ResolveUDPAddr, the
+// default value of resolveUDPAddr, and reach the peer. "localhost" comes from
+// the host's own hosts file, so the test needs no network; the peer is bound on
+// whichever loopback families the resolver can return.
+func TestDirectPacketConnUsesProductionResolver(t *testing.T) {
+	const payload = "hello-production-resolver"
+	addrs, err := net.DefaultResolver.LookupNetIP(t.Context(), "ip", "localhost")
+	if err != nil || len(addrs) == 0 {
+		t.Skipf("cannot resolve localhost from the host's own name sources: %v (%v)", err, addrs)
+	}
+	var servers []*net.UDPConn
+	port := 0
+	for _, addr := range addrs {
+		addr = addr.Unmap()
+		network := "udp4"
+		if addr.Is6() {
+			network = "udp6"
+		}
+		server, err := net.ListenUDP(network, net.UDPAddrFromAddrPort(netip.AddrPortFrom(addr, uint16(port))))
+		if err != nil {
+			continue
+		}
+		t.Cleanup(func() { _ = server.Close() })
+		servers = append(servers, server)
+		port = server.LocalAddr().(*net.UDPAddr).Port
+	}
+	if len(servers) == 0 {
+		t.Skipf("cannot bind a loopback peer for %v", addrs)
+	}
+
+	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP(client): %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	conn := &directPacketConn{
+		UDPConn:  client,
+		FullCone: true,
+		dialTgt:  "127.0.0.1:1",
+		resolver: net.DefaultResolver,
+	}
+	if _, err := conn.WriteTo([]byte(payload), fmt.Sprintf("localhost:%d", port)); err != nil {
+		t.Fatalf("WriteTo(localhost:%d) error = %v; the production resolver path must resolve a hosts-file name", port, err)
+	}
+
+	received := make(chan string, len(servers))
+	for _, server := range servers {
+		go func(server *net.UDPConn) {
+			_ = server.SetReadDeadline(time.Now().Add(3 * time.Second))
+			buf := make([]byte, 128)
+			n, _, err := server.ReadFromUDP(buf)
+			if err != nil {
+				received <- ""
+				return
+			}
+			received <- string(buf[:n])
+		}(server)
+	}
+	for range servers {
+		if got := <-received; got == payload {
+			return
+		}
+	}
+	t.Fatalf("no loopback peer received %q; the production resolver path did not deliver the datagram", payload)
 }

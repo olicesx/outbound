@@ -1,6 +1,8 @@
 package tls
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -72,4 +74,59 @@ func TestSpiderMapsLockReleasedOnPanic(t *testing.T) {
 	}()
 
 	waitForMapsUnlocked(t)
+}
+
+// TestSpiderMapsStayLiveUnderConcurrentHarvests drives the helpers the handshake
+// uses from many goroutines at once. The panic test above pins that the lock is
+// released on a fault; this one pins that ordinary concurrent spider traffic
+// finishes and leaves the lock free, which is the property the wedge broke.
+func TestSpiderMapsStayLiveUnderConcurrentHarvests(t *testing.T) {
+	const (
+		serverName = "spider-concurrent.example"
+		writers    = 8
+		rounds     = 20
+	)
+	prefix := []byte("https://" + serverName)
+
+	maps.Lock()
+	savedMaps, savedBytes := maps.maps, maps.bytes
+	maps.Unlock()
+	t.Cleanup(func() {
+		if !maps.TryLock() {
+			return
+		}
+		maps.maps, maps.bytes = savedMaps, savedBytes
+		maps.Unlock()
+	})
+
+	var wg sync.WaitGroup
+	for i := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range rounds {
+				href := fmt.Sprintf("/c-%d-%d", i, j)
+				paths, _ := spiderPathsFor(serverName, href)
+				if got := spiderHarvest(serverName, paths, prefix, []byte(`<a href="`+href+`">x</a>`)); got == "" {
+					t.Errorf("spiderHarvest() returned no path for %s", href)
+					return
+				}
+				if got := spiderNextPath(paths); got == "" {
+					t.Errorf("spiderNextPath() returned an empty path for %s", href)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	waitForMapsUnlocked(t)
+
+	paths, _ := spiderPathsFor(serverName, "/final")
+	for i := range writers {
+		for j := range rounds {
+			if href := fmt.Sprintf("/c-%d-%d", i, j); !paths[href] {
+				t.Fatalf("path %s was harvested but is missing from the retained set", href)
+			}
+		}
+	}
 }

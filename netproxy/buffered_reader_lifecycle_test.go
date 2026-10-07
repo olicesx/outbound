@@ -352,12 +352,21 @@ func TestBufferedReaderReturnsArrayToThePool(t *testing.T) {
 	t.Fatalf("no session in %d rounds received the array the previous session released: the pool round trip is broken", rounds)
 }
 
-// panicConn panics from Read the way a contract-violating underlay does: bufio
-// panics on a negative read count, so this is the shape the wrapper must
-// survive without corrupting its own accounting.
-type panicConn struct{ scriptConn }
+// negativeReadConn returns a negative count from Read, which is how a
+// misbehaving underlay makes the pooled reader panic for real: bufio guards
+// the count and panics with errNegativeRead from its own frame. The panic
+// therefore originates inside reader.Read, exactly as it would in production,
+// and leaves the reader's window as bufio left it - which is what Close has to
+// read afterwards.
+type negativeReadConn struct{ scriptConn }
 
-func (*panicConn) Read([]byte) (int, error) { panic("underlay violated the Read contract") }
+func (*negativeReadConn) Read([]byte) (int, error) { return -1, nil }
+
+// panickingConn panics from Read directly, covering the panic that does not
+// come from the pooled reader's own guards.
+type panickingConn struct{ scriptConn }
+
+func (*panickingConn) Read([]byte) (int, error) { panic("underlay violated the Read contract") }
 
 func inFlightReaders(c *BufferedReaderConn) int {
 	c.mu.Lock()
@@ -371,28 +380,38 @@ func inFlightReaders(c *BufferedReaderConn) int {
 // down. The panic itself must still propagate, and it must not release
 // anything: the session has no terminal state yet.
 func TestBufferedReaderPanicInUnderlayReleasesOnClose(t *testing.T) {
-	c := ForceBufferedReaderConn(&panicConn{}, 0)
+	for _, tc := range []struct {
+		name string
+		conn Conn
+	}{
+		{"pools own guard (negative count)", &negativeReadConn{}},
+		{"underlay panics from Read", &panickingConn{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := ForceBufferedReaderConn(tc.conn, 0)
 
-	func() {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Fatal("the underlay panic was swallowed instead of propagating")
+			func() {
+				defer func() {
+					if r := recover(); r == nil {
+						t.Fatal("the panic was swallowed instead of propagating")
+					}
+				}()
+				_, _ = c.Read(make([]byte, 8))
+			}()
+
+			if readers := inFlightReaders(c); readers != 0 {
+				t.Fatalf("a panicking read left %d read(s) counted as in flight", readers)
 			}
-		}()
-		_, _ = c.Read(make([]byte, 8))
-	}()
-
-	if readers := inFlightReaders(c); readers != 0 {
-		t.Fatalf("a panicking read left %d read(s) counted as in flight", readers)
-	}
-	if released, size := lifecycleState(c); released || size == 0 {
-		t.Fatalf("the panic released the array without a terminal state: released=%v buffer size=%d", released, size)
-	}
-	if err := c.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if released, size := lifecycleState(c); !released || size != 0 {
-		t.Fatalf("Close after a panicking read did not release: released=%v buffer size=%d", released, size)
+			if released, size := lifecycleState(c); released || size == 0 {
+				t.Fatalf("the panic released the array without a terminal state: released=%v buffer size=%d", released, size)
+			}
+			if err := c.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			if released, size := lifecycleState(c); !released || size != 0 {
+				t.Fatalf("Close after a panicking read did not release: released=%v buffer size=%d", released, size)
+			}
+		})
 	}
 }
 

@@ -153,6 +153,69 @@ func (pc *PacketConn) WriteTo(p []byte, addr string) (n int, err error) {
 	return len(p), nil
 }
 
+// WriteBatch implements netproxy.PacketBatchWriter: encode every datagram as
+// its own XUDP frame (each frame carries its destination address, so
+// full-cone Addr alternation keeps working) and push the whole batch through
+// one underlying write. The first frame of the session still carries the
+// "new" handshake header. Address resolution happens for every item before
+// the first byte is written, so a parse failure is all-or-nothing (n == 0).
+func (pc *PacketConn) WriteBatch(items []netproxy.BatchItem) (n int, err error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+	for _, item := range items {
+		if len(item.Data) > 0xffff {
+			return 0, fmt.Errorf("vision udp payload too large: %d > %d", len(item.Data), 0xffff)
+		}
+	}
+	// Resolve every destination up front: a failure must not leave the
+	// handshake flag flipped or earlier frames on the wire.
+	for _, item := range items {
+		if _, err := pc.addrPortForWrite(item.Addr); err != nil {
+			return 0, err
+		}
+	}
+	pc.muWrite.Lock()
+	defer pc.muWrite.Unlock()
+
+	total := 0
+	prefixes := make([]pool.PB, 0, len(items))
+	defer func() {
+		for _, prefix := range prefixes {
+			prefix.Put()
+		}
+	}()
+	for _, item := range items {
+		prefix, err := pc.prefixPacketLocked(item.Addr)
+		if err != nil {
+			// prefixPacketLocked returns its (already pooled) buffer together
+			// with the error; release it instead of leaking.
+			if prefix != nil {
+				prefix.Put()
+			}
+			return 0, err
+		}
+		prefixes = append(prefixes, prefix)
+		total += len(prefix) + 2 + len(item.Data)
+	}
+	buf := pool.Get(total)
+	defer pool.Put(buf)
+	offset := 0
+	for i, item := range items {
+		offset += copy(buf[offset:], prefixes[i])
+		buf[offset] = byte(len(item.Data) >> 8)
+		buf[offset+1] = byte(len(item.Data))
+		offset += 2
+		offset += copy(buf[offset:], item.Data)
+	}
+	if _, err := pc.writer.Write(buf); err != nil {
+		// One stream write carries every frame; a failure cannot be split
+		// per datagram, so report none instead of guessing.
+		return 0, err
+	}
+	return len(items), nil
+}
+
 func (pc *PacketConn) prefixPacketLocked(addr string) (pool.PB, error) {
 	address, err := pc.addrPortForWrite(addr)
 	if err != nil {

@@ -836,6 +836,25 @@ func (q *quicStreamPacketConn) addressForAddr(addr string) (*Address, error) {
 	return address, nil
 }
 
+// WriteBatch implements netproxy.PacketBatchWriter as a sequential loop over
+// the per-datagram path. The pinned quic-go exposes no batch-send surface
+// (Connection.SendDatagram enqueues exactly one DATAGRAM frame, and the QUIC
+// relay mode opens one uni-stream per datagram by protocol design), so there
+// is nothing to fuse at this layer; the connection's own send queue already
+// coalesces queued datagrams into QUIC packets. The loop keeps the interface
+// contract: ordered items, datagram-count n, and partial success reported as
+// n together with err.
+func (q *quicStreamPacketConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
+	sent := 0
+	for _, item := range items {
+		if _, err := q.WriteTo(item.Data, item.Addr); err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
+}
+
 func (q *quicStreamPacketConn) LocalAddr() net.Addr {
 	return q.quicConn.LocalAddr()
 }

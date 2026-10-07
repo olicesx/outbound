@@ -264,6 +264,11 @@ func (u *udpConn) queueIfNoReceiver(msg *protocol.UDPMessage) bool {
 func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 	u.writeMu.Lock()
 	defer u.writeMu.Unlock()
+	return u.writeLocked(b, addr)
+}
+
+// writeLocked sends one datagram; callers hold writeMu.
+func (u *udpConn) writeLocked(b []byte, addr string) (n int, err error) {
 	if u.closed.Load() || u.SendBuf == nil {
 		return 0, coreErrs.ClosedError{}
 	}
@@ -303,6 +308,26 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 	} else {
 		return len(b), err
 	}
+}
+
+// WriteBatch implements netproxy.PacketBatchWriter as a sequential loop over
+// the per-datagram path. The pinned quic-go exposes no batch-send surface
+// (Connection.SendDatagram enqueues exactly one DATAGRAM frame), so there is
+// nothing to fuse at this layer; the connection's own send queue already
+// coalesces queued frames into QUIC packets. The loop keeps the interface
+// contract (ordered items, datagram-count n, partial success via n+err) and
+// holds the session write lock once for the whole batch.
+func (u *udpConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
+	u.writeMu.Lock()
+	defer u.writeMu.Unlock()
+	sent := 0
+	for _, item := range items {
+		if _, err := u.writeLocked(item.Data, item.Addr); err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
 }
 
 func (u *udpConn) Close() error {

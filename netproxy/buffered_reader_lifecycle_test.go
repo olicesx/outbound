@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"testing"
 	"time"
@@ -305,6 +306,50 @@ func TestBufferedReaderRepeatedCloseIsIdempotent(t *testing.T) {
 	if _, err := c.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("post-release read = %v, want net.ErrClosed", err)
 	}
+}
+
+// The optimization's core claim is the round trip itself: the array a released
+// session used is the array a later session gets. sync.Pool is free to drop an
+// entry at any collection, so the claim is checked as a bounded loop over
+// sessions: one P is pinned and GC frozen to make the reuse immediate in
+// practice, and the loop tolerates a collection that still lands in between. A
+// wrapper that never reaches the pool can never hand its array back, so every
+// round allocates fresh and the loop stays a real falsifier.
+func TestBufferedReaderReturnsArrayToThePool(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+	// Finish any collection already in flight before pools are frozen.
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+
+	const rounds = 8
+	var previous *byte
+	for round := 0; round < rounds; round++ {
+		raw := newStagedReadConn()
+		c := ForceBufferedReaderConn(raw, 0)
+		read := make(chan error, 1)
+		go func() {
+			_, err := c.Read(make([]byte, 1))
+			read <- err
+		}()
+		buf := <-raw.readStarted
+		// Let the parked read finish: the array is released by that reader.
+		close(raw.releaseClose)
+		if err := c.Close(); err != nil {
+			t.Fatalf("round %d Close: %v", round, err)
+		}
+		if err := <-read; !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("round %d read woke with %v, want net.ErrClosed", round, err)
+		}
+		if released, size := lifecycleState(c); !released || size != 0 {
+			t.Fatalf("round %d session did not release: released=%v buffer size=%d", round, released, size)
+		}
+		if previous != nil && previous == buf {
+			return // the array went back to the pool and came out again
+		}
+		previous = buf
+	}
+	t.Fatalf("no session in %d rounds received the array the previous session released: the pool round trip is broken", rounds)
 }
 
 // A proxied session on the pooled wrapper: read the payload, drain to the

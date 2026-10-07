@@ -165,7 +165,7 @@ func (b *BufferedReaderConn) Read(p []byte) (int, error) {
 	defer b.exitRead()
 
 	n, err := b.reader.Read(p)
-	if isTerminalReadErr(err) {
+	if IsTerminalReadErr(err) {
 		b.mu.Lock()
 		if b.termErr == nil {
 			b.termErr = err
@@ -216,13 +216,14 @@ func (b *BufferedReaderConn) releaseIfDrainedLocked() {
 	b.reader.Put()
 }
 
-// isTerminalReadErr classifies read errors after which this wrapper
-// guarantees no future read can still want the buffer. It is deliberately
+// IsTerminalReadErr reports whether err ends a connection's read side, so no
+// future read can still want the read buffer. It is deliberately
 // conservative: deadline-exceeded and other temporary errors are retryable
 // by net.Conn semantics and must not release anything, and a terminal error
 // outside this set (for example ECONNRESET) still releases from Close once
-// the read loop has exited.
-func isTerminalReadErr(err error) bool {
+// the read loop has exited. Transport wrappers that own a pooled read buffer
+// share this classification so their release gates cannot drift apart.
+func IsTerminalReadErr(err error) bool {
 	if err == nil {
 		return false
 	}

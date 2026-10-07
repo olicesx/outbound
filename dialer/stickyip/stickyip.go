@@ -151,8 +151,13 @@ func (c *ProxyIpCache) Set(originalAddr, actualAddr string, network string, ipVe
 // GetWithCycleAndIpVersion returns the cached IP for the specified network and IP version if it belongs to the current check cycle.
 // network should be "tcp" or "udp", ipVersion should be "4" or "6".
 func (c *ProxyIpCache) GetWithCycleAndIpVersion(proxyAddr string, network string, ipVersion string, currentCycle uint64) string {
+	// This lookup runs on every proxy dial; build the debug entries only when
+	// debug logging is actually enabled (the Set path already does this).
+	debugLogs := logger.IsLevelEnabled(logrus.DebugLevel)
 	if c == nil {
-		logger.WithField("proxy_addr", proxyAddr).Debug("[StickyIP] Cache is nil")
+		if debugLogs {
+			logger.WithField("proxy_addr", proxyAddr).Debug("[StickyIP] Cache is nil")
+		}
 		return proxyAddr
 	}
 
@@ -162,7 +167,9 @@ func (c *ProxyIpCache) GetWithCycleAndIpVersion(proxyAddr string, network string
 	entry, ok := c.cache[proxyAddr]
 	if !ok {
 		c.RUnlock()
-		logger.WithField("proxy_addr", proxyAddr).Debug("[StickyIP] No cache entry found")
+		if debugLogs {
+			logger.WithField("proxy_addr", proxyAddr).Debug("[StickyIP] No cache entry found")
+		}
 		return proxyAddr
 	}
 
@@ -170,10 +177,12 @@ func (c *ProxyIpCache) GetWithCycleAndIpVersion(proxyAddr string, network string
 	if now.After(expiredAt) {
 		c.RUnlock()
 		c.deleteIfExpired(proxyAddr, now)
-		logger.WithFields(logrus.Fields{
-			"proxy_addr": proxyAddr,
-			"expired_at": expiredAt,
-		}).Debug("[StickyIP] Cache entry expired")
+		if debugLogs {
+			logger.WithFields(logrus.Fields{
+				"proxy_addr": proxyAddr,
+				"expired_at": expiredAt,
+			}).Debug("[StickyIP] Cache entry expired")
+		}
 		return proxyAddr
 	}
 
@@ -181,11 +190,13 @@ func (c *ProxyIpCache) GetWithCycleAndIpVersion(proxyAddr string, network string
 	if entry.checkCycle != currentCycle {
 		entryCycle := entry.checkCycle
 		c.RUnlock()
-		logger.WithFields(logrus.Fields{
-			"proxy_addr":    proxyAddr,
-			"entry_cycle":   entryCycle,
-			"current_cycle": currentCycle,
-		}).Debug("[StickyIP] Cycle mismatch - cache not from current cycle")
+		if debugLogs {
+			logger.WithFields(logrus.Fields{
+				"proxy_addr":    proxyAddr,
+				"entry_cycle":   entryCycle,
+				"current_cycle": currentCycle,
+			}).Debug("[StickyIP] Cycle mismatch - cache not from current cycle")
+		}
 		return proxyAddr
 	}
 
@@ -205,20 +216,24 @@ func (c *ProxyIpCache) GetWithCycleAndIpVersion(proxyAddr string, network string
 	c.RUnlock()
 
 	if cachedAddr == "" {
-		logger.WithFields(logrus.Fields{
-			"proxy_addr": proxyAddr,
-			"network":    network,
-			"ip_version": ipVersion,
-		}).Debug("[StickyIP] No cached IP for this network type and IP version")
+		if debugLogs {
+			logger.WithFields(logrus.Fields{
+				"proxy_addr": proxyAddr,
+				"network":    network,
+				"ip_version": ipVersion,
+			}).Debug("[StickyIP] No cached IP for this network type and IP version")
+		}
 		return proxyAddr
 	}
 
-	logger.WithFields(logrus.Fields{
-		"proxy_addr":  proxyAddr,
-		"cached_addr": cachedAddr,
-		"network":     network,
-		"ip_version":  ipVersion,
-	}).Debug("[StickyIP] Cache hit - returning cached IP")
+	if debugLogs {
+		logger.WithFields(logrus.Fields{
+			"proxy_addr":  proxyAddr,
+			"cached_addr": cachedAddr,
+			"network":     network,
+			"ip_version":  ipVersion,
+		}).Debug("[StickyIP] Cache hit - returning cached IP")
+	}
 	return cachedAddr
 }
 

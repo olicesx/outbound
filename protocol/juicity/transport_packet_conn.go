@@ -268,6 +268,24 @@ func (c *TransportPacketConn) WriteTo(p []byte, addr string) (n int, err error) 
 	return c.Write(p)
 }
 
+// WriteBatch implements netproxy.PacketBatchWriter as a sequential loop over
+// the per-datagram seal-and-send path. Each item is one independently
+// encrypted UDP datagram on the raw underlay socket, and quic-go exposes no
+// batch-send surface for plain socket writes, so there is nothing to fuse
+// across items; the loop exists so the dae aggregator can rely on the
+// interface (datagram-count semantics included) instead of a fallback. This
+// conn only serves the port-0 underlay auth flow, never relayed traffic.
+func (c *TransportPacketConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
+	sent := 0
+	for _, item := range items {
+		if _, err := c.Write(item.Data); err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
+}
+
 func (c *TransportPacketConn) Close() error {
 	c.ensureLifetime()
 	c.closeOnce.Do(func() {

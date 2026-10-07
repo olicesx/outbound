@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
 )
 
@@ -86,4 +87,52 @@ func (c *Conn) writeTargetAddrPort(addr string) (*net.UDPAddr, error) {
 	addrPort := unmapAddrPort(target.AddrPort())
 	c.writeCache.Store(addr, addrPort)
 	return net.UDPAddrFromAddrPort(addrPort), nil
+}
+
+// WriteBatch implements netproxy.PacketBatchWriter: seal several datagrams
+// (each as its own AEAD chunk, with its own nonce and padding, exactly like
+// WriteTo) and push them with one underlying write. Packet-addr mode
+// prepends each datagram's destination, so full-cone Addr alternation keeps
+// working. Every destination is resolved before the first byte is written,
+// so an address failure is all-or-nothing (n == 0).
+func (c *Conn) WriteBatch(items []netproxy.BatchItem) (n int, err error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+	if c.metadata.Network != "udp" {
+		return 0, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, c.metadata.Network)
+	}
+	datas := make([][]byte, 0, len(items))
+	var release []pool.PB
+	if c.metadata.IsPacketAddr() {
+		release = make([]pool.PB, 0, len(items))
+		for _, item := range items {
+			address, err := c.writeTargetAddrPort(item.Addr)
+			if err != nil {
+				for _, b := range release {
+					pool.Put(b)
+				}
+				return 0, err
+			}
+			packetAddrLen := UDPAddrToPacketAddrLength(address)
+			buf := pool.Get(packetAddrLen + len(item.Data))
+			if err := PutPacketAddr(buf, address); err != nil {
+				pool.Put(buf)
+				for _, b := range release {
+					pool.Put(b)
+				}
+				return 0, err
+			}
+			copy(buf[packetAddrLen:], item.Data)
+			datas = append(datas, buf)
+			release = append(release, buf)
+		}
+	} else {
+		// Fixed target: the destination lives in the request header, so the
+		// plaintext is the payload itself and stays caller-owned.
+		for _, item := range items {
+			datas = append(datas, item.Data)
+		}
+	}
+	return c.writePackets(datas, release)
 }

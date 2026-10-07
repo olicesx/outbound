@@ -351,14 +351,11 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 	}
 }
 
-// Writes data to the connection. Empty b should be written before closing the connection to indicate the terminal.
-func (c *Conn) write(b []byte) (n int, err error) {
-	c.writeMutex.Lock()
-	defer c.writeMutex.Unlock()
-	if c.writeClosed {
-		return 0, net.ErrClosed
-	}
-	var encRespHeader []byte
+// initWriteOnce performs the lazy first-write initialization (the server's
+// encrypted response header plus the body cipher state). It returns the
+// encrypted response header when one was produced; callers must release it
+// with pool.Put. Callers must hold writeMutex.
+func (c *Conn) initWriteOnce() (encRespHeader []byte, err error) {
 	c.initWrite.Do(func() {
 		if !c.metadata.IsClient {
 			header := RespHeaderFromPool(c.responseAuth)
@@ -375,16 +372,33 @@ func (c *Conn) write(b []byte) (n int, err error) {
 			c.writeChunkSizeParser, _, c.writePaddingGenerator, c.writeNonceGenerator = initChunkCodecs(c.requestOptions, c.responseBodyIV[:], c.writeBodyCipher.NonceSize())
 		}
 	})
-	if len(encRespHeader) != 0 {
-		defer pool.Put(encRespHeader)
-	}
 	if err == nil {
 		// The once has already run: a failed init must surface on every
 		// call, or later writes proceed with nil cipher state and panic.
 		err = c.writeInitErr
 	}
+	if err != nil && encRespHeader != nil {
+		// The caller returns on the error without adopting the header;
+		// release the pool buffer here so it cannot leak.
+		pool.Put(encRespHeader)
+		encRespHeader = nil
+	}
+	return encRespHeader, err
+}
+
+// Writes data to the connection. Empty b should be written before closing the connection to indicate the terminal.
+func (c *Conn) write(b []byte) (n int, err error) {
+	c.writeMutex.Lock()
+	defer c.writeMutex.Unlock()
+	if c.writeClosed {
+		return 0, net.ErrClosed
+	}
+	encRespHeader, err := c.initWriteOnce()
 	if err != nil {
 		return 0, err
+	}
+	if len(encRespHeader) != 0 {
+		defer pool.Put(encRespHeader)
 	}
 	if len(b) == 0 {
 		c.writeClosed = true
@@ -401,6 +415,61 @@ func (c *Conn) write(b []byte) (n int, err error) {
 	default:
 		return 0, fmt.Errorf("unsupported network (instruction cmd): %v", c.metadata.Network)
 	}
+}
+
+// writePackets seals several UDP datagrams, each as its own AEAD chunk
+// (nonce and padding are drawn per chunk), and pushes everything with a
+// single underlying write. datas entries are the plaintext of one datagram
+// each; entries in release are pool buffers returned on the way out.
+func (c *Conn) writePackets(datas [][]byte, release []pool.PB) (n int, err error) {
+	defer func() {
+		for _, b := range release {
+			pool.Put(b)
+		}
+	}()
+	c.writeMutex.Lock()
+	defer c.writeMutex.Unlock()
+	if c.writeClosed {
+		return 0, net.ErrClosed
+	}
+	encRespHeader, err := c.initWriteOnce()
+	if err != nil {
+		return 0, err
+	}
+	if len(encRespHeader) != 0 {
+		defer pool.Put(encRespHeader)
+	}
+	sizeSize := int(c.writeChunkSizeParser.SizeBytes())
+	overhead := c.writeBodyCipher.Overhead()
+	maxPadding := int(c.writePaddingGenerator.MaxPaddingLen())
+	total := len(encRespHeader)
+	for _, d := range datas {
+		if sizeSize+len(d)+overhead+maxPadding > 0xffff {
+			// The chunk size parser encodes uint16 only; a larger datagram
+			// would silently wrap and corrupt the stream.
+			return 0, fmt.Errorf("vmess udp chunk too large: %d", len(d))
+		}
+		total += sizeSize + len(d) + overhead + maxPadding
+	}
+	buf := pool.Get(total)
+	defer pool.Put(buf)
+	offset := copy(buf, encRespHeader)
+	for _, d := range datas {
+		encryptedSize := len(d) + overhead
+		paddingSize := int(c.writePaddingGenerator.NextPaddingLen())
+		totalSize := sizeSize + encryptedSize + paddingSize
+		chunk := buf[offset : offset+totalSize]
+		c.writeChunkSizeParser.Encode(uint16(encryptedSize+paddingSize), chunk)
+		c.writeBodyCipher.Seal(chunk[sizeSize:sizeSize], c.writeNonceGenerator(), d, nil)
+		_, _ = fastrand.Read(chunk[len(chunk)-paddingSize:])
+		offset += totalSize
+	}
+	if _, err = c.Conn.Write(buf[:offset]); err != nil {
+		// One stream write carries every chunk; a failure cannot be split
+		// per datagram, so report none instead of guessing.
+		return 0, err
+	}
+	return len(datas), nil
 }
 
 func (c *Conn) Read(b []byte) (n int, err error) {

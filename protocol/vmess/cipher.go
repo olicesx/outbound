@@ -34,11 +34,6 @@ const (
 
 type BytesGenerator func() []byte
 
-// fnv32aPool mirrors shadowsocks' fnv32aPool: the checksummer is per-chunk in
-// ss but per-connection-header here, and pooling keeps the dial hot path
-// allocation-free either way.
-var fnv32aPool = sync.Pool{New: func() any { return fnv.New32a() }}
-
 // ChunkSizeEncoder is a utility class to encode size value into bytes.
 type ChunkSizeEncoder interface {
 	SizeBytes() int32
@@ -214,12 +209,14 @@ func (n *kdfChainNode) sum(msg, buf []byte) [sha256.Size]byte {
 // HMAC(sha256, KDFSaltConstVMessAEADKDF), each path element adds one HMAC
 // level keyed with that element, and the vmess key is written into the final
 // HMAC. The reference builds every tree node with hmac.New, which evaluates
-// 2^(len(path)+1)-1 constructors and turns each handshake into ~250 heap
-// objects; this evaluator walks the identical tree with nodes on the
-// caller's stack and sha256 states from a pool, so a derivation allocates
-// only its result slice. Inputs outside the stack-scratch budget (an empty or
-// too deep path, or a key or path element longer than kdfMaxKeyLen /
-// kdfMaxPathElemLen) fall back to kdfReference, which is unbounded.
+// 2^(len(path)+1)-1 constructors and turns the production three-element shape
+// into 81 allocations / 7152 B per derivation; this evaluator walks the
+// identical tree by value (sha256.Sum256, no hash objects per node) with the
+// pad||msg concat buffer on the caller's stack, so a derivation costs the
+// node array plus its result slice: 2 allocations / 1184 B. Inputs outside
+// the stack-scratch budget (an empty or too deep path, or a key or path
+// element longer than kdfMaxKeyLen / kdfMaxPathElemLen) fall back to
+// kdfReference, which is unbounded.
 func KDF(key []byte, path ...[]byte) []byte {
 	if len(path) == 0 || len(path) >= kdfMaxChainLen || len(key) > kdfMaxKeyLen {
 		return kdfReference(key, path...)
@@ -302,11 +299,9 @@ func ReqInstructionDataFromPool(metadata Metadata) []byte {
 	padding := buf[41+metadata.AddrLen() : 41+metadata.AddrLen()+P]
 	_, _ = fastrand.Read(padding)
 	n := len(buf) - 4
-	h := fnv32aPool.Get().(hash.Hash32)
-	h.Reset()
+	h := fnv.New32a()
 	h.Write(buf[:n])
 	binary.BigEndian.PutUint32(buf[n:], h.Sum32()) // FNV1a
-	fnv32aPool.Put(h)
 	return buf
 }
 

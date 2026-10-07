@@ -219,6 +219,96 @@ func TestDirectPacketConnWriteTgtCacheBounded(t *testing.T) {
 	}
 }
 
+// TestDirectPacketConnSlowResolveDoesNotBlockOtherTargets pins the two-phase
+// target-cache access: resolving the dial target can block for the resolver
+// timeout (seconds), and that resolution must hold no cache lock, or a write
+// to any other peer waits behind it for as long as one lookup takes. The
+// injectable resolver parks the dial-target lookup while the other target is
+// written, so the pre-fix code blocks here until the parked lookup is
+// released instead of completing promptly.
+func TestDirectPacketConnSlowResolveDoesNotBlockOtherTargets(t *testing.T) {
+	const (
+		slowTarget = "slow.example:53"
+		fastTarget = "fast.example:53"
+		// Generous against a loaded -race run: the pre-fix failure mode is a
+		// block until the parked resolver is released, not a slow path.
+		prompt = 2 * time.Second
+	)
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP(server): %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP(client): %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	oldResolve := resolveUDPAddr
+	defer func() { resolveUDPAddr = oldResolve }()
+
+	resolving := make(chan struct{}, 1)
+	// Buffered so the cleanup release cannot block when the resolver was never
+	// entered, and one release can still be left over after the test used one.
+	release := make(chan struct{}, 1)
+	t.Cleanup(func() { release <- struct{}{} })
+
+	resolveUDPAddr = func(_ *net.Resolver, hostport string) (*net.UDPAddr, error) {
+		if hostport == slowTarget {
+			select {
+			case resolving <- struct{}{}:
+			default:
+			}
+			<-release
+		}
+		return net.UDPAddrFromAddrPort(server.LocalAddr().(*net.UDPAddr).AddrPort()), nil
+	}
+
+	conn := &directPacketConn{
+		UDPConn:  client,
+		FullCone: true,
+		dialTgt:  slowTarget,
+		resolver: net.DefaultResolver,
+	}
+
+	slowDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte("slow"))
+		slowDone <- err
+	}()
+	select {
+	case <-resolving:
+	case <-time.After(prompt):
+		t.Fatal("the dial-target resolution never started")
+	}
+
+	fastDone := make(chan error, 1)
+	go func() {
+		_, err := conn.WriteTo([]byte("fast"), fastTarget)
+		fastDone <- err
+	}()
+	select {
+	case err := <-fastDone:
+		if err != nil {
+			t.Fatalf("WriteTo(%s) error = %v, want nil", fastTarget, err)
+		}
+	case <-time.After(prompt):
+		t.Fatal("WriteTo to an unrelated target blocked behind the parked dial-target resolution")
+	}
+
+	release <- struct{}{}
+	select {
+	case err := <-slowDone:
+		if err != nil {
+			t.Fatalf("Write() to the dial target error = %v, want nil", err)
+		}
+	case <-time.After(prompt):
+		t.Fatal("the dial-target write did not finish after the resolution was released")
+	}
+}
+
 // BenchmarkDirectWriteBatchAlternatingPeers measures the FullCone write path
 // with a realistic resolver stub (parsing only, no network): the metric that
 // matters is resolutions per operation, which the bounded cache drops from

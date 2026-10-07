@@ -30,7 +30,7 @@ type directPacketConn struct {
 	// bounded: a pathological many-peer relay must not grow it without limit,
 	// and eviction only costs one re-resolve.
 	writeTgtCache map[string]netip.AddrPort
-	cacheMu       sync.Mutex // serializes lazy dial-target resolution and the bounded target cache
+	cacheMu       sync.Mutex // guards the bounded target cache; never held across a resolve
 	resolver      *net.Resolver
 	batchOnce     sync.Once
 	batchWriter   packetBatchWriter
@@ -201,8 +201,14 @@ func (c *directPacketConn) resolveTarget() error {
 	// Retryable by design: a failure must not be memoized for the lifetime
 	// of the conn (fullcone UDP relays live for hours — a transient resolver
 	// outage at first write would otherwise fail every later write).
-	c.cacheMu.Lock()
-	defer c.cacheMu.Unlock()
+	//
+	// The check and the publication below are two phases around the
+	// resolution, which can block for the resolver timeout: holding cacheMu
+	// across it stalled every lookup of the bounded target cache — and
+	// therefore every write to any other peer — for as long as one lookup
+	// took. Two writers that miss the same brand-new target may now resolve
+	// it concurrently; they publish the same address, so the duplicate only
+	// costs one lookup.
 	if c.cachedDialTgt.Load() != nil {
 		return nil
 	}

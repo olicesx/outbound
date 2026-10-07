@@ -119,6 +119,71 @@ func (c *PacketConn) WriteTo(b []byte, to string) (n int, err error) {
 	return len(b), nil
 }
 
+// WriteBatch implements netproxy.PacketBatchWriter: encode every datagram
+// through the SSR protocol encoder (each packet gets its own obfs/auth
+// envelope, so encoding stays per item) and hand the sealed batch to the
+// wrapped transport's batched writer, or send the items sequentially when it
+// has none. Addresses are resolved and packets encoded before the first
+// send, so a failure reports n == 0. Without this forward the
+// embedded-interface wrapper would hide the capability its inner conn
+// exposes — the same erasure the WriteDeadlineClosesSession forward above
+// guards against.
+func (c *PacketConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
+	addrs := make([]socks.Addr, len(items))
+	for i, item := range items {
+		addr, err := c.targetAddr(item.Addr)
+		if err != nil {
+			return 0, err
+		}
+		addrs[i] = addr
+	}
+
+	c.writeMu.Lock()
+	encoded := make([]pool.PB, len(items))
+	for i, item := range items {
+		pb := pool.Get(len(addrs[i]) + len(item.Data))
+		copy(pb, addrs[i])
+		copy(pb[len(addrs[i]):], item.Data)
+		buf := bytes.NewBuffer(pb)
+		if err := c.Protocol.EncodePkt(buf); err != nil {
+			pool.Put(pb)
+			for _, prev := range encoded[:i] {
+				pool.Put(prev)
+			}
+			c.writeMu.Unlock()
+			return 0, err
+		}
+		// EncodePkt may grow the buffer; own whatever it returned. pool.Put
+		// ignores caps it does not manage, so releasing a grown slice is safe.
+		encoded[i] = buf.Bytes()
+	}
+	c.writeMu.Unlock()
+
+	if bw, ok := c.PacketConn.(netproxy.PacketBatchWriter); ok {
+		defer func() {
+			for _, pkt := range encoded {
+				pool.Put(pkt)
+			}
+		}()
+		enc := make([]netproxy.BatchItem, len(items))
+		for i, pkt := range encoded {
+			enc[i] = netproxy.BatchItem{Data: pkt}
+		}
+		return bw.WriteBatch(enc)
+	}
+	sent := 0
+	for i := range items {
+		_, err := c.PacketConn.Write(encoded[i])
+		pool.Put(encoded[i])
+		encoded[i] = nil
+		if err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
+}
+
 func (c *PacketConn) targetAddr(addr string) (socks.Addr, error) {
 	if cached, ok := c.addrCache.Load(addr); ok {
 		return cached, nil

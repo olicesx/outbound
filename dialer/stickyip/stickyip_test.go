@@ -548,3 +548,146 @@ func TestStickyIpDialerResolvedProxyCancellationStopsFallback(t *testing.T) {
 		t.Fatalf("DialContext() addr = %q, want %q", got, want)
 	}
 }
+
+func TestStickyIpDialerReusesLastKnownIPWhenResolutionFails(t *testing.T) {
+	cache := NewProxyIpCache()
+	const proxyAddr = "proxy.example:443"
+	cache.Set(proxyAddr, "203.0.113.10:443", "tcp", "4", 0)
+
+	parent := &recordingLookupDialer{
+		lookupErr: stderrors.New("dns unreachable"),
+		conn:      nopConn{},
+	}
+	dialer := NewStickyIpDialer(parent, proxyAddr, cache)
+	dialer.IncrementCheckCycle() // the strict getter now misses the cycle-0 entry
+
+	conn, err := dialer.DialContext(context.Background(), "tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("DialContext() error = %v", err)
+	}
+	if conn == nil {
+		t.Fatal("DialContext() returned nil conn")
+	}
+
+	parent.mu.Lock()
+	defer parent.mu.Unlock()
+	if parent.lookupCalls != 1 {
+		t.Fatalf("LookupIPAddr() calls = %d, want 1", parent.lookupCalls)
+	}
+	if len(parent.dialCalls) != 1 {
+		t.Fatalf("DialContext() calls = %d, want 1 (only the last known IP)", len(parent.dialCalls))
+	}
+	if got, want := parent.dialCalls[0][1], "203.0.113.10:443"; got != want {
+		t.Fatalf("DialContext() addr = %q, want %q", got, want)
+	}
+	if got := cache.GetWithCycleAndIpVersion(proxyAddr, "tcp", "4", 1); got != "203.0.113.10:443" {
+		t.Fatalf("cache after last known hit = %q, want the address re-stamped for cycle 1", got)
+	}
+}
+
+func TestStickyIpDialerLastKnownIPRespectsTTL(t *testing.T) {
+	cache := NewProxyIpCache()
+	const proxyAddr = "proxy.example:443"
+	cache.cache[proxyAddr] = &proxyIpEntry{
+		tcp4Addr:   "203.0.113.10:443",
+		expiresAt:  time.Now().Add(-time.Second),
+		checkCycle: 0,
+	}
+
+	parent := &recordingLookupDialer{
+		lookupErr: stderrors.New("dns unreachable"),
+		conn:      nopConn{},
+	}
+	dialer := NewStickyIpDialer(parent, proxyAddr, cache)
+	dialer.IncrementCheckCycle()
+
+	if _, err := dialer.DialContext(context.Background(), "tcp", proxyAddr); err != nil {
+		t.Fatalf("DialContext() error = %v", err)
+	}
+
+	parent.mu.Lock()
+	defer parent.mu.Unlock()
+	if len(parent.dialCalls) != 1 {
+		t.Fatalf("DialContext() calls = %d, want 1", len(parent.dialCalls))
+	}
+	if got, want := parent.dialCalls[0][1], proxyAddr; got != want {
+		t.Fatalf("DialContext() addr = %q, want fallback to original addr %q", got, want)
+	}
+}
+
+func TestStickyIpDialerLastKnownIPDoesNotBypassCycleRefresh(t *testing.T) {
+	cache := NewProxyIpCache()
+	const proxyAddr = "proxy.example:443"
+	cache.Set(proxyAddr, "203.0.113.10:443", "tcp", "4", 0)
+
+	parent := &recordingLookupDialer{
+		lookupResult: []net.IPAddr{{IP: net.ParseIP("203.0.113.99")}},
+		conn:         nopConn{},
+	}
+	dialer := NewStickyIpDialer(parent, proxyAddr, cache)
+	dialer.IncrementCheckCycle()
+
+	if _, err := dialer.DialContext(context.Background(), "tcp", proxyAddr); err != nil {
+		t.Fatalf("DialContext() error = %v", err)
+	}
+
+	parent.mu.Lock()
+	defer parent.mu.Unlock()
+	if len(parent.dialCalls) != 1 {
+		t.Fatalf("DialContext() calls = %d, want 1", len(parent.dialCalls))
+	}
+	if got, want := parent.dialCalls[0][1], "203.0.113.99:443"; got != want {
+		t.Fatalf("DialContext() addr = %q, want freshly resolved %q", got, want)
+	}
+}
+
+func TestStickyIpDialerLastKnownIPFailureFallsBackToOriginalAddr(t *testing.T) {
+	cache := NewProxyIpCache()
+	const proxyAddr = "proxy.example:443"
+	cache.Set(proxyAddr, "203.0.113.10:443", "tcp", "4", 0)
+
+	parent := &recordingLookupDialer{
+		lookupErr: stderrors.New("dns unreachable"),
+		dialFunc: func(_, addr string) (netproxy.Conn, error) {
+			if addr == "203.0.113.10:443" {
+				return nil, stderrors.New("connection refused")
+			}
+			return nopConn{}, nil
+		},
+	}
+	dialer := NewStickyIpDialer(parent, proxyAddr, cache)
+	dialer.IncrementCheckCycle()
+
+	if _, err := dialer.DialContext(context.Background(), "tcp", proxyAddr); err != nil {
+		t.Fatalf("DialContext() error = %v", err)
+	}
+
+	parent.mu.Lock()
+	defer parent.mu.Unlock()
+	if len(parent.dialCalls) != 2 {
+		t.Fatalf("DialContext() calls = %+v, want last known IP then original addr", parent.dialCalls)
+	}
+	if got, want := parent.dialCalls[0][1], "203.0.113.10:443"; got != want {
+		t.Fatalf("first DialContext() addr = %q, want %q", got, want)
+	}
+	if got, want := parent.dialCalls[1][1], proxyAddr; got != want {
+		t.Fatalf("second DialContext() addr = %q, want %q", got, want)
+	}
+}
+
+func TestIncrementCheckCycleKeepsEntryAvailableAsLastKnown(t *testing.T) {
+	cache := NewProxyIpCache()
+	const proxyAddr = "proxy.example:443"
+	cache.Set(proxyAddr, "203.0.113.10:443", "tcp", "4", 0)
+	dialer := NewStickyIpDialer(&recordingLookupDialer{}, proxyAddr, cache)
+
+	dialer.IncrementCheckCycle()
+
+	if got := cache.GetWithCycleAndIpVersion(proxyAddr, "tcp", "4", 1); got != proxyAddr {
+		t.Fatalf("strict getter = %q, want %q after a cycle bump", got, proxyAddr)
+	}
+	addr, ok := cache.GetLastKnown(proxyAddr, "tcp", "4")
+	if !ok || addr != "203.0.113.10:443" {
+		t.Fatalf("GetLastKnown() = %q, %v; want cached address, true", addr, ok)
+	}
+}

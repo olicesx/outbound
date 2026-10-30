@@ -63,6 +63,40 @@ func cacheKey(network, ipVersion string) string {
 	return network + ipVersion
 }
 
+// addrFor returns the address cached for the given protocol and IP version.
+func (e *proxyIpEntry) addrFor(key string) string {
+	switch key {
+	case "tcp4":
+		return e.tcp4Addr
+	case "tcp6":
+		return e.tcp6Addr
+	case "udp4":
+		return e.udp4Addr
+	case "udp6":
+		return e.udp6Addr
+	}
+	return ""
+}
+
+// setAddr stores the address cached for the given protocol and IP version.
+func (e *proxyIpEntry) setAddr(key, addr string) {
+	switch key {
+	case "tcp4":
+		e.tcp4Addr = addr
+	case "tcp6":
+		e.tcp6Addr = addr
+	case "udp4":
+		e.udp4Addr = addr
+	case "udp6":
+		e.udp6Addr = addr
+	}
+}
+
+// isEmpty reports whether no address is cached for any protocol/IP version.
+func (e *proxyIpEntry) isEmpty() bool {
+	return e.tcp4Addr == "" && e.tcp6Addr == "" && e.udp4Addr == "" && e.udp6Addr == ""
+}
+
 // NewProxyIpCache creates a new proxy IP cache.
 func NewProxyIpCache() *ProxyIpCache {
 	return &ProxyIpCache{
@@ -125,17 +159,7 @@ func (c *ProxyIpCache) Set(originalAddr, actualAddr string, network string, ipVe
 	entry.checkCycle = cycle
 
 	// Update the appropriate address based on network type and IP version.
-	key := cacheKey(network, ipVersion)
-	switch key {
-	case "tcp4":
-		entry.tcp4Addr = actualAddr
-	case "tcp6":
-		entry.tcp6Addr = actualAddr
-	case "udp4":
-		entry.udp4Addr = actualAddr
-	case "udp6":
-		entry.udp6Addr = actualAddr
-	}
+	entry.setAddr(cacheKey(network, ipVersion), actualAddr)
 
 	if logger.IsLevelEnabled(logrus.DebugLevel) {
 		logger.WithFields(logrus.Fields{
@@ -201,18 +225,7 @@ func (c *ProxyIpCache) GetWithCycleAndIpVersion(proxyAddr string, network string
 	}
 
 	// Return the protocol and IP version specific cached address.
-	var cachedAddr string
-	key := cacheKey(network, ipVersion)
-	switch key {
-	case "tcp4":
-		cachedAddr = entry.tcp4Addr
-	case "tcp6":
-		cachedAddr = entry.tcp6Addr
-	case "udp4":
-		cachedAddr = entry.udp4Addr
-	case "udp6":
-		cachedAddr = entry.udp6Addr
-	}
+	cachedAddr := entry.addrFor(cacheKey(network, ipVersion))
 	c.RUnlock()
 
 	if cachedAddr == "" {
@@ -247,6 +260,42 @@ func (c *ProxyIpCache) GetWithCycle(proxyAddr string, network string, currentCyc
 	return c.GetWithCycleAndIpVersion(proxyAddr, network, "6", currentCycle)
 }
 
+// GetLastKnown returns the most recently confirmed address for the given
+// protocol and IP version, ignoring the health check cycle it was recorded in.
+//
+// It is a last-resort accessor for the case where re-resolution fails: the
+// address was confirmed by a successful dial when it was cached, and a resolver
+// outage says nothing about whether the proxy still listens there. Entries stay
+// bounded by CacheTTL, so this never resurrects anything beyond the normal cache
+// window, and an address that actually stopped working is still removed by
+// InvalidateProtocolAndIpVersion.
+func (c *ProxyIpCache) GetLastKnown(proxyAddr, network, ipVersion string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+
+	now := time.Now()
+
+	c.RLock()
+	entry, ok := c.cache[proxyAddr]
+	if !ok {
+		c.RUnlock()
+		return "", false
+	}
+	expiredAt := entry.expiresAt
+	cachedAddr := entry.addrFor(cacheKey(network, ipVersion))
+	c.RUnlock()
+
+	if now.After(expiredAt) {
+		c.deleteIfExpired(proxyAddr, now)
+		return "", false
+	}
+	if cachedAddr == "" {
+		return "", false
+	}
+	return cachedAddr, true
+}
+
 // Invalidate removes all cached entries for a proxy address.
 func (c *ProxyIpCache) Invalidate(proxyAddr string) {
 	if c == nil {
@@ -270,20 +319,10 @@ func (c *ProxyIpCache) InvalidateProtocolAndIpVersion(proxyAddr, network, ipVers
 		return
 	}
 
-	key := cacheKey(network, ipVersion)
-	switch key {
-	case "tcp4":
-		entry.tcp4Addr = ""
-	case "tcp6":
-		entry.tcp6Addr = ""
-	case "udp4":
-		entry.udp4Addr = ""
-	case "udp6":
-		entry.udp6Addr = ""
-	}
+	entry.setAddr(cacheKey(network, ipVersion), "")
 
 	// If all addresses are empty now, remove the entry entirely
-	if entry.tcp4Addr == "" && entry.tcp6Addr == "" && entry.udp4Addr == "" && entry.udp6Addr == "" {
+	if entry.isEmpty() {
 		delete(c.cache, proxyAddr)
 	} else {
 		logger.WithFields(logrus.Fields{
@@ -305,17 +344,6 @@ func (c *ProxyIpCache) InvalidateProtocol(proxyAddr, network string) {
 // Deprecated: a bare dialer-local cycle is not globally unique, so this method
 // intentionally does nothing. Invalidation must include the proxy address.
 func (c *ProxyIpCache) InvalidateCycle(cycle uint64) { _ = cycle }
-
-func (c *ProxyIpCache) invalidateProxyCycle(proxyAddr string, cycle uint64) {
-	if c == nil {
-		return
-	}
-	c.Lock()
-	defer c.Unlock()
-	if entry := c.cache[proxyAddr]; entry != nil && entry.checkCycle == cycle {
-		delete(c.cache, proxyAddr)
-	}
-}
 
 // StickyIpDialer wraps a dialer to provide sticky IP caching for proxy servers.
 type StickyIpDialer struct {
@@ -350,6 +378,14 @@ func NewStickyIpDialer(dialer netproxy.Dialer, proxyAddr string, cache *ProxyIpC
 }
 
 // IncrementCheckCycle advances the health check cycle.
+//
+// Advancing the cycle is a soft invalidation: GetWithCycleAndIpVersion only
+// returns addresses stamped with the current cycle, so the next dial re-resolves
+// the proxy domain. The previous cycle's addresses are deliberately kept rather
+// than deleted here — dropping them turned every resolver hiccup right after a
+// cycle bump into "no address at all", even though the last confirmed IP was
+// still listening. They now survive as a bounded stale fallback; see
+// GetLastKnown and dialLastKnownIP.
 func (d *StickyIpDialer) IncrementCheckCycle() {
 	oldCycle := d.checkCycle.Load()
 	newCycle := d.checkCycle.Add(1)
@@ -358,10 +394,6 @@ func (d *StickyIpDialer) IncrementCheckCycle() {
 		"new_cycle":  newCycle,
 		"proxy_addr": d.proxyAddr,
 	}).Debug("[StickyIP] Check cycle incremented")
-	// Cycle values are local to this dialer, so only invalidate its proxy.
-	if newCycle > 0 {
-		d.cache.invalidateProxyCycle(d.proxyAddr, newCycle-1)
-	}
 }
 
 // InvalidateProtocolCache invalidates the cached IP for a specific protocol.
@@ -618,12 +650,30 @@ func (d *StickyIpDialer) dialWithIpResolution(ctx context.Context, network, addr
 		if isCanceledOrClosed(err) {
 			return nil, err
 		}
+		// Re-resolution failed. Retry the last confirmed address before
+		// giving up on the domain: the resolver being down is not evidence
+		// that the proxy stopped listening where it worked a moment ago.
+		if conn, ok := d.dialLastKnownIP(ctx, network, addr, baseNetwork, requestedIPVersion); ok {
+			return conn, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		// Resolution failed, try original address
 		logResolutionError(d.proxyAddr, host, err)
 		return d.dialer.DialContext(ctx, network, addr)
 	}
 	ips = filterIPAddrsByVersion(ips, requestedIPVersion)
 	if len(ips) == 0 {
+		// The resolver answered, but only with the family this dial cannot
+		// use. An address from the other family is still better than failing,
+		// as long as it is one this protocol confirmed earlier.
+		if conn, ok := d.dialLastKnownIP(ctx, network, addr, baseNetwork, requestedIPVersion); ok {
+			return conn, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("no usable proxy IPs for %s%s", baseNetwork, requestedIPVersion)
 	}
 
@@ -677,6 +727,54 @@ func (d *StickyIpDialer) dialWithIpResolution(ctx context.Context, network, addr
 	}
 	logAllIPsFailed(d.proxyAddr, lastErr)
 	return nil, &net.OpError{Op: "dial", Err: lastErr}
+}
+
+// dialLastKnownIP retries the most recently confirmed address after
+// re-resolution fails or yields no address this dial can use.
+//
+// A successful retry re-stamps the entry with the current cycle so the next
+// connection hits the cache directly instead of paying for another resolver
+// timeout first. It reports ok=false when nothing unexpired is cached, or when
+// dialing the stale address fails, so the caller can keep its existing
+// fallback behavior.
+func (d *StickyIpDialer) dialLastKnownIP(ctx context.Context, network, addr, baseNetwork, requestedIPVersion string) (netproxy.Conn, bool) {
+	versions := []string{"4", "6"}
+	if requestedIPVersion != "" {
+		versions = []string{requestedIPVersion}
+	}
+
+	for _, ipVersion := range versions {
+		cachedAddr, ok := d.cache.GetLastKnown(d.proxyAddr, baseNetwork, ipVersion)
+		if !ok {
+			continue
+		}
+
+		targetAddr := rewriteAddrPort(cachedAddr, addr)
+		attemptCtx, cancel := dialAttemptContext(ctx, 1)
+		conn, err := d.dialer.DialContext(attemptCtx, network, targetAddr)
+		cancel()
+		if err != nil {
+			logLastKnownFailure(d.proxyAddr, targetAddr, network, err)
+			if isCanceledOrClosed(err) {
+				return nil, false
+			}
+			continue
+		}
+		if baseNetwork == "udp" {
+			if _, ok := conn.(netproxy.PacketConn); !ok {
+				_ = conn.Close()
+				logLastKnownFailure(d.proxyAddr, targetAddr, network, fmt.Errorf("not a packet connection"))
+				continue
+			}
+		}
+
+		cycle := d.checkCycle.Load()
+		d.cache.Set(d.proxyAddr, targetAddr, baseNetwork, ipVersion, cycle)
+		logLastKnownHit(d.proxyAddr, targetAddr, network, ipVersion, cycle)
+		return conn, true
+	}
+
+	return nil, false
 }
 
 func filterIPAddrsByVersion(ips []net.IPAddr, ipVersion string) []net.IPAddr {
@@ -758,6 +856,29 @@ func logCacheFailure(proxyAddr, cachedAddr, network string, err error) {
 			"network":    network,
 			"error":      err.Error(),
 		}).Debug("[StickyIP] Cached IP failed - invalidating and re-resolving")
+	}
+}
+
+func logLastKnownHit(proxyAddr, cachedAddr, network, ipVersion string, cycle uint64) {
+	if logger.IsLevelEnabled(logrus.DebugLevel) {
+		logger.WithFields(logrus.Fields{
+			"proxy_addr": proxyAddr,
+			"cached_ip":  cachedAddr,
+			"network":    network,
+			"ip_version": ipVersion,
+			"cycle":      cycle,
+		}).Debug("[StickyIP] Re-resolution failed - reused last known proxy IP")
+	}
+}
+
+func logLastKnownFailure(proxyAddr, cachedAddr, network string, err error) {
+	if logger.IsLevelEnabled(logrus.DebugLevel) {
+		logger.WithFields(logrus.Fields{
+			"proxy_addr": proxyAddr,
+			"cached_ip":  cachedAddr,
+			"network":    network,
+			"error":      err.Error(),
+		}).Debug("[StickyIP] Last known proxy IP failed - falling back to original address")
 	}
 }
 

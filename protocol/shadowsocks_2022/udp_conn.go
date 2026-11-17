@@ -28,7 +28,7 @@ import (
 type UdpConn struct {
 	*SS2022Core
 
-	net.Conn
+	netproxy.Conn
 
 	sessionID [8]byte
 	packetID  atomic.Uint64
@@ -76,7 +76,7 @@ type udpSessionReplayState struct {
 // NewUdpConn creates a new UDP connection bound to a shared SS2022 profile.
 // The connection is not bound to the dial context: UDP sessions are
 // long-lived and must not be torn down by the dial's timeout or cancellation.
-func NewUdpConn(conn net.Conn, core *SS2022Core, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
+func NewUdpConn(conn netproxy.Conn, core *SS2022Core, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
 	u := &UdpConn{
 		SS2022Core:     core,
 		Conn:           conn,
@@ -469,6 +469,23 @@ func (c *UdpConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) 
 // reports false; a marker-bearing wrapper in its place reports true.
 func (c *UdpConn) WriteDeadlineClosesSession() bool {
 	return netproxy.WriteDeadlineClosesSession(c.Conn)
+}
+
+// LocalAddr forwards the underlying connection's local address when available.
+// This allows UdpConn to satisfy net.Conn for callers that assert it.
+func (c *UdpConn) LocalAddr() net.Addr {
+	if a, ok := c.Conn.(interface{ LocalAddr() net.Addr }); ok {
+		return a.LocalAddr()
+	}
+	return nil
+}
+
+// RemoteAddr forwards the underlying connection's remote address when available.
+func (c *UdpConn) RemoteAddr() net.Addr {
+	if a, ok := c.Conn.(interface{ RemoteAddr() net.Addr }); ok {
+		return a.RemoteAddr()
+	}
+	return nil
 }
 
 func (c *UdpConn) mapReceivedPacket(packet *netproxy.ReceivedPacket) (*netproxy.ReceivedPacket, bool) {

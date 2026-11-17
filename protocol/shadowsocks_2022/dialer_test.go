@@ -277,3 +277,92 @@ func TestFakeNetPacketConn_ReadUsesPacketSemantics(t *testing.T) {
 		t.Fatalf("unexpected payload: got %q want %q", got, string(wantPayload))
 	}
 }
+
+// bareNetproxyConn implements netproxy.Conn only (no LocalAddr/RemoteAddr).
+type bareNetproxyConn struct{}
+
+func (c *bareNetproxyConn) Read(_ []byte) (int, error)         { return 0, io.EOF }
+func (c *bareNetproxyConn) Write(p []byte) (int, error)        { return len(p), nil }
+func (c *bareNetproxyConn) Close() error                       { return nil }
+func (c *bareNetproxyConn) SetDeadline(_ time.Time) error      { return nil }
+func (c *bareNetproxyConn) SetReadDeadline(_ time.Time) error  { return nil }
+func (c *bareNetproxyConn) SetWriteDeadline(_ time.Time) error { return nil }
+
+type bareDialer struct{}
+
+func (d bareDialer) DialContext(_ context.Context, _, _ string) (netproxy.Conn, error) {
+	return &bareNetproxyConn{}, nil
+}
+
+func TestDialer_UDPChainedBareNetproxyConn(t *testing.T) {
+	d, err := NewDialer(bareDialer{}, protocol.Header{
+		Cipher:       "2022-blake3-aes-256-gcm",
+		Password:     pskBase64(32, 0x33),
+		ProxyAddress: "127.0.0.1:443",
+	})
+	if err != nil {
+		t.Fatalf("NewDialer failed: %v", err)
+	}
+
+	// In a chained-proxy scenario, parentDialer returns a bare netproxy.Conn
+	// that does not implement net.Conn (no LocalAddr/RemoteAddr). ListenPacket
+	// and DialContext("udp", ...) must not panic with interface conversion error.
+	conn, err := d.DialContext(context.Background(), "udp", "8.8.8.8:53")
+	if err != nil {
+		t.Fatalf("DialContext failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// The returned wrapper must also satisfy net.Conn for downstream callers.
+	netConn, ok := conn.(net.Conn)
+	if !ok {
+		t.Fatalf("expected FakeNetPacketConn to satisfy net.Conn, got %T", conn)
+	}
+	if laddr := netConn.LocalAddr(); laddr != nil {
+		t.Fatalf("expected nil LocalAddr from bare underlay, got %v", laddr)
+	}
+	if raddr := netConn.RemoteAddr(); raddr == nil || raddr.String() != "8.8.8.8:53" {
+		t.Fatalf("expected RemoteAddr 8.8.8.8:53, got %v", raddr)
+	}
+}
+
+func TestDialer_UDPChainedShadowsocks2022(t *testing.T) {
+	rawConn := &recordingPacketNetConn{}
+	parentDialer, err := NewDialer(recordingPacketDialer{conn: rawConn}, protocol.Header{
+		Cipher:       "2022-blake3-aes-256-gcm",
+		Password:     pskBase64(32, 0x44),
+		ProxyAddress: "127.0.0.1:1080",
+	})
+	if err != nil {
+		t.Fatalf("parent NewDialer failed: %v", err)
+	}
+
+	childDialer, err := NewDialer(parentDialer, protocol.Header{
+		Cipher:       "2022-blake3-aes-256-gcm",
+		Password:     pskBase64(32, 0x55),
+		ProxyAddress: "127.0.0.1:1081",
+	})
+	if err != nil {
+		t.Fatalf("child NewDialer failed: %v", err)
+	}
+
+	// Chained shadowsocks_2022: parent returns *FakeNetPacketConn.
+	// Child ListenPacket must succeed without panicking:
+	// "interface conversion: *shadowsocks_2022.FakeNetPacketConn is not net.Conn".
+	conn, err := childDialer.DialContext(context.Background(), "udp", "1.1.1.1:53")
+	if err != nil {
+		t.Fatalf("DialContext failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	netConn, ok := conn.(net.Conn)
+	if !ok {
+		t.Fatalf("expected FakeNetPacketConn to satisfy net.Conn, got %T", conn)
+	}
+	if laddr := netConn.LocalAddr(); laddr == nil || laddr.String() != "local" {
+		t.Fatalf("expected forwarded LocalAddr %q, got %v", "local", laddr)
+	}
+	if raddr := netConn.RemoteAddr(); raddr == nil || raddr.String() != "remote" {
+		t.Fatalf("expected forwarded RemoteAddr %q, got %v", "remote", raddr)
+	}
+}

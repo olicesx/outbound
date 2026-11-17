@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 
 	"github.com/daeuniverse/outbound/ciphers"
@@ -58,6 +59,31 @@ func (c *FakeNetPacketConn) WriteBatch(items []netproxy.BatchItem) (int, error) 
 		return sent, nil
 	}
 	return bw.WriteBatch(items)
+}
+
+// LocalAddr forwards the underlying connection's local address when available.
+// This allows FakeNetPacketConn to satisfy net.Conn for callers that assert it.
+func (c *FakeNetPacketConn) LocalAddr() net.Addr {
+	if a, ok := c.PacketConn.(interface{ LocalAddr() net.Addr }); ok {
+		if addr := a.LocalAddr(); addr != nil {
+			return addr
+		}
+	}
+	return nil
+}
+
+// RemoteAddr forwards the underlying connection's remote address when available,
+// or parses the configured target address.
+func (c *FakeNetPacketConn) RemoteAddr() net.Addr {
+	if a, ok := c.PacketConn.(interface{ RemoteAddr() net.Addr }); ok {
+		if addr := a.RemoteAddr(); addr != nil {
+			return addr
+		}
+	}
+	if ap, err := netip.ParseAddrPort(c.Addr); err == nil {
+		return net.UDPAddrFromAddrPort(ap)
+	}
+	return nil
 }
 
 func init() {
@@ -171,13 +197,8 @@ func (d *Dialer) ListenPacket(ctx context.Context, network string, addr string) 
 	if err != nil {
 		return nil, err
 	}
-	// UdpConn embeds net.Conn; a future parent wrapper that does not carry
-	// the address accessors must surface as a dial error, not a panic (the
-	// TCP branch above turns the same condition into an error).
-	netConn, ok := conn.(net.Conn)
-	if !ok {
-		_ = conn.Close()
-		return nil, fmt.Errorf("shadowsocks_2022: UDP underlay does not implement net.Conn: %T", conn)
-	}
-	return NewUdpConn(netConn, d.core, nil)
+	// UdpConn embeds netproxy.Conn; a parent wrapper that does not carry
+	// the address accessors is still accepted, while UdpConn and
+	// FakeNetPacketConn expose LocalAddr/RemoteAddr forwarding.
+	return NewUdpConn(conn, d.core, nil)
 }

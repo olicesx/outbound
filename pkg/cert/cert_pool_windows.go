@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 package cert
@@ -19,6 +20,7 @@ func GetSystemCertPool() (*x509.CertPool, error) {
 		fmt.Println(syscall.GetLastError())
 		return nil, err
 	}
+	defer syscall.CertCloseStore(storeHandle, 0)
 
 	var certs []*x509.Certificate
 	var cert *syscall.CertContext

@@ -2,23 +2,16 @@
 package vision
 
 import (
-	"bytes"
-	gotls "crypto/tls"
 	"errors"
-	"fmt"
-	"reflect"
-	"unsafe"
 
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/transport/tls"
-	utls "github.com/refraction-networking/utls"
 )
 
 var ErrNotTLS13 = errors.New("XTLS Vision based on TLS 1.3 outer connection")
 
 func NewPacketConn(conn netproxy.Conn, userUUID []byte, network string, addr string) (*PacketConn, error) {
 	c, err := NewConn(conn, userUUID)
-	return &PacketConn{c, network, addr}, err
+	return &PacketConn{Conn: c, network: network, addr: addr}, err
 }
 
 func NewConn(conn netproxy.Conn, userUUID []byte) (*Conn, error) {
@@ -36,35 +29,21 @@ func NewConn(conn netproxy.Conn, userUUID []byte) (*Conn, error) {
 	c.reader = &readWrapper{
 		vision: c,
 	}
-	var t reflect.Type
-	var p unsafe.Pointer
-	if iconn, ok := conn.(interface{ IntrinsicConn() netproxy.Conn }); ok {
-		ic := iconn.IntrinsicConn()
-		if tlsConn, ok := ic.(*gotls.Conn); ok {
-			c.Conn = tlsConn.NetConn()
-			c.tlsConn = tlsConn
-			t = reflect.TypeOf(tlsConn).Elem()
-			p = unsafe.Pointer(tlsConn)
-		} else if utlsConn, ok := ic.(*utls.UConn); ok {
-			c.Conn = utlsConn.NetConn()
-			c.tlsConn = utlsConn
-			t = reflect.TypeOf(utlsConn.Conn).Elem()
-			p = unsafe.Pointer(utlsConn.Conn)
-		} else if realityConn, ok := ic.(*tls.RealityUConn); ok {
-			// logrus.Infoln("realityConn")
-			c.Conn = realityConn.NetConn()
-			c.tlsConn = realityConn.UConn
-			t = reflect.TypeOf(realityConn.Conn).Elem()
-			p = unsafe.Pointer(realityConn.Conn)
-		} else {
-			return nil, fmt.Errorf("XTLS only supports TLS and REALITY directly for now: %T", ic)
-		}
-	} else {
-		return nil, fmt.Errorf("XTLS only supports TLS and REALITY directly for now: %T", conn)
+	underlayConn, tlsConn, connType, connPointer, err := visionIntrinsicConn(conn)
+	if err != nil {
+		// NewConn owns conn from here on; close it on every failure or the
+		// vless conn wrapping the dialed underlay leaks.
+		_ = conn.Close()
+		return nil, err
 	}
-	i, _ := t.FieldByName("input")
-	r, _ := t.FieldByName("rawInput")
-	c.input = (*bytes.Reader)(unsafe.Add(p, i.Offset))
-	c.rawInput = (*bytes.Buffer)(unsafe.Add(p, r.Offset))
+	readBuffers, err := visionTLSReadBuffersFor(connType, connPointer)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	c.Conn = underlayConn
+	c.tlsConn = tlsConn
+	c.input = readBuffers.input
+	c.rawInput = readBuffers.rawInput
 	return c, nil
 }

@@ -8,6 +8,7 @@ import (
 	"crypto/rc4"
 	"encoding/binary"
 	"errors"
+	"fmt"
 
 	"github.com/daeuniverse/outbound/common"
 	rand "github.com/daeuniverse/outbound/pkg/fastrand"
@@ -16,8 +17,8 @@ import (
 	"github.com/dgryski/go-idea"
 	"github.com/dgryski/go-rc2"
 	"gitlab.com/yawning/chacha20.git"
-	"golang.org/x/crypto/blowfish"
-	"golang.org/x/crypto/cast5"
+	"golang.org/x/crypto/blowfish" // nolint:staticcheck
+	"golang.org/x/crypto/cast5"    // nolint:staticcheck
 	"golang.org/x/crypto/salsa20/salsa"
 )
 
@@ -46,7 +47,7 @@ func newOFBStream(block cipher.Block, err error, key, iv []byte, doe DecOrEnc) (
 	if err != nil {
 		return nil, err
 	}
-	return cipher.NewOFB(block, iv), nil
+	return cipher.NewOFB(block, iv), nil // nolint:staticcheck
 }
 
 func newAESOFBStream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
@@ -59,9 +60,9 @@ func newCFBStream(block cipher.Block, err error, key, iv []byte, doe DecOrEnc) (
 		return nil, err
 	}
 	if doe == Encrypt {
-		return cipher.NewCFBEncrypter(block, iv), nil
+		return cipher.NewCFBEncrypter(block, iv), nil // nolint:staticcheck
 	} else {
-		return cipher.NewCFBDecrypter(block, iv), nil
+		return cipher.NewCFBDecrypter(block, iv), nil // nolint:staticcheck
 	}
 }
 
@@ -159,9 +160,7 @@ func newRC4Stream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
 }
 
 func newSeedStream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
-	// TODO: SEED block cipher implementation is required
-	block, err := rc2.New(key, 16)
-	return newCFBStream(block, err, key, iv, doe)
+	return nil, errors.New("SEED block cipher is not implemented")
 }
 
 type NoneStream struct {
@@ -256,7 +255,7 @@ func (c *StreamCipher) InitEncrypt() (iv []byte, err error) {
 	}
 	if c.iv == nil {
 		iv = make([]byte, c.info.ivLen)
-		rand.Read(iv)
+		_, _ = rand.Read(iv)
 		c.iv = iv
 	} else {
 		iv = c.iv
@@ -267,22 +266,38 @@ func (c *StreamCipher) InitEncrypt() (iv []byte, err error) {
 	return iv, nil
 }
 
-func (c *StreamCipher) NewEncryptor(iv []byte) (enc cipher.Stream, err error) {
-	if iv == nil {
-		iv = pool.Get(c.info.ivLen)
-		defer pool.Put(iv)
+// NewEncryptorInto initializes an encrypting stream and writes a fresh random
+// IV into iv, which is a caller-provided OUTPUT buffer, not an input: the
+// bytes already in it are overwritten. It must be at least InfoIVLen() bytes
+// long, and the caller sends iv[:InfoIVLen()] on the wire ahead of the
+// ciphertext.
+//
+// The previous name (NewEncryptor) suggested the argument was an input IV,
+// which is the opposite of what it does; a short buffer silently panicked on
+// the reslice below.
+func (c *StreamCipher) NewEncryptorInto(iv []byte) (enc cipher.Stream, err error) {
+	if len(iv) < c.info.ivLen {
+		return nil, fmt.Errorf("stream cipher: IV buffer too short: %d bytes, need %d", len(iv), c.info.ivLen)
 	}
 	iv = iv[:c.info.ivLen]
-	rand.Read(iv)
+	_, _ = rand.Read(iv)
 	return c.info.newStream(c.key, iv, Encrypt)
 }
 
 func (c *StreamCipher) InitDecrypt(iv []byte) (err error) {
+	if len(iv) != c.info.ivLen {
+		return fmt.Errorf("stream cipher: IV must be exactly %d bytes, got %d", c.info.ivLen, len(iv))
+	}
 	c.dec, err = c.info.newStream(c.key, iv, Decrypt)
 	return err
 }
 
+// NewDecryptor returns a decrypting stream for the given wire IV. iv is an
+// INPUT buffer and must be exactly InfoIVLen() bytes.
 func (c *StreamCipher) NewDecryptor(iv []byte) (dec cipher.Stream, err error) {
+	if len(iv) != c.info.ivLen {
+		return nil, fmt.Errorf("stream cipher: IV must be exactly %d bytes, got %d", c.info.ivLen, len(iv))
+	}
 	return c.info.newStream(c.key, iv, Decrypt)
 }
 
@@ -294,7 +309,7 @@ func (c *StreamCipher) Decrypt(dst, src []byte) {
 	c.dec.XORKeyStream(dst, src)
 }
 
-// Clone creates a new cipher at it's initial state.
+// Clone creates a new cipher at its initial state.
 func (c *StreamCipher) Clone() *StreamCipher {
 	// This optimization maybe not necessary. But without this function, we
 	// need to maintain a table cache for newTableCipher and use lock to
@@ -312,6 +327,11 @@ func (c *StreamCipher) Clone() *StreamCipher {
 	nc := *c
 	nc.enc = nil
 	nc.dec = nil
+	// Drop the IV too: keeping it would make InitEncrypt reuse the parent's
+	// IV, encrypting two streams under the same key/IV pair (fatal for CTR,
+	// OFB and CFB). A nil IV also stops the clone from aliasing the parent's
+	// backing array.
+	nc.iv = nil
 	return &nc
 }
 

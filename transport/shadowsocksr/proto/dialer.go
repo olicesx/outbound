@@ -16,7 +16,6 @@ type Dialer struct {
 	Protocol      string
 	ProtocolParam string
 	ObfsOverhead  int
-	protocolData  interface{}
 }
 
 func (d *Dialer) protocolFromInnerConn(conn netproxy.Conn, addr socks.Addr) (proto IProtocol, err error) {
@@ -67,15 +66,20 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (netp
 			if err != nil {
 				return nil, err
 			}
+			// From here on transportConn is owned by this function; every
+			// failure path must close it or the fd leaks.
 			proto, err := d.protocolFromInnerConn(transportConn, addr)
 			if err != nil {
+				_ = transportConn.Close()
 				return nil, err
 			}
 			conn, err := NewConn(transportConn, proto)
 			if err != nil {
+				_ = transportConn.Close()
 				return nil, err
 			}
 			if _, err = conn.Write(addr); err != nil {
+				_ = conn.Close()
 				return nil, fmt.Errorf("failed to write target: %w", err)
 			}
 			return conn, nil
@@ -97,12 +101,18 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (netp
 
 			proto, err := d.protocolFromInnerConn(c, addr)
 			if err != nil {
+				_ = c.Close()
 				return nil, err
 			}
 
-			return NewPacketConn(c, proto, address)
+			packetConn, err := NewPacketConn(c, proto, address)
+			if err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+			return packetConn, nil
 		default:
-			return nil, fmt.Errorf("unsupported inner dialer: %T", nextDialer)
+			return nil, fmt.Errorf("unsupported inner dialer: %T", d.NextDialer)
 		}
 	default:
 		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)

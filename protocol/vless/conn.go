@@ -21,7 +21,7 @@ import (
 )
 
 var (
-	FailAuthErr = fmt.Errorf("incorrect UUID")
+	FailAuthErr = fmt.Errorf("incorrect UUID") // nolint:staticcheck
 )
 
 type Metadata struct {
@@ -36,10 +36,11 @@ type Conn struct {
 	cmdKey              []byte
 	cachedProxyAddrIpIP netip.AddrPort
 
-	writeMutex sync.Mutex
-	readMutex  sync.Mutex
-	onceWrite  bool
-	onceRead   sync.Once
+	writeMutex     sync.Mutex
+	readMutex      sync.Mutex
+	readHeaderDone bool
+	headerErr      error
+	onceWrite      bool
 
 	addonsBytes []byte
 }
@@ -57,14 +58,19 @@ func NewConn(conn netproxy.Conn, metadata Metadata, cmdKey []byte) (c *Conn, err
 	if metadata.Network == "udp" {
 		proxyAddrIp, err := net.ResolveUDPAddr("udp", net.JoinHostPort(c.metadata.Hostname, strconv.Itoa(int(c.metadata.Port))))
 		if err != nil {
+			// NewConn owns conn from here on; close it on every failure or
+			// the dialed underlay leaks.
+			_ = conn.Close()
 			return nil, err
 		}
 		c.cachedProxyAddrIpIP = proxyAddrIp.AddrPort()
 	}
 	if metadata.Network == "tcp" && metadata.IsClient {
 		time.AfterFunc(100*time.Millisecond, func() {
-			// avoid the situation where the server sends messages first
-			if _, err = c.Write(nil); err != nil {
+			// avoid the situation where the server sends messages first.
+			// Use a local error: capturing the named return here would race
+			// with the caller's frame after NewConn returns.
+			if _, werr := c.Write(nil); werr != nil {
 				return
 			}
 		})
@@ -74,6 +80,7 @@ func NewConn(conn netproxy.Conn, metadata Metadata, cmdKey []byte) (c *Conn, err
 			Flow: metadata.Flow,
 		})
 		if err != nil {
+			_ = conn.Close()
 			return nil, err
 		}
 	}
@@ -84,12 +91,19 @@ func (c *Conn) IntrinsicConn() netproxy.Conn {
 	return c.Conn
 }
 
-func (c *Conn) reqHeaderFromPool(payload []byte) (buf []byte) {
+func (c *Conn) CloseWrite() error {
+	return netproxy.ForwardCloseWrite(c.Conn)
+}
+
+// reqHeader builds the request header into a small pooled buffer. The payload
+// is written separately via net.Buffers so a large payload cannot inflate this
+// buffer past the pool's largest bucket (the same cliff anytls hit).
+func (c *Conn) reqHeader() (buf []byte) {
 	addrLen := c.metadata.AddrLen()
 	if !c.metadata.Mux {
-		buf = pool.Get(1 + 16 + len(c.addonsBytes) + 1 + 1 + 2 + 1 + addrLen + len(payload))
+		buf = pool.Get(1 + 16 + len(c.addonsBytes) + 1 + 1 + 2 + 1 + addrLen)
 	} else {
-		buf = pool.Get(1 + 16 + len(c.addonsBytes) + 1 + 1 + len(payload))
+		buf = pool.Get(1 + 16 + len(c.addonsBytes) + 1 + 1)
 	}
 	start := 0
 	buf[start] = 0 // version
@@ -108,12 +122,9 @@ func (c *Conn) reqHeaderFromPool(payload []byte) (buf []byte) {
 		buf[start] = vmess.MetadataTypeToByte(c.metadata.Type) // addr type
 		start += 1
 		c.metadata.PutAddr(buf[start:])
-		start += addrLen
 	} else {
 		buf[start] = vmess.NetworkToByte("mux") // inst
-		start += 1
 	}
-	copy(buf[start:], payload)
 	return buf
 }
 
@@ -123,10 +134,9 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 	defer c.writeMutex.Unlock()
 	if c.metadata.Network == "udp" && c.metadata.Flow != XRV {
 		// logrus.Println("!!!", "UDP, write")
-		bLen := pool.Get(2)
-		defer pool.Put(bLen)
-		binary.BigEndian.PutUint16(bLen, uint16(len(b)))
-		if _, err = c.write(bLen); err != nil {
+		var bLen [2]byte
+		binary.BigEndian.PutUint16(bLen[:], uint16(len(b)))
+		if _, err = c.write(bLen[:]); err != nil {
 			return 0, err
 		}
 	}
@@ -136,9 +146,13 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 func (c *Conn) write(b []byte) (n int, err error) {
 	if !c.onceWrite {
 		if c.metadata.IsClient {
-			buf := c.reqHeaderFromPool(b)
-			defer pool.Put(buf)
-			if _, err = c.Conn.Write(buf); err != nil {
+			header := c.reqHeader()
+			defer pool.Put(header)
+			buffers := net.Buffers{header}
+			if len(b) > 0 {
+				buffers = append(buffers, b)
+			}
+			if _, err = buffers.WriteTo(c.Conn); err != nil {
 				return 0, fmt.Errorf("write header: %w", err)
 			}
 			c.onceWrite = true
@@ -157,34 +171,46 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 		// defer func() {
 		// 	logrus.Println("READ", n, err)
 		// }()
-		bLen := pool.Get(2)
-		defer pool.Put(bLen)
-		if _, err = io.ReadFull(&netproxy.ReadWrapper{ReadFunc: c.read}, bLen); err != nil {
+		var bLen [2]byte
+		if _, err = io.ReadFull(&netproxy.ReadWrapper{ReadFunc: c.read}, bLen[:]); err != nil {
 			return 0, err
 		}
-		length := int(binary.BigEndian.Uint16(bLen))
+		length := int(binary.BigEndian.Uint16(bLen[:]))
 		if len(b) < length {
+			if _, discardErr := io.CopyN(io.Discard, &netproxy.ReadWrapper{ReadFunc: c.read}, int64(length)); discardErr != nil && err == nil {
+				err = discardErr
+			}
+			if err != nil {
+				return 0, err
+			}
 			return 0, fmt.Errorf("buf size is not enough")
 		}
+		// Read exactly one framed datagram: a plain c.read(b) here could
+		// return a partial or spanning chunk of the UDP-over-TCP stream.
+		return io.ReadFull(&netproxy.ReadWrapper{ReadFunc: c.read}, b[:length])
 	}
 
 	return c.read(b)
 }
 
 func (c *Conn) read(b []byte) (n int, err error) {
-	c.onceRead.Do(func() {
+	if c.headerErr != nil {
+		return 0, c.headerErr
+	}
+	// Client reads the server's response header; server reads the client's
+	// request header. A failed io.ReadFull cannot be retried: those bytes
+	// are already gone, so the error is sticky.
+	if !c.readHeaderDone {
 		if c.metadata.IsClient {
-			if err = c.ReadRespHeader(); err != nil {
-				return
-			}
+			err = c.ReadRespHeader()
 		} else {
-			if err = c.ReadReqHeader(); err != nil {
-				return
-			}
+			err = c.ReadReqHeader()
 		}
-	})
-	if err != nil {
-		return 0, err
+		if err != nil {
+			c.headerErr = err
+			return 0, err
+		}
+		c.readHeaderDone = true
 	}
 	return c.Conn.Read(b)
 }
@@ -196,9 +222,11 @@ func (c *Conn) ReadReqHeader() (err error) {
 		return err
 	}
 	if buf[0] != 0 {
+		_ = c.Conn.Close()
 		return fmt.Errorf("version %v is not supprted", buf[0])
 	}
 	if subtle.ConstantTimeCompare(c.cmdKey[:16], buf[1:17]) != 1 {
+		_ = c.Conn.Close()
 		return FailAuthErr
 	}
 	if _, err = io.CopyN(io.Discard, c.Conn, int64(buf[17])); err != nil { // ignore addons
@@ -222,6 +250,7 @@ func (c *Conn) ReadRespHeader() (err error) {
 		return err
 	}
 	if buf[0] != 0 {
+		_ = c.Conn.Close()
 		return fmt.Errorf("version %v is not supprted", buf[0])
 	}
 	if _, err = io.CopyN(io.Discard, c.Conn, int64(buf[1])); err != nil {

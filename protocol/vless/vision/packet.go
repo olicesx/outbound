@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/netip"
 
+	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/common/iout"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
@@ -14,10 +15,13 @@ import (
 
 var _ netproxy.PacketConn = (*PacketConn)(nil)
 
+var parseAddrPort = netip.ParseAddrPort
+
 type PacketConn struct {
 	*Conn
 	network string
 	addr    string
+	target  common.LastStringValue[netip.AddrPort]
 }
 
 func (c *PacketConn) Read(b []byte) (n int, err error) {
@@ -51,59 +55,65 @@ func (c *PacketConn) Write(b []byte) (n int, err error) {
 // |   Length Data     |     Payload      |
 // +-------------------+-------------------+
 func (c *PacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
-	// Read frame length (2 bytes)
-	var frameLengthBytes [2]byte
-	if _, err = io.ReadFull(c.Conn, frameLengthBytes[:]); err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-	frameLength := binary.BigEndian.Uint16(frameLengthBytes[:])
-
-	// Read frame header (4 bytes)
-	var frameHeaderBytes [4]byte
-	if _, err = io.ReadFull(c.Conn, frameHeaderBytes[:]); err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-
-	switch frameHeaderBytes[2] {
-	case 0x01:
-		return 0, netip.AddrPort{}, fmt.Errorf("unexpected frame new")
-	case 0x02:
-		// Keep
-		if frameLength > 4 {
-			addrData := make([]byte, frameLength-4)
-			if _, err = io.ReadFull(c.Conn, addrData); err != nil {
-				return 0, netip.AddrPort{}, err
-			}
-			addr, err = ReadPacketAddr(addrData)
-			if err != nil {
-				return 0, netip.AddrPort{}, err
-			}
+	for {
+		// Read frame length (2 bytes)
+		var frameLengthBytes [2]byte
+		if _, err = io.ReadFull(c.Conn, frameLengthBytes[:]); err != nil {
+			return 0, netip.AddrPort{}, err
 		}
-	case 0x03:
-		return 0, netip.AddrPort{}, io.EOF
-	case 0x04:
-		// KeepAlive
-	default:
-		return 0, netip.AddrPort{}, fmt.Errorf("unsupported frame header: %x", frameHeaderBytes[2])
-	}
+		frameLength := binary.BigEndian.Uint16(frameLengthBytes[:])
 
-	if frameHeaderBytes[3]&1 != 1 {
-		return c.ReadFrom(p)
-	}
+		// Read frame header (4 bytes)
+		var frameHeaderBytes [4]byte
+		if _, err = io.ReadFull(c.Conn, frameHeaderBytes[:]); err != nil {
+			return 0, netip.AddrPort{}, err
+		}
 
-	// Read length and payload
-	var lengthBytes [2]byte
-	if _, err = io.ReadFull(c.Conn, lengthBytes[:]); err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-	length := binary.BigEndian.Uint16(lengthBytes[:])
+		addr = netip.AddrPort{}
+		switch frameHeaderBytes[2] {
+		case 0x01:
+			return 0, netip.AddrPort{}, fmt.Errorf("unexpected frame new")
+		case 0x02:
+			// Keep
+			if frameLength > 4 {
+				addrData := make([]byte, frameLength-4)
+				if _, err = io.ReadFull(c.Conn, addrData); err != nil {
+					return 0, netip.AddrPort{}, err
+				}
+				addr, err = ReadPacketAddr(addrData)
+				if err != nil {
+					return 0, netip.AddrPort{}, err
+				}
+			}
+		case 0x03:
+			return 0, netip.AddrPort{}, io.EOF
+		case 0x04:
+			// KeepAlive
+		default:
+			return 0, netip.AddrPort{}, fmt.Errorf("unsupported frame header: %x", frameHeaderBytes[2])
+		}
 
-	if length > uint16(len(p)) {
-		return 0, netip.AddrPort{}, fmt.Errorf("buffer too small")
-	}
+		if frameHeaderBytes[3]&1 != 1 {
+			continue
+		}
 
-	n, err = io.ReadFull(c.Conn, p[:length])
-	return n, addr, err
+		// Read length and payload
+		var lengthBytes [2]byte
+		if _, err = io.ReadFull(c.Conn, lengthBytes[:]); err != nil {
+			return 0, netip.AddrPort{}, err
+		}
+		length := binary.BigEndian.Uint16(lengthBytes[:])
+
+		if length > uint16(len(p)) {
+			if _, discardErr := io.CopyN(io.Discard, c.Conn, int64(length)); discardErr != nil {
+				return 0, netip.AddrPort{}, discardErr
+			}
+			return 0, netip.AddrPort{}, io.ErrShortBuffer
+		}
+
+		n, err = io.ReadFull(c.Conn, p[:length])
+		return n, addr, err
+	}
 }
 
 // +------------------------+------------------------+
@@ -123,8 +133,11 @@ func (c *PacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) 
 // |   Data Length (2B)     |      Payload          |
 // +------------------------+------------------------+
 func (pc *PacketConn) WriteTo(p []byte, addr string) (n int, err error) {
+	pc.muWrite.Lock()
+	defer pc.muWrite.Unlock()
+
 	dataLen := len(p)
-	prefix, err := pc.prefixPacket(addr)
+	prefix, err := pc.prefixPacketLocked(addr)
 	if err != nil {
 		return 0, err
 	}
@@ -136,8 +149,8 @@ func (pc *PacketConn) WriteTo(p []byte, addr string) (n int, err error) {
 	return len(p), nil
 }
 
-func (pc *PacketConn) prefixPacket(addr string) (pool.PB, error) {
-	address, err := netip.ParseAddrPort(addr)
+func (pc *PacketConn) prefixPacketLocked(addr string) (pool.PB, error) {
+	address, err := pc.addrPortForWrite(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -168,6 +181,18 @@ func (pc *PacketConn) prefixPacket(addr string) (pool.PB, error) {
 	}
 
 	return prefix, err
+}
+
+func (pc *PacketConn) addrPortForWrite(addr string) (netip.AddrPort, error) {
+	if cached, ok := pc.target.Load(addr); ok {
+		return cached, nil
+	}
+	address, err := parseAddrPort(addr)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	pc.target.Store(addr, address)
+	return address, nil
 }
 
 func IPAddrToPacketAddrLength(addr netip.AddrPort) int {
@@ -202,15 +227,29 @@ func PutPacketAddr(src []byte, addr netip.AddrPort) error {
 	return nil
 }
 
+// ReadPacketAddr parses a packet address block laid out as one skipped byte,
+// a 2-byte port, a 1-byte IP type and a 4- or 16-byte IP. The block comes
+// from the server with an attacker-controlled length; every slice below must
+// be bounds-checked against what was actually received.
 func ReadPacketAddr(p []byte) (addr netip.AddrPort, err error) {
+	const ipv4Len, ipv6Len = 4, 16
+	if len(p) < 1+2+1+ipv4Len {
+		return netip.AddrPort{}, io.ErrUnexpectedEOF
+	}
 	p = p[1:]
 	port := binary.BigEndian.Uint16(p[0:2])
 	ipType := p[2]
 	ip := p[3:]
 	if ipType == 1 {
-		ip = ip[:4]
+		if len(ip) < ipv4Len {
+			return netip.AddrPort{}, io.ErrUnexpectedEOF
+		}
+		ip = ip[:ipv4Len]
 	} else {
-		ip = ip[:16]
+		if len(ip) < ipv6Len {
+			return netip.AddrPort{}, io.ErrUnexpectedEOF
+		}
+		ip = ip[:ipv6Len]
 	}
 	ipAddr, ok := netip.AddrFromSlice(ip)
 	if !ok {

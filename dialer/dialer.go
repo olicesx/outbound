@@ -6,8 +6,8 @@ import (
 )
 
 var (
-	UnexpectedFieldErr  = fmt.Errorf("unexpected field")
-	InvalidParameterErr = fmt.Errorf("invalid parameters")
+	UnexpectedFieldErr  = fmt.Errorf("unexpected field")   // nolint:staticcheck
+	InvalidParameterErr = fmt.Errorf("invalid parameters") // nolint:staticcheck
 )
 
 type ExtraOption struct {
@@ -19,7 +19,7 @@ type ExtraOption struct {
 	UtlsImitate         string
 	BandwidthMaxTx      string
 	BandwidthMaxRx      string
-	UDPHopInterval    time.Duration
+	UDPHopInterval      time.Duration
 }
 
 type Property struct {

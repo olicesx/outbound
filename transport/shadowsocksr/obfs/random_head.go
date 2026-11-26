@@ -61,7 +61,7 @@ func (r *randomHead) Encode(data []byte) (encodedData []byte, err error) {
 	} else {
 		size := rand.Intn(96) + 8
 		encodedData = make([]byte, size)
-		rand.Read(encodedData)
+		_, _ = rand.Read(encodedData)
 		crypto.SetCRC32(encodedData, size)
 
 		d := make([]byte, dataLength)

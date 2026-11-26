@@ -99,13 +99,13 @@ func init() {
 		cipherKey[i] = byte(i)
 	}
 
-	rand.Read(cipherIv)
+	_, _ = rand.Read(cipherIv)
 }
 
 func BenchmarkRC4Init(b *testing.B) {
 	key := cipherKey[:16]
 	for i := 0; i < b.N; i++ {
-		rc4.NewCipher(key)
+		_, _ = rc4.NewCipher(key)
 	}
 }
 
@@ -114,7 +114,7 @@ func benchmarkCipherInit(b *testing.B, method string) {
 	key := cipherKey[:ci.keyLen]
 	buf := make([]byte, ci.ivLen)
 	for i := 0; i < b.N; i++ {
-		ci.newStream(key, buf, Encrypt)
+		_, _ = ci.newStream(key, buf, Encrypt)
 	}
 }
 
@@ -165,7 +165,7 @@ func benchmarkCipherEncrypt(b *testing.B, method string) {
 	src := make([]byte, CIPHER_BENCHMARK_BUFFER_LEN)
 	dst := make([]byte, CIPHER_BENCHMARK_BUFFER_LEN)
 
-	rand.Read(src)
+	_, _ = rand.Read(src)
 	for i := 0; i < b.N; i++ {
 		enc.XORKeyStream(dst, src)
 	}
@@ -222,7 +222,7 @@ func benchmarkCipherDecrypt(b *testing.B, method string) {
 	src := make([]byte, CIPHER_BENCHMARK_BUFFER_LEN)
 	dst := make([]byte, CIPHER_BENCHMARK_BUFFER_LEN)
 
-	rand.Read(src)
+	_, _ = rand.Read(src)
 	enc.XORKeyStream(dst, src)
 	for i := 0; i < b.N; i++ {
 		dec.XORKeyStream(src, dst)

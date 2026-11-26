@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/daeuniverse/outbound/pkg/coalesce"
 	"net"
 	"net/http"
 	"net/url"
@@ -44,6 +45,10 @@ type Ws struct {
 	fragmentMaxLength   int64
 	fragmentMinInterval int64
 	fragmentMaxInterval int64
+}
+
+func (s *Ws) UnwrapDialer() netproxy.Dialer {
+	return s.dialer
 }
 
 // NewWs returns a Ws infra.
@@ -123,6 +128,10 @@ func (s *Ws) DialContext(ctx context.Context, network, addr string) (c netproxy.
 	}
 	switch magicNetwork.Network {
 	case "tcp":
+		// Coalescer drains after each message write (conn.Write), and its
+		// Read side flushes before blocking, which covers the websocket
+		// handshake (HTTP upgrade request then response read).
+		var co *coalesce.Conn
 		wsDialer := &websocket.Dialer{
 			NetDial: func(_, addr string) (net.Conn, error) {
 				c, err := s.dialer.DialContext(ctx, network, addr)
@@ -134,17 +143,21 @@ func (s *Ws) DialContext(ctx context.Context, network, addr string) (c netproxy.
 					c = transportTls.NewFragmentConn(c, s.fragmentMinLength, s.fragmentMaxLength, s.fragmentMinInterval, s.fragmentMaxInterval)
 				}
 
-				return &netproxy.FakeNetConn{
+				co = coalesce.New(&netproxy.FakeNetConn{
 					Conn:  c,
 					LAddr: nil,
 					RAddr: nil,
-				}, nil
+				})
+				return co, nil
 			},
 			TLSClientConfig: s.tlsClientConfig,
 		}
 		rc, _, err := wsDialer.DialContext(ctx, s.wsAddr, s.header)
 		if err != nil {
 			return nil, fmt.Errorf("[Ws]: dial to %s: %w", s.wsAddr, err)
+		}
+		if co != nil {
+			return newConnWithFlusher(rc, co), err
 		}
 		return newConn(rc), err
 	case "udp":

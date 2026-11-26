@@ -23,12 +23,37 @@ type Dialer struct {
 	skipVerify bool
 }
 
+type bufferedConn struct {
+	netproxy.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func (c *bufferedConn) CloseWrite() error {
+	return netproxy.ForwardCloseWrite(c.Conn)
+}
+
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped conn: embedding netproxy.Conn
+// promotes SetWriteDeadline but not this optional method, so the inner
+// conn's destructive-deadline declaration would otherwise be erased here.
+func (c *bufferedConn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.Conn)
+}
+
+func (t *Dialer) UnwrapDialer() netproxy.Dialer {
+	return t.nextDialer
+}
+
 func NewDialer(s string, d netproxy.Dialer) (*Dialer, error) {
 	u, err := url.Parse(s)
-	query := u.Query()
 	if err != nil {
 		return nil, fmt.Errorf("NewHTTPUpgrade: %w", err)
 	}
+	query := u.Query()
 
 	path := query.Get("path")
 	if !strings.HasPrefix(path, "/") {
@@ -79,11 +104,24 @@ func (t *Dialer) DialContext(ctx context.Context, network, addr string) (c netpr
 		}
 
 		if t.tlsConfig != nil {
-			conn = tls.Client(&netproxy.FakeNetConn{Conn: conn}, t.tlsConfig)
+			tlsConn := tls.Client(&netproxy.FakeNetConn{Conn: conn}, t.tlsConfig)
+			if err := netproxy.HandshakeWithContext(ctx, tlsConn); err != nil {
+				_ = tlsConn.Close()
+				return nil, fmt.Errorf("httpupgrade: %w", err)
+			}
+			conn = tlsConn
 		}
+
+		restoreDeadline, err := netproxy.ApplyConnDeadlineFromContext(ctx, conn)
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("httpupgrade: %w", err)
+		}
+		defer restoreDeadline()
 
 		req, err := http.NewRequest("GET", t.path, nil)
 		if err != nil {
+			_ = conn.Close()
 			return nil, fmt.Errorf("httpupgrade: %w", err)
 		}
 		req.Header.Set("Connection", "upgrade")
@@ -92,20 +130,26 @@ func (t *Dialer) DialContext(ctx context.Context, network, addr string) (c netpr
 
 		err = req.Write(conn)
 		if err != nil {
+			_ = conn.Close()
 			return nil, fmt.Errorf("httpupgrade: %w", err)
 		}
 
-		// TODO The bufio usage here is unreliable
-		resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+		reader := bufio.NewReaderSize(conn, 32<<10)
+		resp, err := http.ReadResponse(reader, req)
 		if err != nil {
+			_ = conn.Close()
 			return nil, fmt.Errorf("httpupgrade: %w", err)
 		}
 
 		if resp.Status == "101 Switching Protocols" &&
 			strings.ToLower(resp.Header.Get("Upgrade")) == "websocket" &&
 			strings.ToLower(resp.Header.Get("Connection")) == "upgrade" {
-			return conn, nil
+			if reader.Buffered() == 0 {
+				return conn, nil
+			}
+			return &bufferedConn{Conn: conn, reader: reader}, nil
 		}
+		_ = conn.Close()
 		return nil, errors.New("httpupgrade: unrecognized reply")
 
 	case "udp":

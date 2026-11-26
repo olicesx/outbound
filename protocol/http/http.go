@@ -27,57 +27,58 @@ type HttpProxy struct {
 
 func NewHTTPProxy(u *url.URL, forward netproxy.Dialer) (netproxy.Dialer, error) {
 	s := new(HttpProxy)
+	query := u.Query()
 	s.Addr = u.Host
 	s.Path = u.Path
 	if !strings.HasPrefix(s.Path, "/") {
 		s.Path = "/" + s.Path
 	}
-	s.Host = u.Query().Get("host")
+	s.Host = query.Get("host")
 	s.dialer = forward
 	if u.User != nil {
 		s.HaveAuth = true
 		s.Username = u.User.Username()
 		s.Password, _ = u.User.Password()
 	}
-	s.transport, _ = strconv.ParseBool(u.Query().Get("transport"))
+	s.transport, _ = strconv.ParseBool(query.Get("transport"))
 	if u.Scheme == "https" {
 		s.https = true
-		serverName := u.Query().Get("sni")
+		serverName := query.Get("sni")
 		if serverName == "" {
 			serverName = u.Hostname()
 		}
 
 		tlsImplementation := "tls"
-		if u.Query().Get("tlsImplementation") != "" {
-			tlsImplementation = u.Query().Get("tlsImplementation")
+		if query.Get("tlsImplementation") != "" {
+			tlsImplementation = query.Get("tlsImplementation")
 		}
-		alpn := []string{"h2,http/1.1"}
-		if u.Query().Get("alpn") != "" {
-			alpn = []string{u.Query().Get("alpn")}
+		alpnValue := "h2,http/1.1"
+		if query.Get("alpn") != "" {
+			alpnValue = query.Get("alpn")
 		}
-		u := url.URL{
+		tlsURL := url.URL{
 			Host: s.Addr,
 			RawQuery: url.Values{
 				"sni":  []string{serverName},
-				"alpn": alpn,
+				"alpn": []string{alpnValue},
 			}.Encode(),
 		}
-		allowInsecure, _ := strconv.ParseBool(u.Query().Get("allowInsecure"))
+		allowInsecure, _ := strconv.ParseBool(query.Get("allowInsecure"))
 		if !allowInsecure {
-			allowInsecure, _ = strconv.ParseBool(u.Query().Get("allow_insecure"))
+			allowInsecure, _ = strconv.ParseBool(query.Get("allow_insecure"))
 		}
 		if !allowInsecure {
-			allowInsecure, _ = strconv.ParseBool(u.Query().Get("allowinsecure"))
+			allowInsecure, _ = strconv.ParseBool(query.Get("allowinsecure"))
 		}
 		if !allowInsecure {
-			allowInsecure, _ = strconv.ParseBool(u.Query().Get("skipVerify"))
+			allowInsecure, _ = strconv.ParseBool(query.Get("skipVerify"))
 		}
 		var err error
 		s.dialer, _, err = tls2.NewTls(&dialer.ExtraOption{
 			AllowInsecure:     allowInsecure,
 			TlsImplementation: tlsImplementation,
-			UtlsImitate:       u.Query().Get("utlsImitate"),
-		}, s.dialer, u.String())
+			UtlsImitate:       query.Get("utlsImitate"),
+		}, s.dialer, tlsURL.String())
 		if err != nil {
 			return nil, err
 		}
@@ -92,7 +93,7 @@ func (s *HttpProxy) DialContext(ctx context.Context, network, addr string) (netp
 	}
 	switch magicNetwork.Network {
 	case "tcp":
-		return NewConn(s.dialer, s, addr, network), nil
+		return NewConn(ctx, s.dialer, s, addr, network), nil
 	case "udp":
 		return nil, netproxy.UnsupportedTunnelTypeError
 	default:

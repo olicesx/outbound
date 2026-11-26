@@ -57,16 +57,8 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	}, nil
 }
 
-func (d *Dialer) DialTcp(ctx context.Context, addr string) (c netproxy.Conn, err error) {
-	return d.DialContext(ctx, "tcp", addr)
-}
-
-func (d *Dialer) DialUdp(ctx context.Context, addr string) (c netproxy.PacketConn, err error) {
-	pktConn, err := d.DialContext(ctx, "udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	return pktConn.(netproxy.PacketConn), nil
+func (d *Dialer) UnwrapDialer() netproxy.Dialer {
+	return d.nextDialer
 }
 
 func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (c netproxy.Conn, err error) {
@@ -91,6 +83,9 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 		if err != nil {
 			return nil, err
 		}
+		// Buffer reads so vless length-prefixed reads (io.ReadFull on small
+		// length headers + payload) do not each trigger a syscall.
+		conn = netproxy.NewBufferedReaderConn(conn, 0)
 		conn, err = NewConn(conn, Metadata{
 			Metadata: vmess.Metadata{Metadata: mdata, Network: magicNetwork.Network},
 			Flow:     d.flow,

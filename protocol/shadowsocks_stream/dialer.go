@@ -35,6 +35,10 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	}, nil
 }
 
+func (d *Dialer) UnwrapDialer() netproxy.Dialer {
+	return d.nextDialer
+}
+
 // Addr returns forwarder's address
 func (d *Dialer) Addr() string {
 	return d.addr
@@ -58,7 +62,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (netprox
 		}
 
 		if _, err := conn.Write(target); err != nil {
-			conn.Close()
+			_ = conn.Close()
 			return nil, err
 		}
 		return conn, err
@@ -97,6 +101,9 @@ func (d *Dialer) DialTcpTransport(ctx context.Context, magicNetwork string) (net
 		return nil, fmt.Errorf("dial to %v error: %w", d.addr, err)
 	}
 
+	// Buffer reads: TcpConn.Read issues io.ReadAtLeast on c.Conn for the
+	// IV and subsequent data; without buffering each may be its own syscall.
+	c = netproxy.NewBufferedReaderConn(c, 0)
 	conn := NewTcpConn(c, ciph)
 
 	return conn, err

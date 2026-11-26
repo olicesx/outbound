@@ -7,7 +7,7 @@ import (
 
 	rand "github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/daeuniverse/outbound/protocol/tuic/congestion/common"
-	"github.com/daeuniverse/quic-go/congestion"
+	"github.com/olicesx/quic-go/congestion"
 )
 
 // BbrSender implements BBR congestion control algorithm.  BBR aims to estimate
@@ -32,10 +32,7 @@ const (
 
 	// The gain used for the STARTUP, equal to 2/ln(2).
 	defaultHighGain = 2.885
-	// The newly derived gain for STARTUP, equal to 4 * ln(2)
-	derivedHighGain = 2.773
 	// The newly derived CWND gain for STARTUP, 2.
-	derivedHighCWNDGain = 2.0
 )
 
 // The cycle of gains used during the PROBE_BW stage.
@@ -200,12 +197,12 @@ type bbrSender struct {
 	// A window used to limit the number of bytes in flight during loss recovery.
 	recoveryWindow congestion.ByteCount
 	// If true, consider all samples in recovery app-limited.
-	isAppLimitedRecovery bool // not used
+	// isAppLimitedRecovery bool // not used
 
 	// When true, pace at 1.5x and disable packet conservation in STARTUP.
-	slowerStartup bool // not used
+	// slowerStartup bool // not used
 	// When true, disables packet conservation in STARTUP.
-	rateBasedStartup bool // not used
+	// rateBasedStartup bool // not used
 
 	// When true, add the most recent ack aggregation measurement during STARTUP.
 	enableAckAggregationDuringStartup bool
@@ -270,7 +267,7 @@ func newBbrSender(
 		maxCongestionWindow:          initialMaxCongestionWindow,
 		minCongestionWindow:          defaultMinimumCongestionWindow,
 		highGain:                     defaultHighGain,
-		highCwndGain:                 defaultHighGain,
+		highCwndGain:                 defaultHighGain, // Initialized with defaultHighGain, then set by setHighCwndGain
 		drainGain:                    1.0 / defaultHighGain,
 		pacingGain:                   1.0,
 		congestionWindowGain:         1.0,
@@ -294,7 +291,7 @@ func newBbrSender(
 	*/
 
 	b.enterStartupMode(b.clock.Now())
-	b.setHighCwndGain(derivedHighCWNDGain)
+	b.setHighCwndGain(2.0) // Using literal 2.0 instead of derivedHighCWNDGain
 
 	return b
 }
@@ -509,33 +506,12 @@ func (b *bbrSender) PacingRate() Bandwidth {
 	return b.pacingRate
 }
 
-func (b *bbrSender) hasGoodBandwidthEstimateForResumption() bool {
-	return b.hasNonAppLimitedSample()
-}
-
-func (b *bbrSender) hasNonAppLimitedSample() bool {
-	return b.hasNoAppLimitedSample
-}
-
-// Sets the pacing gain used in STARTUP.  Must be greater than 1.
-func (b *bbrSender) setHighGain(highGain float64) {
-	b.highGain = highGain
-	if b.mode == bbrModeStartup {
-		b.pacingGain = highGain
-	}
-}
-
 // Sets the CWND gain used in STARTUP.  Must be greater than 1.
 func (b *bbrSender) setHighCwndGain(highCwndGain float64) {
 	b.highCwndGain = highCwndGain
 	if b.mode == bbrModeStartup {
 		b.congestionWindowGain = highCwndGain
 	}
-}
-
-// Sets the gain used in DRAIN.  Must be less than 1.
-func (b *bbrSender) setDrainGain(drainGain float64) {
-	b.drainGain = drainGain
 }
 
 // What's the current estimated bandwidth in bytes per second.
@@ -915,13 +891,7 @@ func (b *bbrSender) shouldExitStartupDueToLoss(lastPacketSendState *sendTimeStat
 
 	inflightAtSend := lastPacketSendState.bytesInFlight
 
-	if inflightAtSend > 0 && b.bytesLostInRound > 0 {
-		if b.bytesLostInRound > congestion.ByteCount(float64(inflightAtSend)*quicBbr2DefaultLossThreshold) {
-			return true
-		}
-		return false
-	}
-	return false
+	return inflightAtSend > 0 && b.bytesLostInRound > congestion.ByteCount(float64(inflightAtSend)*quicBbr2DefaultLossThreshold)
 }
 
 func bdpFromRttAndBandwidth(rtt time.Duration, bandwidth Bandwidth) congestion.ByteCount {

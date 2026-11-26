@@ -12,17 +12,14 @@ import (
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
-	"github.com/daeuniverse/outbound/protocol/shadowsocks"
 	"github.com/daeuniverse/outbound/transport/mux"
+	"github.com/daeuniverse/outbound/transport/shadowtls"
 	"github.com/daeuniverse/outbound/transport/simpleobfs"
 	"github.com/daeuniverse/outbound/transport/tls"
 	"github.com/daeuniverse/outbound/transport/ws"
 )
 
 func init() {
-	// Use random salt by default to decrease the boot time
-	shadowsocks.DefaultSaltGeneratorType = shadowsocks.RandomSaltGeneratorType
-
 	dialer.FromLinkRegister("shadowsocks", NewShadowsocksFromLink)
 	dialer.FromLinkRegister("ss", NewShadowsocksFromLink)
 }
@@ -113,12 +110,40 @@ func (s *Shadowsocks) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dia
 		default:
 			return nil, nil, fmt.Errorf("unsupported mode %v of plugin %v", s.Plugin.Opts.Obfs, s.Plugin.Name)
 		}
+	case "shadow-tls":
+		uShadowTLS := url.URL{
+			Scheme: "shadow-tls",
+			Host:   net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
+		}
+		if s.Plugin.Opts.Password != "" {
+			uShadowTLS.User = url.User(s.Plugin.Opts.Password)
+		}
+		query := uShadowTLS.Query()
+		if s.Plugin.Opts.Version != "" {
+			query.Set("version", s.Plugin.Opts.Version)
+		}
+		sni := s.Plugin.Opts.SNI
+		if sni == "" {
+			sni = s.Plugin.Opts.Host
+		}
+		if sni != "" {
+			query.Set("sni", sni)
+		}
+		if s.Plugin.Opts.AllowInsecure != "" {
+			query.Set("allowInsecure", s.Plugin.Opts.AllowInsecure)
+		}
+		uShadowTLS.RawQuery = query.Encode()
+		if d, _, err = shadowtls.NewShadowTLS(option, d, uShadowTLS.String()); err != nil {
+			return nil, nil, err
+		}
 	default:
 	}
 	var nextDialerName string
 	switch s.Cipher {
 	case "aes-256-gcm", "aes-128-gcm", "chacha20-poly1305", "chacha20-ietf-poly1305":
 		nextDialerName = "shadowsocks"
+	case "2022-blake3-aes-256-gcm", "2022-blake3-aes-128-gcm", "2022-blake3-chacha20-poly1305":
+		nextDialerName = "shadowsocks_2022"
 	case "aes-128-cfb", "aes-192-cfb", "aes-256-cfb", "aes-128-ctr", "aes-192-ctr", "aes-256-ctr", "aes-128-ofb", "aes-192-ofb", "aes-256-ofb", "des-cfb", "bf-cfb", "cast5-cfb", "rc4-md5", "rc4-md5-6", "chacha20", "chacha20-ietf", "salsa20", "camellia-128-cfb", "camellia-192-cfb", "camellia-256-cfb", "idea-cfb", "rc2-cfb", "seed-cfb", "rc4", "none", "plain":
 		nextDialerName = "shadowsocks_stream"
 	default:
@@ -149,14 +174,27 @@ func ParseSSURL(u string) (data *Shadowsocks, err error) {
 		if err != nil {
 			return nil, false
 		}
-		username := u.User.String()
-		username, _ = common.Base64UrlDecode(username)
-		arr := strings.SplitN(username, ":", 2)
-		if len(arr) != 2 {
+
+		var (
+			cipher   string
+			password string
+		)
+		if u.User == nil {
 			return nil, false
 		}
-		cipher := arr[0]
-		password := arr[1]
+		if parsedPassword, hasPassword := u.User.Password(); hasPassword {
+			cipher = u.User.Username()
+			password = parsedPassword
+		} else {
+			username := u.User.Username()
+			username, _ = common.Base64UrlDecode(username)
+			arr := strings.SplitN(username, ":", 2)
+			if len(arr) != 2 {
+				return nil, false
+			}
+			cipher = arr[0]
+			password = arr[1]
+		}
 		var sip003 Sip003
 		plugin := u.Query().Get("plugin")
 		if len(plugin) > 0 {
@@ -184,7 +222,13 @@ func ParseSSURL(u string) (data *Shadowsocks, err error) {
 	content := u
 	// try to parse the ss:// link, if it fails, base64 decode first
 	if v, ok = parse(content); !ok {
-		// 进行base64解码，并unmarshal到VmessInfo上
+		if v, ok = parsePlainSSURL(content); ok {
+			return v, nil
+		}
+		// Decode base64 and unmarshal to VmessInfo
+		if len(content) < len("ss://") {
+			return nil, fmt.Errorf("%w: unrecognized ss address", dialer.InvalidParameterErr)
+		}
 		t := content[5:]
 		var l, r string
 		if ind := strings.Index(t, "#"); ind > -1 {
@@ -212,27 +256,131 @@ func ParseSSURL(u string) (data *Shadowsocks, err error) {
 	return v, nil
 }
 
+func parsePlainSSURL(content string) (v *Shadowsocks, ok bool) {
+	scheme, body, found := strings.Cut(content, "://")
+	if !found {
+		return nil, false
+	}
+	switch strings.ToLower(scheme) {
+	case "ss", "shadowsocks":
+	default:
+		return nil, false
+	}
+
+	var fragment string
+	if i := strings.IndexByte(body, '#'); i >= 0 {
+		fragment = body[i+1:]
+		body = body[:i]
+		if unescapedFragment, err := url.PathUnescape(fragment); err == nil {
+			fragment = unescapedFragment
+		}
+	}
+
+	at := strings.LastIndexByte(body, '@')
+	if at <= 0 || at == len(body)-1 {
+		return nil, false
+	}
+	userinfo, hostPart := body[:at], body[at+1:]
+
+	var rawQuery string
+	if i := strings.IndexByte(hostPart, '?'); i >= 0 {
+		rawQuery = hostPart[i+1:]
+		hostPart = hostPart[:i]
+	}
+	if i := strings.IndexByte(hostPart, '/'); i >= 0 {
+		hostPart = hostPart[:i]
+	}
+
+	host, portText, err := net.SplitHostPort(hostPart)
+	if err != nil {
+		return nil, false
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return nil, false
+	}
+
+	cipher, password, ok := parseSSUserinfo(userinfo)
+	if !ok {
+		return nil, false
+	}
+
+	var sip003 Sip003
+	if rawQuery != "" {
+		q, err := url.ParseQuery(rawQuery)
+		if err != nil {
+			return nil, false
+		}
+		if plugin := q.Get("plugin"); plugin != "" {
+			sip003 = ParseSip003(plugin)
+		}
+	}
+
+	return &Shadowsocks{
+		Cipher:   strings.ToLower(cipher),
+		Password: password,
+		Server:   host,
+		Port:     port,
+		Name:     fragment,
+		Plugin:   sip003,
+		UDP:      sip003.Name == "",
+		Protocol: "shadowsocks",
+	}, true
+}
+
+func parseSSUserinfo(userinfo string) (cipher, password string, ok bool) {
+	if strings.Contains(userinfo, ":") {
+		cipher, password, _ = strings.Cut(userinfo, ":")
+		var err error
+		cipher, err = url.PathUnescape(cipher)
+		if err != nil {
+			return "", "", false
+		}
+		password, err = url.PathUnescape(password)
+		if err != nil {
+			return "", "", false
+		}
+		return cipher, password, cipher != ""
+	}
+
+	decoded, err := common.Base64UrlDecode(userinfo)
+	if err != nil {
+		decoded, err = common.Base64StdDecode(userinfo)
+		if err != nil {
+			return "", "", false
+		}
+	}
+	cipher, password, ok = strings.Cut(decoded, ":")
+	return cipher, password, ok && cipher != ""
+}
+
 type Sip003 struct {
 	Name string     `json:"name"`
 	Opts Sip003Opts `json:"opts"`
 }
 type Sip003Opts struct {
-	Tls  string `json:"tls"`  // for v2ray-plugin
-	Obfs string `json:"obfs"` // mode for v2ray-plugin
-	Host string `json:"host"`
-	Path string `json:"uri"`
+	Tls           string `json:"tls"`  // for v2ray-plugin
+	Obfs          string `json:"obfs"` // mode for v2ray-plugin
+	Host          string `json:"host"`
+	Path          string `json:"uri"`
+	Password      string `json:"password"`
+	Version       string `json:"version"`
+	SNI           string `json:"sni"`
+	AllowInsecure string `json:"allowInsecure"`
 }
 
 func ParseSip003Opts(opts string) Sip003Opts {
 	var sip003Opts Sip003Opts
 	fields := strings.Split(opts, ";")
 	for i := range fields {
-		a := strings.Split(fields[i], "=")
+		if fields[i] == "" {
+			continue
+		}
+		a := strings.SplitN(fields[i], "=", 2)
 		if len(a) == 1 {
-			// to avoid panic
 			a = append(a, "")
 		}
-		switch a[0] {
+		switch strings.ToLower(a[0]) {
 		case "tls":
 			sip003Opts.Tls = "tls"
 		case "obfs", "mode":
@@ -244,6 +392,14 @@ func ParseSip003Opts(opts string) Sip003Opts {
 			sip003Opts.Path = a[1]
 		case "obfs-host", "host":
 			sip003Opts.Host = a[1]
+		case "password", "passwd", "pwd":
+			sip003Opts.Password = a[1]
+		case "version", "v":
+			sip003Opts.Version = a[1]
+		case "sni":
+			sip003Opts.SNI = a[1]
+		case "allowinsecure", "allow_insecure", "insecure", "skip-cert-verify":
+			sip003Opts.AllowInsecure = a[1]
 		}
 	}
 	return sip003Opts
@@ -251,18 +407,27 @@ func ParseSip003Opts(opts string) Sip003Opts {
 func ParseSip003(plugin string) Sip003 {
 	var sip003 Sip003
 	fields := strings.SplitN(plugin, ";", 2)
-	switch fields[0] {
+	opts := ""
+	if len(fields) == 2 {
+		opts = fields[1]
+	}
+	switch strings.ToLower(fields[0]) {
 	case "obfs-local", "simpleobfs":
 		sip003.Name = "simple-obfs"
+	case "shadowtls", "shadow-tls", "sstls":
+		sip003.Name = "shadow-tls"
 	default:
 		sip003.Name = fields[0]
 	}
-	sip003.Opts = ParseSip003Opts(fields[1])
+	sip003.Opts = ParseSip003Opts(opts)
 	return sip003
 }
 
 func (s *Sip003) String() string {
 	list := []string{s.Name}
+	if s.Opts.Tls != "" {
+		list = append(list, "tls")
+	}
 	if s.Opts.Obfs != "" {
 		list = append(list, "obfs="+s.Opts.Obfs)
 	}
@@ -271,6 +436,18 @@ func (s *Sip003) String() string {
 	}
 	if s.Opts.Path != "" {
 		list = append(list, "obfs-uri="+s.Opts.Path)
+	}
+	if s.Opts.Password != "" {
+		list = append(list, "password="+s.Opts.Password)
+	}
+	if s.Opts.Version != "" {
+		list = append(list, "version="+s.Opts.Version)
+	}
+	if s.Opts.SNI != "" {
+		list = append(list, "sni="+s.Opts.SNI)
+	}
+	if s.Opts.AllowInsecure != "" {
+		list = append(list, "allowInsecure="+s.Opts.AllowInsecure)
 	}
 	return strings.Join(list, ";")
 }

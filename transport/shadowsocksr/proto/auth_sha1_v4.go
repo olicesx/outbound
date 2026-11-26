@@ -19,7 +19,10 @@ type authSHA1v4 struct {
 	*ServerInfo
 	data          *AuthData
 	hasSentHeader bool
-	buffer        bytes.Buffer
+	// buffer and encodeBuffer are per-direction scratch: Encode runs under
+	// the conn writeMu and Decode under readMu, so they must not share state.
+	buffer       bytes.Buffer
+	encodeBuffer bytes.Buffer
 }
 
 func NewAuthSHA1v4() IProtocol {
@@ -101,9 +104,9 @@ func (a *authSHA1v4) packAuthData(data []byte) (outData []byte) {
 	}
 	if len(a.data.clientID) == 0 {
 		a.data.clientID = make([]byte, 8)
-		rand.Read(a.data.clientID)
+		_, _ = rand.Read(a.data.clientID)
 		b := make([]byte, 4)
-		rand.Read(b)
+		_, _ = rand.Read(b)
 		a.data.connectionID = binary.LittleEndian.Uint32(b) & 0xFFFFFF
 	}
 	// 0-1, out length
@@ -119,7 +122,7 @@ func (a *authSHA1v4) packAuthData(data []byte) (outData []byte) {
 	// 2~6, crc of out length+salt+key
 	binary.LittleEndian.PutUint32(outData[2:], crc32)
 	// 6~rand length+6, rand numbers
-	rand.Read(outData[dataOffset-randLength : dataOffset])
+	_, _ = rand.Read(outData[dataOffset-randLength : dataOffset])
 	// 6, rand length
 	if randLength < 128 {
 		outData[6] = byte(randLength & 0xFF)
@@ -158,7 +161,7 @@ func (a *authSHA1v4) DecodePkt(in []byte) (out pool.Bytes, err error) {
 }
 
 func (a *authSHA1v4) Encode(plainData []byte) (outData []byte, err error) {
-	a.buffer.Reset()
+	a.encodeBuffer.Reset()
 	dataLength := len(plainData)
 	offset := 0
 	if !a.hasSentHeader && dataLength > 0 {
@@ -166,22 +169,22 @@ func (a *authSHA1v4) Encode(plainData []byte) (outData []byte, err error) {
 		if headSize > dataLength {
 			headSize = dataLength
 		}
-		a.buffer.Write(a.packAuthData(plainData[:headSize]))
+		_, _ = a.encodeBuffer.Write(a.packAuthData(plainData[:headSize]))
 		offset += headSize
 		dataLength -= headSize
 		a.hasSentHeader = true
 	}
 	const blockSize = 4096
 	for dataLength > blockSize {
-		a.buffer.Write(a.packData(plainData[offset : offset+blockSize]))
+		_, _ = a.encodeBuffer.Write(a.packData(plainData[offset : offset+blockSize]))
 		offset += blockSize
 		dataLength -= blockSize
 	}
 	if dataLength > 0 {
-		a.buffer.Write(a.packData(plainData[offset:]))
+		_, _ = a.encodeBuffer.Write(a.packData(plainData[offset:]))
 	}
 
-	return a.buffer.Bytes(), nil
+	return a.encodeBuffer.Bytes(), nil
 }
 
 func (a *authSHA1v4) Decode(plainData []byte) (outData []byte, n int, err error) {
@@ -197,8 +200,6 @@ func (a *authSHA1v4) Decode(plainData []byte) (outData []byte, n int, err error)
 		length := int(binary.BigEndian.Uint16(plainData[0:2]))
 		if length >= 8192 || length < 8 {
 			//common.Error("auth_sha1_v4 post decrypt data length error")
-			dataLength = 0
-			plainData = nil
 			return nil, 0, ErrAuthSHA1v4DataLengthError
 		}
 		if length > dataLength {
@@ -212,14 +213,17 @@ func (a *authSHA1v4) Decode(plainData []byte) (outData []byte, n int, err error)
 			} else {
 				pos = int(binary.BigEndian.Uint16(plainData[5:5+2])) + 4
 			}
+			// The padding offset is server-controlled; reject frames whose
+			// offset leaves no payload bytes instead of slicing negatively.
+			if pos > length-4 {
+				return nil, 0, ErrAuthSHA1v4PosOutOfRange
+			}
 			outLength := length - pos - 4
-			a.buffer.Write(plainData[pos : pos+outLength])
+			_, _ = a.buffer.Write(plainData[pos : pos+outLength])
 			dataLength -= length
 			plainData = plainData[length:]
 		} else {
 			//common.Error("auth_sha1_v4 post decrypt incorrect checksum")
-			dataLength = 0
-			plainData = nil
 			return nil, 0, ErrAuthSHA1v4IncorrectChecksum
 		}
 	}

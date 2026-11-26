@@ -34,6 +34,10 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	}, nil
 }
 
+func (d *Dialer) UnwrapDialer() netproxy.Dialer {
+	return d.nextDialer
+}
+
 func (d *Dialer) DialContext(ctx context.Context, network, addr string) (netproxy.Conn, error) {
 	magicNetwork, err := netproxy.ParseMagicNetwork(network)
 	if err != nil {
@@ -53,7 +57,15 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (netprox
 		if err != nil {
 			return nil, err
 		}
-		return NewTCPConn(conn, mdata, d.key, nil)
+		// Wrap with a buffered reader so io.ReadFull on chunk headers and
+		// payloads does not each hit the kernel. See BufferedReaderConn docs.
+		conn = netproxy.NewBufferedReaderConn(conn, 0)
+		c, err := NewTCPConn(conn, mdata, d.key, nil)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return c, nil
 	case "udp":
 		mdata, err := protocol.ParseMetadata(addr)
 		if err != nil {
@@ -68,7 +80,19 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (netprox
 		if err != nil {
 			return nil, err
 		}
-		return NewUdpConn(conn.(netproxy.PacketConn), d.proxyAddress, mdata, d.key, nil)
+		pktConn, ok := conn.(netproxy.PacketConn)
+		if !ok {
+			_ = conn.Close()
+			return nil, fmt.Errorf("%w: %T does not implement PacketConn", netproxy.UnsupportedTunnelTypeError, conn)
+		}
+		c, err := NewUdpConn(pktConn, d.proxyAddress, mdata, d.key, nil)
+		if err != nil {
+			// The cipher was rejected after the dial succeeded: the
+			// underlay belongs to this call until the wrapper takes over.
+			_ = conn.Close()
+			return nil, err
+		}
+		return c, nil
 	default:
 		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
 	}

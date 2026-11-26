@@ -23,7 +23,7 @@ func (*ShakeSizeParser) SizeBytes() int32 {
 }
 
 func (s *ShakeSizeParser) next() uint16 {
-	s.shake.Read(s.buffer[:])
+	_, _ = s.shake.Read(s.buffer[:])
 	return binary.BigEndian.Uint16(s.buffer[:])
 }
 

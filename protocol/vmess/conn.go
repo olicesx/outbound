@@ -1,7 +1,6 @@
 package vmess
 
 import (
-	"bytes"
 	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/binary"
@@ -13,14 +12,19 @@ import (
 	"sync"
 
 	"github.com/daeuniverse/outbound/common"
+	"github.com/daeuniverse/outbound/common/iout"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/daeuniverse/outbound/pool"
 )
 
+var resolveUDPAddr = net.ResolveUDPAddr
+
 const (
 	MaxChunkSize = 1 << 14
 	MaxUDPSize   = 1 << 11
+
+	maxReusableSealFrameSize = 128 << 10
 )
 
 type Conn struct {
@@ -31,6 +35,8 @@ type Conn struct {
 	cmdKey          []byte
 	dialTgt         string
 	dialTgtAddrPort netip.AddrPort // lazy resolve
+	dialTgtMu       sync.Mutex
+	writeCache      common.LastStringValue[netip.AddrPort]
 
 	NewAEAD func(key []byte) (cipher.AEAD, error)
 
@@ -39,6 +45,7 @@ type Conn struct {
 	writeNonceGenerator   BytesGenerator
 	writeChunkSizeParser  ChunkSizeEncoder
 	writePaddingGenerator PaddingLengthGenerator
+	writeInitErr          error
 
 	readBodyCipher       cipher.AEAD
 	readNonceGenerator   BytesGenerator
@@ -53,9 +60,14 @@ type Conn struct {
 	responseBodyIV  [16]byte
 	responseAuth    byte
 
-	readMutex   sync.Mutex
-	leftToRead  []byte
-	indexToRead int
+	readMutex     sync.Mutex
+	leftToRead    []byte
+	indexToRead   int
+	readSizeBuf   [2]byte
+	readOpenFrame []byte
+
+	writeSealFrame []byte
+	writeClosed    bool
 }
 
 func NewConn(conn netproxy.Conn, metadata Metadata, dialTgt string, cmdKey []byte) (c *Conn, err error) {
@@ -70,14 +82,72 @@ func NewConn(conn netproxy.Conn, metadata Metadata, dialTgt string, cmdKey []byt
 	}
 	if metadata.IsClient {
 		if err = c.WriteReqHeader(); err != nil {
+			// NewConn owns conn from here on; close it on every failure or
+			// the dialed underlay leaks.
+			_ = c.Conn.Close()
 			return nil, err
 		}
 	}
 	return c, nil
 }
 
+func (c *Conn) CloseWrite() error {
+	if c.metadata.Network == "udp" || c.metadata.IsPacketAddr() {
+		return nil
+	}
+	_, err := c.write(nil)
+	return err
+}
+
 func (c *Conn) Close() error {
-	return c.Conn.Close()
+	err := c.Conn.Close()
+
+	c.readMutex.Lock()
+	c.leftToRead = nil
+	c.indexToRead = 0
+	c.readOpenFrame = nil
+	c.readMutex.Unlock()
+
+	c.writeMutex.Lock()
+	c.writeSealFrame = nil
+	c.writeMutex.Unlock()
+	return err
+}
+
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped stream conn: SetWriteDeadline is
+// delegated to the underlying netproxy.Conn unchanged, so the semantics —
+// and the declaration — belong to that conn (vmess UDP rides ReadFrom/Write
+// on this conn).
+func (c *Conn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.Conn)
+}
+
+func (c *Conn) dialTargetAddrPort() (netip.AddrPort, error) {
+	c.dialTgtMu.Lock()
+	defer c.dialTgtMu.Unlock()
+
+	if c.dialTgtAddrPort.IsValid() {
+		return c.dialTgtAddrPort, nil
+	}
+
+	tgt, err := resolveUDPAddr("udp", c.dialTgt)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	c.dialTgtAddrPort = unmapAddrPort(tgt.AddrPort())
+	return c.dialTgtAddrPort, nil
+}
+
+// unmapAddrPort normalizes the v4-in-v6 form net.ResolveUDPAddr yields for
+// literal IPv4 targets (its net.IP keeps the 16-byte ::ffff: representation
+// and UDPAddr.AddrPort does not unmap it). Without this, the fixed-target
+// ReadFrom reports datagram sources as [::ffff:a.b.c.d]:p instead of the
+// canonical a.b.c.d:p, and packet-addr writes would encode IPv4 targets with
+// the IPv6 address type. Unmap is the identity for IPv6 and clean IPv4
+// addresses, so only the mapped form changes.
+func unmapAddrPort(ap netip.AddrPort) netip.AddrPort {
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
 }
 
 func (c *Conn) chunks(size int) (payloadSize int, numChunks int) {
@@ -104,27 +174,31 @@ func (c *Conn) sealFromPool(b []byte) (data []byte) {
 	sizeSize := c.writeChunkSizeParser.SizeBytes()
 	encryptedSize := int32(len(b) + c.writeBodyCipher.Overhead())
 	paddingSize := int32(c.writePaddingGenerator.NextPaddingLen())
+	totalSize := int(sizeSize + encryptedSize + paddingSize)
 
-	data = pool.Get(int(sizeSize + encryptedSize + paddingSize))
+	if totalSize <= maxReusableSealFrameSize {
+		if cap(c.writeSealFrame) < totalSize {
+			c.writeSealFrame = make([]byte, totalSize)
+		}
+		data = c.writeSealFrame[:totalSize]
+	} else {
+		data = make([]byte, totalSize)
+	}
 	c.writeChunkSizeParser.Encode(uint16(encryptedSize+paddingSize), data)
 
 	c.writeBodyCipher.Seal(data[sizeSize:sizeSize], c.writeNonceGenerator(), b, nil)
-	fastrand.Read(data[len(data)-int(paddingSize):])
+	_, _ = fastrand.Read(data[len(data)-int(paddingSize):])
 	//log.Warn("write: size: %v, padding: %v", encryptedSize+paddingSize, paddingSize)
 	return data
 }
 
-// writeStream splits mb into multiple FIXED size (payloadSize) chunks.
-// Then seal the chunks and write separately.
-// If the sum size of mb less than one payloadSize, seal and write it directly.
 func (c *Conn) writeStream(b []byte, preWrite []byte) (n int, err error) {
 	payloadSize, numChunks := c.chunks(len(b))
 	var start = 0
 	if preWrite != nil {
 		start++
 		data := c.sealFromPool(b[n:common.Min(n+payloadSize, len(b))])
-		defer pool.Put(data)
-		if _, err = c.Conn.Write(bytes.Join([][]byte{preWrite, data}, nil)); err != nil {
+		if _, err = iout.MultiWrite(c.Conn, preWrite, data); err != nil {
 			return 0, err
 		}
 		n += payloadSize
@@ -134,7 +208,6 @@ func (c *Conn) writeStream(b []byte, preWrite []byte) (n int, err error) {
 		if _, err = c.Conn.Write(data); err != nil {
 			return n, err
 		}
-		pool.Put(data)
 		n += payloadSize
 	}
 	if n > len(b) {
@@ -143,12 +216,10 @@ func (c *Conn) writeStream(b []byte, preWrite []byte) (n int, err error) {
 	return n, nil
 }
 
-// writePacket simply seal every buffer of mb and write.
 func (c *Conn) writePacket(b []byte, preWrite []byte) (n int, err error) {
 	data := c.sealFromPool(b)
-	defer pool.Put(data)
 	if preWrite != nil {
-		if _, err = c.Conn.Write(bytes.Join([][]byte{preWrite, data}, nil)); err != nil {
+		if _, err = iout.MultiWrite(c.Conn, preWrite, data); err != nil {
 			return 0, err
 		}
 	} else {
@@ -159,7 +230,22 @@ func (c *Conn) writePacket(b []byte, preWrite []byte) (n int, err error) {
 	return len(b), nil
 }
 
+// vmessInstructionDataFixedLen is the number of bytes InitContext reads from a
+// request instruction block: 1 version byte + 16 IV + 16 key + 1 options byte
+// + 1 security byte + 1 reserved byte, with the last fixed byte at index 35.
+// The variable-length address, its padding and the trailing FNV1a checksum
+// follow it.
+const vmessInstructionDataFixedLen = 36
+
 func (c *Conn) InitContext(instructionData []byte) error {
+	// This path is reached from the server side with peer-supplied bytes, so
+	// the length must be validated before any fixed offset is read: the
+	// indexes below (up to 35) would otherwise panic on a short block, turning
+	// a malformed request into a denial of service against the process.
+	if len(instructionData) < vmessInstructionDataFixedLen {
+		return fmt.Errorf("vmess: instruction data too short: %d bytes, need at least %d",
+			len(instructionData), vmessInstructionDataFixedLen)
+	}
 	c.responseAuth = instructionData[33]
 	copy(c.requestBodyIV[:], instructionData[1:])
 	copy(c.requestBodyKey[:], instructionData[17:])
@@ -220,14 +306,11 @@ func (c *Conn) WriteReqHeader() (err error) {
 
 func (c *Conn) Write(b []byte) (n int, err error) {
 	if c.metadata.IsPacketAddr() {
-		if !c.dialTgtAddrPort.IsValid() {
-			tgt, err := net.ResolveUDPAddr("udp", c.dialTgt)
-			if err != nil {
-				return 0, err
-			}
-			c.dialTgtAddrPort = tgt.AddrPort()
+		tgt, err := c.dialTargetAddrPort()
+		if err != nil {
+			return 0, err
 		}
-		return c.WriteTo(b, c.dialTgtAddrPort.String())
+		return c.WriteTo(b, tgt.String())
 	} else {
 		return c.write(b)
 	}
@@ -237,6 +320,9 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 func (c *Conn) write(b []byte) (n int, err error) {
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
+	if c.writeClosed {
+		return 0, net.ErrClosed
+	}
 	var encRespHeader []byte
 	c.initWrite.Do(func() {
 		if !c.metadata.IsClient {
@@ -244,9 +330,11 @@ func (c *Conn) write(b []byte) (n int, err error) {
 			defer pool.Put(header)
 			encRespHeader, err = c.EncryptRespHeaderFromPool(header)
 			if err != nil {
+				c.writeInitErr = err
 				return
 			}
 			if c.writeBodyCipher, err = c.NewAEAD(c.responseBodyKey[:]); err != nil {
+				c.writeInitErr = err
 				return
 			}
 			if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
@@ -267,12 +355,17 @@ func (c *Conn) write(b []byte) (n int, err error) {
 	if len(encRespHeader) != 0 {
 		defer pool.Put(encRespHeader)
 	}
+	if err == nil {
+		// The once has already run: a failed init must surface on every
+		// call, or later writes proceed with nil cipher state and panic.
+		err = c.writeInitErr
+	}
 	if err != nil {
 		return 0, err
 	}
 	if len(b) == 0 {
+		c.writeClosed = true
 		data := c.sealFromPool(nil)
-		defer pool.Put(data)
 		_, err = c.Conn.Write(data)
 		return 0, err
 	}
@@ -291,9 +384,12 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 	if c.metadata.IsPacketAddr() {
 		n, _, err = c.ReadFrom(b)
 		return n, err
-	} else {
-		return c.read(b)
 	}
+	if c.metadata.Network == "udp" {
+		n, _, err = c.ReadFrom(b)
+		return n, err
+	}
+	return c.read(b)
 }
 
 func (c *Conn) read(b []byte) (n int, err error) {
@@ -428,27 +524,34 @@ func (c *Conn) read(b []byte) (n int, err error) {
 	// dump unread data
 	if c.indexToRead < len(c.leftToRead) {
 		n = copy(b, c.leftToRead[c.indexToRead:])
+		if c.metadata.Network == "udp" {
+			c.leftToRead = nil
+			c.indexToRead = 0
+			return 0, io.ErrShortBuffer
+		}
 		c.indexToRead += n
 		if c.indexToRead >= len(c.leftToRead) {
-			// put the buf back
-			pool.Put(c.leftToRead)
+			c.leftToRead = nil
+			c.indexToRead = 0
 		}
 		return n, nil
 	}
 
-	chunk, err := c.readChunkFromPool()
+	chunk, err := c.readChunk()
 	if err != nil {
 		return 0, err
 	}
-	//log.Trace("vmess: read len(chunk)=%v", len(chunk))
 	n = copy(b, chunk)
 	if n < len(chunk) {
-		// wait for the next read
+		if c.metadata.Network == "udp" {
+			// Do not deliver a truncated datagram; dae skips io.ErrShortBuffer
+			// without retiring the UDP endpoint.
+			c.leftToRead = nil
+			c.indexToRead = 0
+			return 0, io.ErrShortBuffer
+		}
 		c.leftToRead = chunk
 		c.indexToRead = n
-	} else {
-		// full reading. put the buf back
-		pool.Put(chunk)
 	}
 	return n, nil
 }
@@ -459,13 +562,14 @@ func (c *Conn) Metadata() Metadata {
 
 // readSize reads the size and padding from Conn. size=encryptedSize+padding
 func (c *Conn) readSize() (size uint16, padding uint16, err error) {
-	buf := pool.Get(int(c.readChunkSizeParser.SizeBytes()))
-	defer pool.Put(buf)
-	if _, err := io.ReadFull(c.Conn, buf); err != nil {
+	// SizeBytes is always 2 (ShakeSizeParser/PlainChunkSizeParser). Keep the
+	// scratch on Conn so passing it through the reader interface cannot make a
+	// fresh stack array escape on every chunk.
+	if _, err := io.ReadFull(c.Conn, c.readSizeBuf[:]); err != nil {
 		return 0, 0, err
 	}
 	padding = c.readPaddingGenerator.NextPaddingLen()
-	size, err = c.readChunkSizeParser.Decode(buf)
+	size, err = c.readChunkSizeParser.Decode(c.readSizeBuf[:])
 	if err != nil {
 		return size, padding, err
 	}
@@ -473,7 +577,14 @@ func (c *Conn) readSize() (size uint16, padding uint16, err error) {
 	return size, padding, nil
 }
 
-func (c *Conn) readChunkFromPool() (b []byte, err error) {
+func (c *Conn) borrowReadOpenFrame(size int) []byte {
+	if cap(c.readOpenFrame) < size {
+		c.readOpenFrame = make([]byte, size)
+	}
+	return c.readOpenFrame[:size]
+}
+
+func (c *Conn) readChunk() ([]byte, error) {
 	size, padding, err := c.readSize()
 	if err != nil {
 		return nil, err
@@ -482,12 +593,17 @@ func (c *Conn) readChunkFromPool() (b []byte, err error) {
 	if size == uint16(c.readBodyCipher.Overhead())+padding {
 		return nil, io.EOF
 	}
-	b = pool.Get(int(size))
-	if _, err = io.ReadFull(c.Conn, b); err != nil {
-		pool.Put(b)
+	// The unmasked size is server-controlled while the padding is negotiated
+	// locally; a chunk smaller than its own padding would slice negatively
+	// below, so reject the frame instead of panicking.
+	if int(size) < int(padding) {
+		return nil, fmt.Errorf("vmess: chunk size %d is smaller than its padding %d", size, padding)
+	}
+	frame := c.borrowReadOpenFrame(int(size))
+	if _, err = io.ReadFull(c.Conn, frame); err != nil {
 		return nil, err
 	}
-	return c.readBodyCipher.Open(b[:0], c.readNonceGenerator(), b[:len(b)-int(padding)], nil)
+	return c.readBodyCipher.Open(frame[:0], c.readNonceGenerator(), frame[:len(frame)-int(padding)], nil)
 }
 
 func (c *Conn) EncryptRespHeaderFromPool(header []byte) (b []byte, err error) {

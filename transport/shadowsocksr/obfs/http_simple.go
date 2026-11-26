@@ -42,7 +42,14 @@ type httpSimplePost struct {
 	rawTransReceived bool
 	userAgentIndex   int
 	methodGet        bool // true for get, false for post
+	// headerBuf accumulates response-header bytes that arrived without the
+	// "\r\n\r\n" terminator yet (the header may straddle TCP segments).
+	headerBuf []byte
 }
+
+// maxResponseHeaderSize bounds headerBuf: the peer controls how many bytes
+// it can send without a terminator.
+const maxResponseHeaderSize = 8 * 1024
 
 func init() {
 	register("http_simple", &constructor{
@@ -84,7 +91,7 @@ var base62table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012345678
 func (t *httpSimplePost) boundary() (ret string) {
 	b := pool.Get(32)
 	defer pool.Put(b)
-	rand.Read(b)
+	_, _ = rand.Read(b)
 	for i := 0; i < 32; i++ {
 		b[i] = base62table[b[i]%62]
 	}
@@ -146,7 +153,7 @@ func (t *httpSimplePost) Encode(data []byte) (encodedData []byte, err error) {
 		host,
 		t.Port)
 	if len(customHead) > 0 {
-		httpBuf = httpBuf + strings.Replace(customHead, "\\n", "\r\n", -1) + "\r\n\r\n"
+		httpBuf = httpBuf + strings.ReplaceAll(customHead, "\\n", "\r\n") + "\r\n\r\n"
 	} else {
 		var contentType string
 		if !t.methodGet {
@@ -179,12 +186,19 @@ func (t *httpSimplePost) Decode(data []byte) (decodedData []byte, needSendBack b
 	if t.rawTransReceived {
 		return data, false, nil
 	}
-
-	pos := bytes.Index(data, []byte("\r\n\r\n"))
-	if pos > 0 {
-		decodedData = make([]byte, len(data)-pos-4)
-		copy(decodedData, data[pos+4:])
-		t.rawTransReceived = true
+	// A response header split across TCP reads must be reassembled:
+	// searching only the current segment loses the bytes already consumed.
+	t.headerBuf = append(t.headerBuf, data...)
+	pos := bytes.Index(t.headerBuf, []byte("\r\n\r\n"))
+	if pos < 0 {
+		if len(t.headerBuf) > maxResponseHeaderSize {
+			t.headerBuf = nil
+			return nil, false, fmt.Errorf("http_simple: response header exceeds %d bytes", maxResponseHeaderSize)
+		}
+		return nil, false, nil
 	}
+	t.rawTransReceived = true
+	decodedData = t.headerBuf[pos+4:]
+	t.headerBuf = nil
 	return decodedData, false, nil
 }

@@ -9,11 +9,13 @@ import (
 	"hash/fnv"
 	"io"
 	"math"
+	"net"
 	"sync"
 	"time"
 
 	"github.com/daeuniverse/outbound/ciphers"
 	"github.com/daeuniverse/outbound/common"
+	"github.com/daeuniverse/outbound/common/iout"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol"
@@ -23,10 +25,19 @@ import (
 
 const (
 	TCPChunkMaxLen = (1 << (16 - 2)) - 1
+	// Cap matches ss2022/vmess: keep a per-conn write frame for the common
+	// AEAD chunk sizes so steady-state Write does not pool.Get every call.
+	// EncryptedPayloadLen(64KiB) overflows pool's 64KiB bucket; reuse avoids
+	// that cliff without changing chunk semantics.
+	maxReusableWriteFrameSize = 128 << 10
 )
 
 var (
-	ErrFailInitCipher = fmt.Errorf("fail to initiate cipher")
+	ErrFailInitCipher     = fmt.Errorf("fail to initiate cipher")
+	ShadowsocksReusedInfo = []byte("ss-subkey")
+
+	fnv32aPool = sync.Pool{New: func() any { return fnv.New32a() }}
+	fnv32Pool  = sync.Pool{New: func() any { return fnv.New32() }}
 )
 
 type TCPConn struct {
@@ -39,14 +50,19 @@ type TCPConn struct {
 	cipherWrite cipher.AEAD
 	onceRead    bool
 	onceWrite   bool
+	writeBroken bool
 	nonceRead   []byte
 	nonceWrite  []byte
 
 	readMutex  sync.Mutex
 	writeMutex sync.Mutex
 
-	leftToRead  []byte
-	indexToRead int
+	leftToRead    []byte
+	indexToRead   int
+	readLengthBuf []byte
+	readCipherBuf []byte
+
+	writeFrame []byte
 
 	bloom *disk_bloom.FilterGroup
 	sg    SaltGenerator
@@ -70,27 +86,34 @@ func NewTCPConn(conn netproxy.Conn, metadata protocol.Metadata, masterKey []byte
 	if conf.NewCipher == nil {
 		return nil, fmt.Errorf("invalid CipherConf")
 	}
-	sg, err := GetSaltGenerator(masterKey, conf.SaltLen)
+	sg, err := NewRandomSaltGenerator(conf.SaltLen)
 	if err != nil {
 		return nil, err
 	}
-	// DO NOT use pool here because Close() cannot interrupt the reading or writing, which will modify the value of the pool buffer.
+	// Keep the key connection-owned because both directions use it for the
+	// lifetime of the stream.
 	key := make([]byte, len(masterKey))
 	copy(key, masterKey)
+	state := make([]byte, 2*conf.NonceLen+2+conf.TagLen)
+	nonceWriteOffset := conf.NonceLen
+	readLengthOffset := 2 * conf.NonceLen
 	c := TCPConn{
-		Conn:       conn,
-		metadata:   metadata,
-		cipherConf: conf,
-		masterKey:  key,
-		nonceRead:  make([]byte, conf.NonceLen),
-		nonceWrite: make([]byte, conf.NonceLen),
-		bloom:      bloom,
-		sg:         sg,
+		Conn:          conn,
+		metadata:      metadata,
+		cipherConf:    conf,
+		masterKey:     key,
+		nonceRead:     state[:nonceWriteOffset],
+		nonceWrite:    state[nonceWriteOffset:readLengthOffset],
+		readLengthBuf: state[readLengthOffset:],
+		bloom:         bloom,
+		sg:            sg,
 	}
 	if metadata.IsClient {
 		time.AfterFunc(100*time.Millisecond, func() {
-			// avoid the situation where the server sends messages first
-			if _, err = c.Write(nil); err != nil {
+			// avoid the situation where the server sends messages first.
+			// Use a local error: capturing the named return here would race
+			// with the caller's frame after NewTCPConn returns.
+			if _, werr := c.Write(nil); werr != nil {
 				return
 			}
 		})
@@ -98,8 +121,44 @@ func NewTCPConn(conn netproxy.Conn, metadata protocol.Metadata, masterKey []byte
 	return &c, nil
 }
 
+func (c *TCPConn) CloseWrite() error {
+	return netproxy.ForwardCloseWrite(c.Conn)
+}
+
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped conn. Embedding the conn interface
+// promotes SetWriteDeadline but not this optional method, so without the
+// forward a session-closing inner conn (TUIC, hysteria2) would be invisible to
+// deadline-arming callers and they would arm a destructive timer believing it
+// was an ordinary write deadline.
+func (c *TCPConn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.Conn)
+}
+
 func (c *TCPConn) Close() error {
-	return c.Conn.Close()
+	err := c.Conn.Close()
+
+	c.readMutex.Lock()
+	c.leftToRead = nil
+	c.indexToRead = 0
+	c.readLengthBuf = nil
+	c.readCipherBuf = nil
+	c.readMutex.Unlock()
+
+	c.writeMutex.Lock()
+	c.writeFrame = nil
+	c.writeMutex.Unlock()
+	return err
+}
+
+func (c *TCPConn) borrowWriteFrame(size int) []byte {
+	if size <= maxReusableWriteFrameSize {
+		if cap(c.writeFrame) < size {
+			c.writeFrame = make([]byte, size)
+		}
+		return c.writeFrame[:size]
+	}
+	return make([]byte, size)
 }
 
 func (c *TCPConn) Read(b []byte) (n int, err error) {
@@ -118,14 +177,13 @@ func (c *TCPConn) Read(b []byte) (n int, err error) {
 				return
 			}
 		}
-		//log.Warn("salt: %v", hex.EncodeToString(salt))
-		subKey := pool.Get(c.cipherConf.KeyLen)
-		defer pool.Put(subKey)
+		subKey := getSubKey(c.cipherConf.KeyLen)
+		defer putSubKey(subKey)
 		kdf := hkdf.New(
 			sha1.New,
 			c.masterKey,
 			salt,
-			ciphers.ShadowsocksReusedInfo,
+			ShadowsocksReusedInfo,
 		)
 		_, err = io.ReadFull(kdf, subKey)
 		if err != nil {
@@ -141,49 +199,56 @@ func (c *TCPConn) Read(b []byte) (n int, err error) {
 		n = copy(b, c.leftToRead[c.indexToRead:])
 		c.indexToRead += n
 		if c.indexToRead >= len(c.leftToRead) {
-			// Put the buf back
-			pool.Put(c.leftToRead)
+			c.leftToRead = nil
+			c.indexToRead = 0
 		}
 		return n, nil
 	}
-	// Chunk
-	chunk, err := c.readChunkFromPool()
+	chunk, err := c.readChunk()
 	if err != nil {
 		return 0, err
 	}
 	n = copy(b, chunk)
 	if n < len(chunk) {
-		// Wait for the next read
 		c.leftToRead = chunk
 		c.indexToRead = n
-	} else {
-		// Full reading. Put the buf back
-		pool.Put(chunk)
 	}
 	return n, nil
 }
 
-func (c *TCPConn) readChunkFromPool() ([]byte, error) {
-	bufLen := pool.Get(2 + c.cipherConf.TagLen)
-	defer pool.Put(bufLen)
-	//log.Warn("len(bufLen): %v, c.nonceRead: %v", len(bufLen), c.nonceRead)
-	if _, err := io.ReadFull(c.Conn, bufLen); err != nil {
+func (c *TCPConn) borrowReadLengthFrame() []byte {
+	size := 2 + c.cipherConf.TagLen
+	if cap(c.readLengthBuf) < size {
+		c.readLengthBuf = make([]byte, size)
+	}
+	return c.readLengthBuf[:size]
+}
+
+func (c *TCPConn) borrowReadCipherFrame(size int) []byte {
+	if cap(c.readCipherBuf) < size {
+		c.readCipherBuf = make([]byte, size)
+	}
+	return c.readCipherBuf[:size]
+}
+
+func (c *TCPConn) readChunk() ([]byte, error) {
+	lengthFrame := c.borrowReadLengthFrame()
+	if _, err := io.ReadFull(c.Conn, lengthFrame); err != nil {
 		return nil, err
 	}
-	bLenPayload, err := c.cipherRead.Open(bufLen[:0], c.nonceRead, bufLen, nil)
+	length, err := c.cipherRead.Open(lengthFrame[:0], c.nonceRead, lengthFrame, nil)
 	if err != nil {
-		//log.Warn("read length of payload: %v: %v", protocol.ErrFailAuth, err)
 		return nil, protocol.ErrFailAuth
 	}
 	common.BytesIncLittleEndian(c.nonceRead)
-	lenPayload := binary.BigEndian.Uint16(bLenPayload)
-	bufPayload := pool.Get(int(lenPayload) + c.cipherConf.TagLen) // delay putting back
-	if _, err = io.ReadFull(c.Conn, bufPayload); err != nil {
+
+	payloadSize := int(binary.BigEndian.Uint16(length)) + c.cipherConf.TagLen
+	cipherFrame := c.borrowReadCipherFrame(payloadSize)
+	if _, err := io.ReadFull(c.Conn, cipherFrame); err != nil {
 		return nil, err
 	}
-	payload, err := c.cipherRead.Open(bufPayload[:0], c.nonceRead, bufPayload, nil)
+	payload, err := c.cipherRead.Open(cipherFrame[:0], c.nonceRead, cipherFrame, nil)
 	if err != nil {
-		//log.Warn("read payload: %v: %v", protocol.ErrFailAuth, err)
 		return nil, protocol.ErrFailAuth
 	}
 	common.BytesIncLittleEndian(c.nonceRead)
@@ -216,13 +281,13 @@ func (c *TCPConn) initWriteFromPool(b []byte) (buf []byte, offset int, toWrite [
 	salt := c.sg.Get()
 	copy(buf, salt)
 	pool.Put(salt)
-	subKey := pool.Get(c.cipherConf.KeyLen)
-	defer pool.Put(subKey)
+	subKey := getSubKey(c.cipherConf.KeyLen)
+	defer putSubKey(subKey)
 	kdf := hkdf.New(
 		sha1.New,
 		c.masterKey,
 		buf[:c.cipherConf.SaltLen],
-		ciphers.ShadowsocksReusedInfo,
+		ShadowsocksReusedInfo,
 	)
 	_, err = io.ReadFull(kdf, subKey)
 	if err != nil {
@@ -240,18 +305,20 @@ func (c *TCPConn) initWriteFromPool(b []byte) (buf []byte, offset int, toWrite [
 	if c.bloom != nil {
 		c.bloom.ExistOrAdd(buf[:c.cipherConf.SaltLen])
 	}
-	//log.Trace("salt(%p): %v", &b, hex.EncodeToString(buf[:c.cipherConf.SaltLen]))
 	return buf, offset, toWrite, nil
 }
 
 func (c *TCPConn) Write(b []byte) (n int, err error) {
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
+	if c.writeBroken {
+		return 0, net.ErrClosed
+	}
 	var buf []byte
 	var toPack []byte
 	var offset int
-	if !c.onceWrite {
-		c.onceWrite = true
+	firstWrite := !c.onceWrite
+	if firstWrite {
 		buf, offset, toPack, err = c.initWriteFromPool(b)
 		if err != nil {
 			return 0, err
@@ -259,18 +326,21 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 		defer pool.Put(toPack)
 	}
 	if buf == nil {
-		buf = pool.Get(EncryptedPayloadLen(len(b), c.cipherConf.TagLen))
+		buf = c.borrowWriteFrame(EncryptedPayloadLen(len(b), c.cipherConf.TagLen))
 		toPack = b
+	} else {
+		defer pool.Put(buf)
 	}
-	defer pool.Put(buf)
 	if c.cipherWrite == nil {
 		return 0, fmt.Errorf("%v: %w", ErrFailInitCipher, err)
 	}
-	c.seal(buf[offset:], toPack)
-	//log.Trace("to write(%p): %v", &b, hex.EncodeToString(buf[:c.cipherConf.SaltLen]))
-	_, err = c.Conn.Write(buf)
-	if err != nil {
+	sealed := c.seal(buf[offset:], toPack)
+	if _, err = iout.WriteFull(c.Conn, buf[:offset+len(sealed)]); err != nil {
+		c.writeBroken = true
 		return 0, err
+	}
+	if firstWrite {
+		c.onceWrite = true
 	}
 	return len(b), nil
 }
@@ -316,13 +386,14 @@ func (c *TCPConn) ReadMetadata() (metadata Metadata, err error) {
 	metadata = *mdata
 	// complete metadata
 	if !c.metadata.IsClient {
-		c.metadata.Type = metadata.Metadata.Type
-		c.metadata.Hostname = metadata.Metadata.Hostname
-		c.metadata.Port = metadata.Metadata.Port
+		c.metadata.Type = metadata.Type
+		c.metadata.Hostname = metadata.Hostname
+		c.metadata.Port = metadata.Port
+		c.metadata.IP = metadata.IP
 		if metadata.Type == protocol.MetadataTypeMsg {
 			c.metadata.Cmd = protocol.MetadataCmdResponse
 		} else {
-			c.metadata.Cmd = metadata.Metadata.Cmd
+			c.metadata.Cmd = metadata.Cmd
 		}
 	}
 	return metadata, nil
@@ -335,10 +406,13 @@ func CalcPaddingLen(masterKey []byte, bodyWithoutAddr []byte, req bool) (length 
 	}
 	var h hash.Hash32
 	if req {
-		h = fnv.New32a()
+		h = fnv32aPool.Get().(hash.Hash32)
+		defer fnv32aPool.Put(h)
 	} else {
-		h = fnv.New32()
+		h = fnv32Pool.Get().(hash.Hash32)
+		defer fnv32Pool.Put(h)
 	}
+	h.Reset()
 	h.Write(masterKey)
 	h.Write(bodyWithoutAddr)
 	return int(h.Sum32()) % maxPadding

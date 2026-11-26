@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
@@ -15,7 +17,21 @@ import (
 	"golang.org/x/net/context"
 )
 
+func requireHysteria2Integration(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping hysteria2 integration test in short mode")
+	}
+	if os.Getenv("OUTBOUND_INTEGRATION") == "" {
+		t.Skip("skipping hysteria2 integration test; set OUTBOUND_INTEGRATION=1 to enable")
+	}
+	if _, err := net.DialTimeout("tcp", "127.0.0.1:8443", 100*time.Millisecond); err != nil {
+		t.Skip("skipping hysteria2 integration test: local server on 127.0.0.1:8443 not available")
+	}
+}
+
 func TestTCP(t *testing.T) {
+	requireHysteria2Integration(t)
 	d, err := NewDialer(direct.SymmetricDirect, protocol.Header{
 		ProxyAddress: "localhost:8443",
 		SNI:          "",
@@ -46,12 +62,13 @@ func TestTCP(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf := new(bytes.Buffer)
-	buf.ReadFrom(resp.Body)
-	defer resp.Body.Close()
+	_, _ = buf.ReadFrom(resp.Body)
+	defer func() { _ = resp.Body.Close() }()
 	t.Log(buf.String())
 }
 
 func TestUDP(t *testing.T) {
+	requireHysteria2Integration(t)
 	d, err := NewDialer(direct.SymmetricDirect, protocol.Header{
 		ProxyAddress: "localhost:8443",
 		SNI:          "",

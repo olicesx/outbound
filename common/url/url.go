@@ -1090,7 +1090,7 @@ func (u *URL) ResolveReference(ref *URL) *URL {
 		// The "absoluteURI" or "net_path" cases.
 		// We can ignore the error from setPath since we know we provided a
 		// validly-escaped path.
-		url.setPath(resolvePath(ref.EscapedPath(), ""))
+		_ = url.setPath(resolvePath(ref.EscapedPath(), ""))
 		return &url
 	}
 	if ref.Opaque != "" {
@@ -1109,7 +1109,7 @@ func (u *URL) ResolveReference(ref *URL) *URL {
 	// The "abs_path" or "rel_path" cases.
 	url.Host = u.Host
 	url.User = u.User
-	url.setPath(resolvePath(u.EscapedPath(), ref.EscapedPath()))
+	_ = url.setPath(resolvePath(u.EscapedPath(), ref.EscapedPath()))
 	return &url
 }
 
@@ -1212,7 +1212,7 @@ func (u *URL) JoinPath(elem ...string) *URL {
 		p += "/"
 	}
 	url := *u
-	url.setPath(p)
+	_ = url.setPath(p)
 	return &url
 }
 

@@ -7,10 +7,12 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"sync"
 
+	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol"
-	"github.com/daeuniverse/quic-go"
 	"github.com/google/uuid"
+	"github.com/olicesx/quic-go"
 )
 
 type BufferedReader interface {
@@ -121,8 +123,8 @@ func NewAuthenticate(UUID [16]byte, TOKEN [32]byte, VER byte) *Authenticate {
 func ReadAuthenticateWithHead(head *CommandHead, reader BufferedReader) (c *Authenticate, err error) {
 	var _c Authenticate
 	_c.CommandHead = head
-	if _c.CommandHead.TYPE != AuthenticateType {
-		return nil, fmt.Errorf("error command type: %s", _c.CommandHead.TYPE)
+	if _c.TYPE != AuthenticateType {
+		return nil, fmt.Errorf("error command type: %s", _c.TYPE)
 	}
 	_, err = io.ReadFull(reader, _c.UUID[:])
 	if err != nil {
@@ -188,8 +190,8 @@ func NewConnect(ADDR *Address, VER byte) *Connect {
 func ReadConnectWithHead(head *CommandHead, reader BufferedReader) (c *Connect, err error) {
 	var _c Connect
 	_c.CommandHead = head
-	if _c.CommandHead.TYPE != ConnectType {
-		err = fmt.Errorf("error command type: %s", _c.CommandHead.TYPE)
+	if _c.TYPE != ConnectType {
+		err = fmt.Errorf("error command type: %s", _c.TYPE)
 		return nil, err
 	}
 	_c.ADDR, err = ReadAddress(reader)
@@ -229,6 +231,10 @@ func (c Connect) BytesLen() int {
 	return c.CommandHead.BytesLen() + c.ADDR.BytesLen()
 }
 
+type packetDataOwner struct {
+	once sync.Once
+}
+
 type Packet struct {
 	*CommandHead
 	ASSOC_ID   uint16
@@ -238,6 +244,22 @@ type Packet struct {
 	SIZE       uint16
 	ADDR       *Address
 	DATA       []byte
+
+	// dataOwner is present only for parsed pool-backed DATA. Keeping sync.Once
+	// behind a pointer makes outgoing Packet value copies safe.
+	dataOwner *packetDataOwner
+}
+
+// releaseData returns DATA to the pool if pool-backed; no-op otherwise and on
+// repeat calls. Call once the consumer is done with DATA.
+func (p *Packet) releaseData() {
+	if p == nil || p.dataOwner == nil {
+		return
+	}
+	p.dataOwner.once.Do(func() {
+		pool.Put(p.DATA)
+		p.DATA = nil
+	})
 }
 
 func NewPacket(ASSOC_ID uint16, PKT_ID uint16, FRGA_TOTAL uint8, FRAG_ID uint8, SIZE uint16, ADDR *Address, DATA []byte, VER byte) *Packet {
@@ -256,8 +278,8 @@ func NewPacket(ASSOC_ID uint16, PKT_ID uint16, FRGA_TOTAL uint8, FRAG_ID uint8, 
 func ReadPacketWithHead(head *CommandHead, reader BufferedReader) (c *Packet, err error) {
 	var _c Packet
 	_c.CommandHead = head
-	if _c.CommandHead.TYPE != PacketType {
-		err = fmt.Errorf("error command type: %s", _c.CommandHead.TYPE)
+	if _c.TYPE != PacketType {
+		err = fmt.Errorf("error command type: %s", _c.TYPE)
 		return nil, err
 	}
 	err = binary.Read(reader, binary.BigEndian, &_c.ASSOC_ID)
@@ -301,43 +323,50 @@ func ReadPacket(reader BufferedReader) (c *Packet, err error) {
 }
 
 func (c Packet) WriteTo(writer BufferedWriter) (err error) {
-	err = c.CommandHead.WriteTo(writer)
-	if err != nil {
-		return
+	// Serialize straight into the writer's tail when it supports Extend
+	// (pool/bytes.Buffer), skipping the intermediate heap buffer and extra
+	// copy of the scratch path. BytesLen is exact, so the extended region
+	// needs no truncation.
+	if ext, ok := writer.(interface {
+		Extend(n int)
+		Len() int
+		Bytes() []byte
+	}); ok {
+		start := ext.Len()
+		ext.Extend(c.BytesLen())
+		_ = c.WriteToBytes(ext.Bytes()[start:])
+		return nil
 	}
-	err = binary.Write(writer, binary.BigEndian, c.ASSOC_ID)
-	if err != nil {
-		return
-	}
-	err = binary.Write(writer, binary.BigEndian, c.PKT_ID)
-	if err != nil {
-		return
-	}
-	err = binary.Write(writer, binary.BigEndian, c.FRAG_TOTAL)
-	if err != nil {
-		return
-	}
-	err = binary.Write(writer, binary.BigEndian, c.FRAG_ID)
-	if err != nil {
-		return
-	}
-	err = binary.Write(writer, binary.BigEndian, c.SIZE)
-	if err != nil {
-		return
-	}
-	err = c.ADDR.WriteTo(writer)
-	if err != nil {
-		return
-	}
-	_, err = writer.Write(c.DATA)
-	if err != nil {
-		return
-	}
+	buf := make([]byte, c.BytesLen())
+	n := c.WriteToBytes(buf)
+	_, err = writer.Write(buf[:n])
 	return
 }
 
+// WriteToBytes serializes the Packet into a caller-provided buffer using
+// direct binary.BigEndian writes, avoiding the per-field binary.Write
+// reflection allocations of WriteTo. The buffer must be at least
+// c.BytesLen() bytes long.
+func (c Packet) WriteToBytes(b []byte) (n int) {
+	n += c.CommandHead.WriteToBytes(b)
+	binary.BigEndian.PutUint16(b[n:], c.ASSOC_ID)
+	n += 2
+	binary.BigEndian.PutUint16(b[n:], c.PKT_ID)
+	n += 2
+	b[n] = c.FRAG_TOTAL
+	n += 1
+	b[n] = c.FRAG_ID
+	n += 1
+	binary.BigEndian.PutUint16(b[n:], c.SIZE)
+	n += 2
+	n += c.ADDR.WriteToBytes(b[n:])
+	n += copy(b[n:], c.DATA)
+	return n
+}
+
 func (c Packet) BytesLen() int {
-	return c.CommandHead.BytesLen() + 4 + 2 + c.ADDR.BytesLen() + len(c.DATA)
+	// Fixed fields: ASSOC_ID(2) + PKT_ID(2) + FRAG_TOTAL(1) + FRAG_ID(1) + SIZE(2) = 8
+	return c.CommandHead.BytesLen() + 8 + c.ADDR.BytesLen() + len(c.DATA)
 }
 
 var PacketOverHead = NewPacket(0, 0, 0, 0, 0, NewAddressAddrPort(netip.AddrPortFrom(netip.IPv6Unspecified(), 0)), nil, 0).BytesLen()
@@ -357,8 +386,8 @@ func NewDissociate(ASSOC_ID uint16, VER byte) *Dissociate {
 func ReadDissociateWithHead(head *CommandHead, reader BufferedReader) (c *Dissociate, err error) {
 	var _c Dissociate
 	_c.CommandHead = head
-	if _c.CommandHead.TYPE != DissociateType {
-		err = fmt.Errorf("error command type: %s", _c.CommandHead.TYPE)
+	if _c.TYPE != DissociateType {
+		err = fmt.Errorf("error command type: %s", _c.TYPE)
 		return nil, err
 	}
 	err = binary.Read(reader, binary.BigEndian, &_c.ASSOC_ID)
@@ -405,8 +434,8 @@ func NewHeartbeat(VER byte) *Heartbeat {
 func ReadHeartbeatWithHead(head *CommandHead, reader BufferedReader) (c *Heartbeat, err error) {
 	var _c Heartbeat
 	_c.CommandHead = head
-	if _c.CommandHead.TYPE != HeartbeatType {
-		err = fmt.Errorf("error command type: %s", _c.CommandHead.TYPE)
+	if _c.TYPE != HeartbeatType {
+		err = fmt.Errorf("error command type: %s", _c.TYPE)
 		return nil, err
 	}
 	return &_c, nil
@@ -440,10 +469,20 @@ func NewAddress(metadata *protocol.Metadata) *Address {
 	switch metadata.Type {
 	case protocol.MetadataTypeIPv4:
 		addrType = AtypIPv4
-		addr = net.ParseIP(metadata.Hostname).To4()
+		if metadata.IP.Is4() {
+			ip4 := metadata.IP.As4()
+			addr = ip4[:]
+		} else {
+			addr = net.ParseIP(metadata.Hostname).To4()
+		}
 	case protocol.MetadataTypeIPv6:
 		addrType = AtypIPv6
-		addr = net.ParseIP(metadata.Hostname).To16()
+		if metadata.IP.IsValid() && !metadata.IP.Is4() {
+			ip16 := metadata.IP.As16()
+			addr = ip16[:]
+		} else {
+			addr = net.ParseIP(metadata.Hostname).To16()
+		}
 	case protocol.MetadataTypeDomain:
 		addrType = AtypDomainName
 		addr = make([]byte, len(metadata.Hostname)+1)
@@ -556,7 +595,9 @@ func (c Address) WriteTo(writer BufferedWriter) (err error) {
 func (c Address) WriteToBytes(b []byte) (n int) {
 	b[0] = c.TYPE
 	if c.TYPE == AtypNone {
-		return
+		// The type byte alone is serialized; returning 0 here would make
+		// the caller lay the payload over it and shift the frame.
+		return 1
 	}
 	n = copy(b[1:], c.ADDR)
 	binary.BigEndian.PutUint16(b[1+n:], c.PORT)
@@ -582,7 +623,22 @@ func (c Address) UDPAddr() *net.UDPAddr {
 	}
 }
 
+// UDPAddrPort returns the address as a netip.AddrPort without the
+// intermediate net.UDPAddr allocation, for per-datagram receive paths.
+// Domain-typed addresses fall back to UDPAddr and yield an invalid AddrPort,
+// exactly like the previous UDPAddr().AddrPort() chain.
+func (c Address) UDPAddrPort() netip.AddrPort {
+	if addr, ok := netip.AddrFromSlice(c.ADDR); ok {
+		return netip.AddrPortFrom(addr, c.PORT)
+	}
+	return c.UDPAddr().AddrPort()
+}
+
 func (c Address) BytesLen() int {
+	if c.TYPE == AtypNone {
+		// Mirror the serializers: only the type byte goes on the wire.
+		return 1
+	}
 	return 1 + len(c.ADDR) + 2
 }
 

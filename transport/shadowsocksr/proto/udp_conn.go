@@ -3,8 +3,10 @@ package proto
 import (
 	"fmt"
 	"net/netip"
+	"sync"
 
 	"github.com/daeuniverse/outbound/ciphers"
+	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/pool/bytes"
@@ -14,9 +16,13 @@ import (
 
 type PacketConn struct {
 	netproxy.PacketConn
-	Protocol IProtocol
-	tgt      string
+	Protocol  IProtocol
+	tgt       string
+	writeMu   sync.Mutex
+	addrCache common.LastStringValue[socks.Addr]
 }
+
+var parseSocksAddr = socks.ParseAddr
 
 func NewPacketConn(c netproxy.PacketConn, proto IProtocol, tgt string) (*PacketConn, error) {
 	return &PacketConn{
@@ -24,6 +30,16 @@ func NewPacketConn(c netproxy.PacketConn, proto IProtocol, tgt string) (*PacketC
 		Protocol:   proto,
 		tgt:        tgt,
 	}, nil
+}
+
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped transport: SetWriteDeadline is
+// delegated to the underlying PacketConn unchanged, so the semantics — and
+// the declaration — belong to that transport, not to this wrapper.
+// Production wraps shadowsocks_stream.DialUdpTransport here, whose own
+// forward would otherwise be erased by this outer layer.
+func (c *PacketConn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.PacketConn)
 }
 
 func (c *PacketConn) InnerCipher() *ciphers.StreamCipher {
@@ -60,9 +76,13 @@ func (c *PacketConn) ReadFrom(b []byte) (n int, from netip.AddrPort, err error) 
 		return 0, netip.AddrPort{}, fmt.Errorf("no addr present")
 	}
 
-	from, err = netip.ParseAddrPort(addr.String())
-	if err != nil {
-		return 0, netip.AddrPort{}, fmt.Errorf("bad addr: %w", err)
+	from, ok := addr.AddrPort()
+	if !ok {
+		var err error
+		from, err = netip.ParseAddrPort(addr.String())
+		if err != nil {
+			return 0, netip.AddrPort{}, fmt.Errorf("bad addr: %w", err)
+		}
 	}
 
 	//if len(b) < len(decoded.Bytes())-len(addr) {
@@ -73,11 +93,19 @@ func (c *PacketConn) ReadFrom(b []byte) (n int, from netip.AddrPort, err error) 
 }
 
 func (c *PacketConn) WriteTo(b []byte, to string) (n int, err error) {
-	addr, err := socks.ParseAddr(to)
+	addr, err := c.targetAddr(to)
 	if err != nil {
 		return 0, err
 	}
-	pb := pool.GetMustBigger(len(addr) + len(b))
+
+	// Lock to protect concurrent writes.
+	// Critical section is minimized to only protect the shared buffer and write operation.
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	pb := pool.Get(len(addr) + len(b))
+	defer pool.Put(pb)
+
 	copy(pb, addr)
 	copy(pb[len(addr):], b)
 	buf := bytes.NewBuffer(pb)
@@ -88,5 +116,18 @@ func (c *PacketConn) WriteTo(b []byte, to string) (n int, err error) {
 		return 0, err
 	}
 
-	return len(b), err
+	return len(b), nil
+}
+
+func (c *PacketConn) targetAddr(addr string) (socks.Addr, error) {
+	if cached, ok := c.addrCache.Load(addr); ok {
+		return cached, nil
+	}
+	target, err := parseSocksAddr(addr)
+	if err != nil {
+		return nil, err
+	}
+	target = append(socks.Addr(nil), target...)
+	c.addrCache.Store(addr, target)
+	return target, nil
 }

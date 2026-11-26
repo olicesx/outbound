@@ -3,7 +3,6 @@ package juicity
 import (
 	"context"
 	"fmt"
-	"math"
 	"net"
 	"strconv"
 	"time"
@@ -13,8 +12,8 @@ import (
 	"github.com/daeuniverse/outbound/protocol/shadowsocks"
 	"github.com/daeuniverse/outbound/protocol/trojanc"
 	"github.com/daeuniverse/outbound/protocol/tuic/common"
-	"github.com/daeuniverse/quic-go"
 	"github.com/google/uuid"
+	"github.com/olicesx/quic-go"
 )
 
 func init() {
@@ -25,6 +24,7 @@ type Dialer struct {
 	clientRing *clientRing
 
 	proxyAddress string
+	proxyUDPAddr *net.UDPAddr
 	nextDialer   netproxy.Dialer
 }
 
@@ -35,14 +35,27 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	}
 	// ensure server's incoming stream can handle correctly, increase to 1.1x
 	maxOpenIncomingStreams := int64(100)
-	quicMaxOpenIncomingStreams := int64(maxOpenIncomingStreams)
-	quicMaxOpenIncomingStreams = quicMaxOpenIncomingStreams + int64(math.Ceil(float64(quicMaxOpenIncomingStreams)/10.0))
 	reservedStreamsCapability := maxOpenIncomingStreams / 5
 	if reservedStreamsCapability < 1 {
 		reservedStreamsCapability = 1
 	}
 	if reservedStreamsCapability > 5 {
 		reservedStreamsCapability = 5
+	}
+	// Feature1 is the congestion controller echoed by the server. A non-string
+	// value (a caller mistake) must degrade instead of panicking; the override,
+	// when present, takes precedence over whatever the server echoed.
+	serverCC, _ := header.Feature1.(string)
+	// The declared fixed rate selects the brutal sender when the server
+	// negotiated brutal; 0 means no rate is known and the probing default runs.
+	brutalTarget := common.CWNDFromFeature(header.Feature2)
+	cc, err := common.SelectCongestionController(serverCC, header.CongestionOverride, brutalTarget)
+	if err != nil {
+		return nil, err
+	}
+	proxyUDPAddr, err := net.ResolveUDPAddr("udp", header.ProxyAddress)
+	if err != nil {
+		return nil, err
 	}
 	return &Dialer{
 		clientRing: newClientRing(func(capabilityCallback func(n int64)) *clientImpl {
@@ -55,16 +68,16 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 						MaxStreamReceiveWindow:         common.MaxStreamReceiveWindow,
 						InitialConnectionReceiveWindow: common.InitialConnectionReceiveWindow,
 						MaxConnectionReceiveWindow:     common.MaxConnectionReceiveWindow,
-						KeepAlivePeriod:                5 * time.Second,
+						KeepAlivePeriod:                10 * time.Second,
+						HandshakeIdleTimeout:           10 * time.Second,
 						DisablePathMTUDiscovery:        false,
 						EnableDatagrams:                false,
-						HandshakeIdleTimeout:           8 * time.Second,
 						CapabilityCallback:             capabilityCallback,
 					},
 					Uuid:                 id,
 					Password:             header.Password,
-					CongestionController: header.Feature1.(string),
-					CWND:                 10,
+					CongestionController: cc,
+					CWND:                 common.CWNDFromFeature(header.Feature2),
 					Ctx:                  ctx,
 					Cancel:               cancel,
 					UnderlayAuth:         make(chan *UnderlayAuth, 64),
@@ -72,20 +85,13 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 			}
 		}, reservedStreamsCapability),
 		proxyAddress: header.ProxyAddress,
+		proxyUDPAddr: proxyUDPAddr,
 		nextDialer:   nextDialer,
 	}, nil
 }
 
-func (d *Dialer) DialTcp(ctx context.Context, addr string) (c netproxy.Conn, err error) {
-	return d.DialContext(ctx, "tcp", addr)
-}
-
-func (d *Dialer) DialUdp(ctx context.Context, addr string) (c netproxy.PacketConn, err error) {
-	pktConn, err := d.DialContext(ctx, "udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	return pktConn.(netproxy.PacketConn), nil
+func (d *Dialer) UnwrapDialer() netproxy.Dialer {
+	return d.nextDialer
 }
 
 func (d *Dialer) dialFuncFactory(udpNetwork string, rAddr net.Addr) common.DialFunc {
@@ -98,7 +104,10 @@ func (d *Dialer) dialFuncFactory(udpNetwork string, rAddr net.Addr) common.DialF
 			conn.(netproxy.PacketConn),
 			net.UDPAddrFromAddrPort(common.GetUniqueFakeAddrPort()),
 			rAddr)
-		transport = &quic.Transport{Conn: pc}
+		transport = &quic.Transport{
+			Conn:               pc,
+			DisableAddrParsing: true,
+		}
 		return transport, rAddr, nil
 	}
 }
@@ -115,10 +124,6 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 			return nil, err
 		}
 		mdata.IsClient = true
-		proxyAddr, err := net.ResolveUDPAddr("udp", d.proxyAddress)
-		if err != nil {
-			return nil, err
-		}
 		udpNetwork := network
 		if magicNetwork.Network == "tcp" {
 			udpNetwork = netproxy.MagicNetwork{
@@ -133,7 +138,7 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 				iv, psk, err := d.clientRing.DialAuth(ctx, &trojanc.Metadata{
 					Metadata: mdata,
 					Network:  magicNetwork.Network,
-				}, d.nextDialer, d.dialFuncFactory(udpNetwork, proxyAddr))
+				}, d.nextDialer, d.dialFuncFactory(udpNetwork, d.proxyUDPAddr))
 				if err != nil {
 					return nil, err
 				}
@@ -145,13 +150,13 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 				if err != nil {
 					return nil, err
 				}
-				transport, _, err := d.dialFuncFactory(udpNetwork, proxyAddr)(context.TODO(), d.nextDialer)
+				transport, _, err := d.dialFuncFactory(udpNetwork, d.proxyUDPAddr)(ctx, d.nextDialer)
 				if err != nil {
 					return nil, err
 				}
 				return &TransportPacketConn{
 					Transport: transport,
-					proxyAddr: proxyAddr,
+					proxyAddr: d.proxyUDPAddr,
 					tgt:       innerAddr.AddrPort(),
 					key:       key,
 					firstIv:   iv,
@@ -162,7 +167,7 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 			Metadata: mdata,
 			Network:  magicNetwork.Network,
 		}, d.nextDialer,
-			d.dialFuncFactory(udpNetwork, proxyAddr),
+			d.dialFuncFactory(udpNetwork, d.proxyUDPAddr),
 		)
 		if err != nil {
 			return nil, err
@@ -170,9 +175,9 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 		if magicNetwork.Network == "tcp" {
 			time.AfterFunc(100*time.Millisecond, func() {
 				// avoid the situation where the server sends messages first
-				if _, err = conn.Write(nil); err != nil {
-					return
-				}
+				// Write to the underlay purely for its side effect (wake the
+				// server); probe errors are not reportable here anymore.
+				_, _ = conn.Write(nil)
 			})
 			return conn, nil
 		} else {
@@ -194,10 +199,6 @@ func underlayKey(psk []byte) (key *shadowsocks.Key, err error) {
 }
 
 func (d *Dialer) DialCmdMsg(ctx context.Context, cmd protocol.MetadataCmd) (c netproxy.Conn, err error) {
-	proxyAddr, err := net.ResolveUDPAddr("udp", d.proxyAddress)
-	if err != nil {
-		return nil, err
-	}
 	conn, err := d.clientRing.DialContext(ctx, &trojanc.Metadata{
 		Metadata: protocol.Metadata{
 			Type:     protocol.MetadataTypeMsg,
@@ -205,10 +206,17 @@ func (d *Dialer) DialCmdMsg(ctx context.Context, cmd protocol.MetadataCmd) (c ne
 			IsClient: true,
 		},
 	}, d.nextDialer,
-		d.dialFuncFactory("udp", proxyAddr),
+		d.dialFuncFactory("udp", d.proxyUDPAddr),
 	)
 	if err != nil {
 		return nil, err
 	}
 	return conn, nil
+}
+
+func (d *Dialer) Close() error {
+	if d == nil || d.clientRing == nil {
+		return nil
+	}
+	return d.clientRing.Close()
 }

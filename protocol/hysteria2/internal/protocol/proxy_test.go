@@ -16,7 +16,7 @@ func TestUDPMessage(t *testing.T) {
 			PacketID:  77,
 			FragID:    2,
 			FragCount: 5,
-			Addr:      "random_addr",
+			Addr:      []byte("random_addr"),
 			Data:      []byte("random_data"),
 		}).Serialize(tBuf) != -1 {
 			t.Error("Serialize() did not return -1 when the buffer was too small")
@@ -28,7 +28,7 @@ func TestUDPMessage(t *testing.T) {
 		PacketID  uint16
 		FragID    uint8
 		FragCount uint8
-		Addr      string
+		Addr      []byte
 		Data      []byte
 	}
 	tests := []struct {
@@ -43,7 +43,7 @@ func TestUDPMessage(t *testing.T) {
 				PacketID:  1,
 				FragID:    0,
 				FragCount: 1,
-				Addr:      "example.com:80",
+				Addr:      []byte("example.com:80"),
 				Data:      []byte("GET /nothing HTTP/1.1\r\n"),
 			},
 			want: []byte{0x0, 0x0, 0x0, 0x1, 0x0, 0x1, 0x0, 0x1, 0xe, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x3a, 0x38, 0x30, 0x47, 0x45, 0x54, 0x20, 0x2f, 0x6e, 0x6f, 0x74, 0x68, 0x69, 0x6e, 0x67, 0x20, 0x48, 0x54, 0x54, 0x50, 0x2f, 0x31, 0x2e, 0x31, 0xd, 0xa},
@@ -52,7 +52,7 @@ func TestUDPMessage(t *testing.T) {
 			name: "test 2",
 			fields: fields{
 				SessionID: 1329655244,
-				Addr:      "some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long:9000",
+				Addr:      []byte("some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long_some_random_goofy_ahh_address_which_is_very_long:9000"),
 				PacketID:  62233,
 				FragID:    8,
 				FragCount: 19,
@@ -206,7 +206,7 @@ func TestWriteTCPRequest(t *testing.T) {
 				t.Errorf("WriteTCPRequest() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if gotW := w.String(); !(strings.HasPrefix(gotW, tt.wantW) && len(gotW) > len(tt.wantW)) {
+			if gotW := w.String(); !strings.HasPrefix(gotW, tt.wantW) || len(gotW) <= len(tt.wantW) {
 				t.Errorf("WriteTCPRequest() gotW = %v, want %v", gotW, tt.wantW)
 			}
 		})
@@ -309,7 +309,7 @@ func TestWriteTCPResponse(t *testing.T) {
 				t.Errorf("WriteTCPResponse() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if gotW := w.String(); !(strings.HasPrefix(gotW, tt.wantW) && len(gotW) > len(tt.wantW)) {
+			if gotW := w.String(); !strings.HasPrefix(gotW, tt.wantW) || len(gotW) <= len(tt.wantW) {
 				t.Errorf("WriteTCPResponse() gotW = %v, want %v", gotW, tt.wantW)
 			}
 		})

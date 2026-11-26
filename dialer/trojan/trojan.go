@@ -109,7 +109,12 @@ func (s *Trojan) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) 
 			ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 			Cipher:       fields[1],
 			Password:     fields[2],
-			IsClient:     false,
+			// This stack is the shadowsocks *client* hop toward the
+			// trojan server's ss terminator. With false the first TCP
+			// write would omit the target-address header entirely
+			// (see shadowsocks initWriteFromPool) and the server could
+			// not route the connection.
+			IsClient: true,
 		}); err != nil {
 			return nil, nil, err
 		}
@@ -136,23 +141,8 @@ func ParseTrojanURL(u string) (data *Trojan, err error) {
 		err = fmt.Errorf("invalid trojan format")
 		return
 	}
-	allowInsecure, _ := strconv.ParseBool(t.Query().Get("allowInsecure"))
-	if !allowInsecure {
-		allowInsecure, _ = strconv.ParseBool(t.Query().Get("allow_insecure"))
-	}
-	if !allowInsecure {
-		allowInsecure, _ = strconv.ParseBool(t.Query().Get("allowinsecure"))
-	}
-	if !allowInsecure {
-		allowInsecure, _ = strconv.ParseBool(t.Query().Get("skipVerify"))
-	}
-	sni := t.Query().Get("peer")
-	if sni == "" {
-		sni = t.Query().Get("sni")
-	}
-	if sni == "" {
-		sni = t.Hostname()
-	}
+	allowInsecure := dialer.AllowInsecureFromQuery(t.Query())
+	sni := dialer.SNIFromQuery(t.Query(), t.Hostname())
 	port, err := strconv.Atoi(t.Port())
 	if err != nil {
 		return nil, dialer.InvalidParameterErr

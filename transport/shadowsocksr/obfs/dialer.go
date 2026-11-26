@@ -21,6 +21,10 @@ type ObfsParam struct {
 	ObfsParam string
 }
 
+func (d *Dialer) UnwrapDialer() netproxy.Dialer {
+	return d.NextDialer
+}
+
 func NewDialer(nextDialer netproxy.Dialer, param *ObfsParam) (*Dialer, error) {
 
 	constructor := NewObfs(param.Obfs)

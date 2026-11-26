@@ -20,6 +20,10 @@ type Dialer struct {
 	alpn       []string
 }
 
+func (m *Dialer) UnwrapDialer() netproxy.Dialer {
+	return m.nextDialer
+}
+
 func NewDialer(s string, d netproxy.Dialer) (*Dialer, error) {
 	u, err := url.Parse(s)
 	if err != nil {
@@ -58,6 +62,16 @@ func NewDialer(s string, d netproxy.Dialer) (*Dialer, error) {
 		m.alpn = []string{"h2", "http/1.1"}
 	}
 	if m.serverName == "" {
+		// The sni/serverName query parameters were historically parsed
+		// nowhere, so every link silently used the host as SNI.
+		for _, key := range []string{"sni", "serverName"} {
+			if v := query.Get(key); v != "" {
+				m.serverName = v
+				break
+			}
+		}
+	}
+	if m.serverName == "" {
 		m.serverName = u.Hostname()
 	}
 	m.tlsConfig = &tls.Config{
@@ -80,6 +94,11 @@ func (m *Dialer) DialContext(ctx context.Context, network, addr string) (c netpr
 			nextDialer: m.nextDialer,
 			addr:       addr,
 			url:        m.url,
+			// The TLS block above (sni/serverName/skipVerify/alpn) must
+			// actually reach the round tripper, and it is part of the
+			// transport cache key, so dialers differing only in TLS
+			// options no longer share one cached transport.
+			tlsConfig: m.tlsConfig,
 		}
 
 		clientConfig := &config{
@@ -93,7 +112,12 @@ func (m *Dialer) DialContext(ctx context.Context, network, addr string) (c netpr
 		}
 
 		assembler := newAssemblerClient(tripper, clientConfig)
-		session, err := assembler.NewSession(context.Background())
+		// The session outlives this dial: its lifetime is governed by
+		// Conn.Close, not by the dial context (which may be request-scoped
+		// and cancelled right after the handshake). WithoutCancel keeps the
+		// caller's context values (loggers, trace metadata) while decoupling
+		// cancellation, instead of discarding the context entirely.
+		session, err := assembler.NewSession(context.WithoutCancel(ctx))
 		if err != nil {
 			return nil, err
 		}

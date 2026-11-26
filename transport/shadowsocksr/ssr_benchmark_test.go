@@ -16,7 +16,6 @@ import (
 )
 
 func BenchmarkSSR(b *testing.B) {
-	b.N = 5000
 	for i := 0; i < b.N; i++ {
 		d := direct.SymmetricDirect
 		obfsDialer, err := obfs.NewDialer(d, &obfs.ObfsParam{
@@ -64,8 +63,8 @@ func BenchmarkSSR(b *testing.B) {
 			b.Fatal(err)
 		}
 		buf := new(bytes.Buffer)
-		buf.ReadFrom(resp.Body)
+		_, _ = buf.ReadFrom(resp.Body)
 		//b.Log(buf.String())
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 }

@@ -1,20 +1,23 @@
 package v2ray
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
-	"github.com/daeuniverse/outbound/protocol/direct"
 	"github.com/daeuniverse/outbound/protocol/http"
 	"github.com/daeuniverse/outbound/transport/grpc"
+	"github.com/daeuniverse/outbound/transport/httpheader"
 	"github.com/daeuniverse/outbound/transport/httpupgrade"
 	"github.com/daeuniverse/outbound/transport/meek"
 	"github.com/daeuniverse/outbound/transport/tls"
@@ -42,12 +45,63 @@ type V2Ray struct {
 	Flow          string `json:"flow,omitempty"`
 	Alpn          string `json:"alpn,omitempty"`
 	AllowInsecure bool   `json:"allowInsecure"`
-	Fingerprint   string `json:"fp,omitempty`
+	Fingerprint   string `json:"fp,omitempty"`
 	PublicKey     string `json:"pbk,omitempty"`
 	ShortId       string `json:"sid,omitempty"`
 	SpiderX       string `json:"spx,omitempty"`
 	V             string `json:"v"`
 	Protocol      string `json:"protocol"`
+}
+
+func (s *V2Ray) UnmarshalJSON(data []byte) error {
+	type plain V2Ray
+	decoded := struct {
+		*plain
+		Port json.RawMessage `json:"port"`
+		Aid  json.RawMessage `json:"aid"`
+		V    json.RawMessage `json:"v"`
+	}{
+		plain: (*plain)(s),
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	fields := []struct {
+		name string
+		raw  json.RawMessage
+		dst  *string
+	}{
+		{name: "port", raw: decoded.Port, dst: &s.Port},
+		{name: "aid", raw: decoded.Aid, dst: &s.Aid},
+		{name: "v", raw: decoded.V, dst: &s.V},
+	}
+	for _, field := range fields {
+		value, err := stringOrUint(field.raw)
+		if err != nil {
+			return fmt.Errorf("V2Ray.%s: %w", field.name, err)
+		}
+		*field.dst = value
+	}
+	return nil
+}
+
+func stringOrUint(raw json.RawMessage) (string, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "", nil
+	}
+	if raw[0] == '"' {
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return "", err
+		}
+		return value, nil
+	}
+	if _, err := strconv.ParseUint(string(raw), 10, 64); err != nil {
+		return "", fmt.Errorf("expects a string or unsigned integer: %w", err)
+	}
+	return string(raw), nil
 }
 
 func NewV2Ray(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string) (netproxy.Dialer, *dialer.Property, error) {
@@ -149,7 +203,14 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 			}
 
 		}
-		if s.Type != "none" && s.Type != "" {
+		switch strings.ToLower(s.Type) {
+		case "none", "":
+		case "http":
+			d, err = httpheader.NewDialer(d, s.Host, s.Path)
+			if err != nil {
+				return nil, nil, err
+			}
+		default:
 			return nil, nil, fmt.Errorf("%w: type: %v", dialer.UnexpectedFieldErr, s.Type)
 		}
 	case "grpc":
@@ -190,7 +251,7 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 				"transport":         []string{"1"},
 			}.Encode(),
 		}
-		d, err = http.NewHTTPProxy(&u, direct.SymmetricDirect)
+		d, err = http.NewHTTPProxy(&u, nextDialer)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -302,6 +363,10 @@ func ParseVlessURL(vless string) (data *V2Ray, err error) {
 	return data, nil
 }
 
+// vmessLegacyAddrRe parses the legacy vmess://BASE64 form's
+// "Security:UUID@Host:Port" body.
+var vmessLegacyAddrRe = regexp.MustCompile(`.*:(.+)@(.+):(\d+)`)
+
 func ParseVmessURL(vmess string) (data *V2Ray, err error) {
 	var info V2Ray
 	// perform base64 decoding and unmarshal to VmessInfo
@@ -316,7 +381,7 @@ func ParseVmessURL(vmess string) (data *V2Ray, err error) {
 		if err != nil {
 			return
 		}
-		re := regexp.MustCompile(`.*:(.+)@(.+):(\d+)`)
+		re := vmessLegacyAddrRe
 		s := strings.Split(vmess[8:], "?")[0]
 		s, err = common.Base64StdDecode(s)
 		if err != nil {

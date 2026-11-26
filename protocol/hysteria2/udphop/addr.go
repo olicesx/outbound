@@ -16,8 +16,9 @@ func (e InvalidPortError) Error() string {
 	return fmt.Sprintf("%s is not a valid port number or range", e.PortStr)
 }
 
-// UDPHopAddr contains an IP address and a list of ports.
+// UDPHopAddr contains a host or IP address and a list of ports.
 type UDPHopAddr struct {
+	Host    string
 	IP      net.IP
 	Ports   []uint16
 	PortStr string
@@ -28,34 +29,43 @@ func (a *UDPHopAddr) Network() string {
 }
 
 func (a *UDPHopAddr) String() string {
-	return net.JoinHostPort(a.IP.String(), a.PortStr)
+	return net.JoinHostPort(a.hostString(), a.PortStr)
 }
 
 // addrs returns a list of net.Addr's, one for each port.
 func (a *UDPHopAddr) addrs() ([]net.Addr, error) {
 	var addrs []net.Addr
+	host := a.hostString()
+	ip := net.ParseIP(host)
 	for _, port := range a.Ports {
-		addr := &net.UDPAddr{
-			IP:   a.IP,
-			Port: int(port),
+		var addr net.Addr
+		if ip != nil {
+			addr = &net.UDPAddr{
+				IP:   ip,
+				Port: int(port),
+			}
+		} else {
+			addr = &hostPortAddr{
+				Host: host,
+				Port: port,
+			}
 		}
 		addrs = append(addrs, addr)
 	}
 	return addrs, nil
 }
 
-func ResolveUDPHopAddr(addr string) (*UDPHopAddr, error) {
+func ParseUDPHopAddr(addr string) (*UDPHopAddr, error) {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
-	ip, err := net.ResolveIPAddr("ip", host)
-	if err != nil {
-		return nil, err
-	}
 	result := &UDPHopAddr{
-		IP:      ip.IP,
+		Host:    host,
 		PortStr: portStr,
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		result.IP = ip
 	}
 
 	pu := ParsePortUnion(portStr)
@@ -65,6 +75,47 @@ func ResolveUDPHopAddr(addr string) (*UDPHopAddr, error) {
 	result.Ports = pu.Ports()
 
 	return result, nil
+}
+
+func ResolveUDPHopAddr(addr string) (*UDPHopAddr, error) {
+	result, err := ParseUDPHopAddr(addr)
+	if err != nil {
+		return nil, err
+	}
+	if result.IP != nil {
+		result.Host = result.IP.String()
+		return result, nil
+	}
+	ip, err := net.ResolveIPAddr("ip", result.Host)
+	if err != nil {
+		return nil, err
+	}
+	result.IP = ip.IP
+	result.Host = result.IP.String()
+	return result, nil
+}
+
+func (a *UDPHopAddr) hostString() string {
+	if a.Host != "" {
+		return a.Host
+	}
+	if a.IP != nil {
+		return a.IP.String()
+	}
+	return ""
+}
+
+type hostPortAddr struct {
+	Host string
+	Port uint16
+}
+
+func (a *hostPortAddr) Network() string {
+	return "udp"
+}
+
+func (a *hostPortAddr) String() string {
+	return net.JoinHostPort(a.Host, strconv.Itoa(int(a.Port)))
 }
 
 // PortUnion is a collection of multiple port ranges.

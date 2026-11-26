@@ -42,8 +42,3 @@ type GunServiceClientX interface {
 	Tun(ctx context.Context, opts ...grpc.CallOption) (GunService_TunClient, error)
 	TunDatagram(ctx context.Context, opts ...grpc.CallOption) (GunService_TunDatagramClient, error)
 }
-
-func RegisterGunServiceServerX(s *grpc.Server, srv GunServiceServer, name string) {
-	desc := ServerDesc(name)
-	s.RegisterService(&desc, srv)
-}

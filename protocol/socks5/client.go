@@ -34,8 +34,8 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (netprox
 		if err != nil {
 			return nil, fmt.Errorf("[socks5]: dial to %s error: %w", s.addr, err)
 		}
-		if _, err := s.connect(c, addr, socks.CmdConnect); err != nil {
-			c.Close()
+		if _, err := s.connect(ctx, c, addr, socks.CmdConnect); err != nil {
+			_ = c.Close()
 			return nil, err
 		}
 		return c, nil
@@ -52,8 +52,8 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (netprox
 
 		// Get the proxy addr we should dial.
 		var uAddr socks.Addr
-		if uAddr, err = s.connect(c, addr, socks.CmdUDPAssociate); err != nil {
-			c.Close()
+		if uAddr, err = s.connect(ctx, c, addr, socks.CmdUDPAssociate); err != nil {
+			_ = c.Close()
 			return nil, err
 		}
 
@@ -71,10 +71,13 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (netprox
 
 		conn, err := s.dialer.DialContext(ctx, network, uAddress)
 		if err != nil {
+			_ = c.Close()
 			return nil, fmt.Errorf("[socks5] dialudp to %s error: %w", uAddress, err)
 		}
 		pc, ok := conn.(netproxy.PacketConn)
 		if !ok {
+			_ = conn.Close()
+			_ = c.Close()
 			return nil, fmt.Errorf("[socks5] forwarder is not transport.PacketConn")
 		}
 
@@ -87,7 +90,17 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (netprox
 // connect takes an existing connection to a socks5 proxy server,
 // and commands the server to extend that connection to target,
 // which must be a canonical address with a host and port.
-func (s *Socks5) connect(conn netproxy.Conn, target string, cmd byte) (addr socks.Addr, err error) {
+func (s *Socks5) connect(ctx context.Context, conn netproxy.Conn, target string, cmd byte) (addr socks.Addr, err error) {
+	// The handshake below is 3-4 blocking round trips; apply the dial
+	// context's deadline to the conn so a stalling server fails the dial
+	// instead of hanging it past ctx cancellation (http got the same
+	// treatment; without it a socks5 greeting stall wedged DialContext).
+	restoreDeadline, err := netproxy.ApplyConnDeadlineFromContext(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	defer restoreDeadline()
+
 	// the size here is just an estimate
 	buf := pool.Get(socks.MaxAddrLen)
 	defer pool.Put(buf)
@@ -111,6 +124,21 @@ func (s *Socks5) connect(conn netproxy.Conn, target string, cmd byte) (addr sock
 	}
 	if buf[1] == 0xff {
 		return addr, errors.New("proxy: SOCKS5 proxy at " + s.addr + " requires authentication")
+	}
+	// The server must choose a method we actually offered. Accepting anything
+	// else (e.g. GSSAPI) would silently proceed without the auth the server
+	// expects.
+	offeredPassword := len(s.user) > 0 && len(s.user) < 256 && len(s.password) < 256
+	methodUnoffered := false
+	switch buf[1] {
+	case socks.AuthNone:
+	case socks.AuthPassword:
+		methodUnoffered = !offeredPassword
+	default:
+		methodUnoffered = true
+	}
+	if methodUnoffered {
+		return addr, errors.New("proxy: SOCKS5 proxy at " + s.addr + " selected an unoffered auth method " + strconv.Itoa(int(buf[1])))
 	}
 
 	if buf[1] == socks.AuthPassword {
@@ -151,15 +179,14 @@ func (s *Socks5) connect(conn netproxy.Conn, target string, cmd byte) (addr sock
 		return addr, errors.New("proxy: failed to read connect reply from SOCKS5 proxy at " + s.addr + ": " + err.Error())
 	}
 
-	failure := "unknown error"
-	if int(buf[1]) < len(socks.Errors) {
-		failure = socks.Errors[buf[1]].Error()
-		if strings.Contains(failure, "command not supported") {
-			failure += " by socks5 server: " + socks.Command[cmd]
+	if buf[1] != socks.Success {
+		failure := "unknown error"
+		if int(buf[1]) < len(socks.Errors) {
+			failure = socks.Errors[buf[1]].Error()
+			if strings.Contains(failure, "command not supported") {
+				failure += " by socks5 server: " + socks.Command[cmd]
+			}
 		}
-	}
-
-	if len(failure) > 0 {
 		return addr, errors.New("proxy: SOCKS5 proxy at " + s.addr + " failed to connect: " + failure)
 	}
 

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/daeuniverse/outbound/common/iout"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
 )
@@ -24,33 +25,81 @@ type TLSObfs struct {
 	remain        int
 	firstRequest  bool
 	firstResponse bool
-	rMu           sync.Mutex
-	wMu           sync.Mutex
+	// writeFrame is a per-connection scratch holding the 5-byte record
+	// header plus one chunk payload; allocating it per chunk (a fresh
+	// bytes.Buffer growing to ~16.4KB) put a ~1:1 allocation rate on bulk
+	// relay paths, which measurably doubles engine CPU per GB.
+	writeFrame []byte
+	// readDiscard/readSizeBuf are per-connection scratch for the record
+	// framing on the receive side; the discard length varies (3 regular,
+	// 105 first hello) but never exceeds 105.
+	readDiscard [105]byte
+	readSizeBuf [2]byte
+	rMu         sync.Mutex
+	wMu         sync.Mutex
 }
 
 func (to *TLSObfs) read(b []byte, discardN int) (int, error) {
-	buf := make([]byte, discardN)
-	_, err := io.ReadFull(to.Conn, buf)
-	if err != nil {
+	// discardN is 3 for regular records but 105 for the first server
+	// hello, so the scratch is sized for the 105 maximum.
+	discard := to.readDiscard[:discardN]
+	if _, err := io.ReadFull(to.Conn, discard); err != nil {
 		return 0, err
 	}
-	sizeBuf := make([]byte, 2)
-	_, err = io.ReadFull(to.Conn, sizeBuf)
-	if err != nil {
-		return 0, nil
+	// A truncated size header must surface as an error: returning
+	// (0, nil) here made relay loops spin forever on success-with-no-data.
+	sizeBuf := to.readSizeBuf[:]
+	if _, err := io.ReadFull(to.Conn, sizeBuf); err != nil {
+		return 0, err
 	}
 
 	length := int(binary.BigEndian.Uint16(sizeBuf))
+	if length == 0 {
+		// A zero-length record makes no progress; returning (0, nil)
+		// here would spin relay loops until the peer sends real data.
+		// Skip it and read the next record instead: the hello discard
+		// only applies to the very first record.
+		return to.readNext(b)
+	}
 	if length > len(b) {
+		// A single raw Read can return fewer bytes than the record holds, and
+		// the leftover must be recorded even when that Read fails partway:
+		// returning before setting remain desynchronizes the frame stream, so
+		// every later Read would start mid-record.
 		n, err := to.Conn.Read(b)
+		to.remain = length - n
 		if err != nil {
 			return n, err
 		}
-		to.remain = length - n
 		return n, nil
 	}
 
 	return io.ReadFull(to.Conn, b[:length])
+}
+
+// readNext reads a regular record after the first hello was consumed.
+func (to *TLSObfs) readNext(b []byte) (int, error) {
+	var hdr [5]byte // type + ver (discard) + uint16 size
+	for {
+		if _, err := io.ReadFull(to.Conn, hdr[:]); err != nil {
+			return 0, err
+		}
+		length := int(binary.BigEndian.Uint16(hdr[3:]))
+		if length == 0 {
+			// Zero-length records make no progress; skipping them keeps
+			// relay loops from spinning on a (0, nil) return.
+			continue
+		}
+		if length > len(b) {
+			n, err := to.Conn.Read(b)
+			to.remain = length - n
+			if err != nil {
+				return n, err
+			}
+			return n, nil
+		}
+		return io.ReadFull(to.Conn, b[:length])
+	}
 }
 
 func (to *TLSObfs) Read(b []byte) (int, error) {
@@ -81,6 +130,12 @@ func (to *TLSObfs) Read(b []byte) (int, error) {
 func (to *TLSObfs) Write(b []byte) (int, error) {
 	to.wMu.Lock()
 	defer to.wMu.Unlock()
+	// The return value is the count of bytes the caller may consider
+	// delivered, so it must count whole chunks that already went out. The
+	// previous version returned n from the *failing* chunk (often 0), which
+	// discards the accounting for every chunk already written - a retry then
+	// re-sends up to 16 KB that the peer has already accepted.
+	written := 0
 	length := len(b)
 	for i := 0; i < length; i += chunkSize {
 		end := i + chunkSize
@@ -89,30 +144,61 @@ func (to *TLSObfs) Write(b []byte) (int, error) {
 		}
 
 		n, err := to.write(b[i:end])
+		written += n
 		if err != nil {
-			return n, err
+			return written, err
+		}
+		if n != end-i {
+			// A chunk that reports success must have consumed all of its
+			// bytes; anything else is a short write and the remaining bytes
+			// are not safe to account for.
+			return written, io.ErrShortWrite
 		}
 	}
-	return length, nil
+	return written, nil
 }
 
 func (to *TLSObfs) write(b []byte) (int, error) {
 	if to.firstRequest {
 		helloMsg := makeClientHelloMsg(b, to.server)
-		_, err := to.Conn.Write(helloMsg)
+		if _, err := iout.WriteFull(to.Conn, helloMsg); err != nil {
+			return 0, err
+		}
 		to.firstRequest = false
-		return len(b), err
+		return len(b), nil
 	}
 
-	buf := &bytes.Buffer{}
-	buf.Write([]byte{0x17, 0x03, 0x03})
-	binary.Write(buf, binary.BigEndian, uint16(len(b)))
-	buf.Write(b)
-	_, err := to.Conn.Write(buf.Bytes())
-	return len(b), err
+	// Frame into the reusable scratch: 5-byte header + payload in one
+	// WriteFull, replacing the per-chunk bytes.Buffer (which allocated a
+	// fresh ~16.4KB buffer per 16KB chunk plus several small escapes).
+	if cap(to.writeFrame) < 5+len(b) {
+		to.writeFrame = make([]byte, 5+chunkSize)
+	}
+	frame := to.writeFrame[:5+len(b)]
+	frame[0], frame[1], frame[2] = 0x17, 0x03, 0x03
+	frame[3] = byte(uint16(len(b)) >> 8)
+	frame[4] = byte(len(b))
+	copy(frame[5:], b)
+	if _, err := iout.WriteFull(to.Conn, frame); err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
-// NewTLSObfs return a SimpleObfs
+func (to *TLSObfs) CloseWrite() error {
+	return netproxy.ForwardCloseWrite(to.Conn)
+}
+
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped conn. Embedding netproxy.Conn
+// promotes SetWriteDeadline but not this optional method, so without the
+// forward a session-closing inner conn (TUIC, hysteria2) behind this wrapper
+// would be invisible to deadline-arming callers and they would arm a
+// destructive timer believing it was an ordinary deadline.
+func (to *TLSObfs) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(to.Conn)
+}
+
 func NewTLSObfs(conn netproxy.Conn, server string) netproxy.Conn {
 	return &TLSObfs{
 		Conn:          conn,
@@ -125,8 +211,8 @@ func NewTLSObfs(conn netproxy.Conn, server string) netproxy.Conn {
 func makeClientHelloMsg(data []byte, server string) []byte {
 	random := make([]byte, 28)
 	sessionID := make([]byte, 32)
-	fastrand.Read(random)
-	fastrand.Read(sessionID)
+	_, _ = fastrand.Read(random)
+	_, _ = fastrand.Read(sessionID)
 
 	buf := &bytes.Buffer{}
 
@@ -140,11 +226,11 @@ func makeClientHelloMsg(data []byte, server string) []byte {
 	// clientHello, length, TLS 1.2 version
 	buf.WriteByte(1)
 	buf.WriteByte(0)
-	binary.Write(buf, binary.BigEndian, uint16(208+len(data)+len(server)))
+	_ = binary.Write(buf, binary.BigEndian, uint16(208+len(data)+len(server)))
 	buf.Write([]byte{0x03, 0x03})
 
 	// random with timestamp, sid len, sid
-	binary.Write(buf, binary.BigEndian, uint32(time.Now().Unix()))
+	_ = binary.Write(buf, binary.BigEndian, uint32(time.Now().Unix()))
 	buf.Write(random)
 	buf.WriteByte(32)
 	buf.Write(sessionID)
@@ -162,19 +248,19 @@ func makeClientHelloMsg(data []byte, server string) []byte {
 	buf.Write([]byte{0x01, 0x00})
 
 	// extension length
-	binary.Write(buf, binary.BigEndian, uint16(79+len(data)+len(server)))
+	_ = binary.Write(buf, binary.BigEndian, uint16(79+len(data)+len(server)))
 
 	// session ticket
 	buf.Write([]byte{0x00, 0x23})
-	binary.Write(buf, binary.BigEndian, uint16(len(data)))
+	_ = binary.Write(buf, binary.BigEndian, uint16(len(data)))
 	buf.Write(data)
 
 	// server name
 	buf.Write([]byte{0x00, 0x00})
-	binary.Write(buf, binary.BigEndian, uint16(len(server)+5))
-	binary.Write(buf, binary.BigEndian, uint16(len(server)+3))
+	_ = binary.Write(buf, binary.BigEndian, uint16(len(server)+5))
+	_ = binary.Write(buf, binary.BigEndian, uint16(len(server)+3))
 	buf.WriteByte(0)
-	binary.Write(buf, binary.BigEndian, uint16(len(server)))
+	_ = binary.Write(buf, binary.BigEndian, uint16(len(server)))
 	buf.Write([]byte(server))
 
 	// ec_point

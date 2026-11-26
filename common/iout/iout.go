@@ -11,12 +11,46 @@ import (
 	"github.com/daeuniverse/outbound/pool"
 )
 
-func MultiWrite(dst io.Writer, bs ...[]byte) (int64, error) {
-	var n int
-	for _, b := range bs {
-		n += len(b)
+const smallWriteThreshold = 4096
+
+// WriteFull writes all of b to w. A short write with a nil error is
+// retried; a zero-length write with a nil error is treated as
+// io.ErrShortWrite so the caller cannot observe a successful partial
+// frame.
+func WriteFull(w io.Writer, b []byte) (int, error) {
+	n := 0
+	for n < len(b) {
+		wn, err := w.Write(b[n:])
+		n += wn
+		if err != nil {
+			return n, err
+		}
+		if wn == 0 {
+			return n, io.ErrShortWrite
+		}
 	}
-	buf := pool.Get(n)[:0]
+	return n, nil
+}
+
+func MultiWrite(dst io.Writer, bs ...[]byte) (int64, error) {
+	var total int
+	for _, b := range bs {
+		total += len(b)
+	}
+
+	if total <= smallWriteThreshold {
+		var written int64
+		for _, b := range bs {
+			n, err := dst.Write(b)
+			written += int64(n)
+			if err != nil {
+				return written, err
+			}
+		}
+		return written, nil
+	}
+
+	buf := pool.Get(total)[:0]
 	defer buf.Put()
 	for _, b := range bs {
 		buf = append(buf, b...)

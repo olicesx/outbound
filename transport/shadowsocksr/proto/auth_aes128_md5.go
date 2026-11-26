@@ -27,16 +27,23 @@ func NewAuthAES128MD5() IProtocol {
 		hashDigest: common.MD5Sum,
 		packID:     1,
 		recvInfo: recvInfo{
-			recvID: 1,
-			buffer: new(swBytes.Buffer),
+			recvID:       1,
+			buffer:       new(swBytes.Buffer),
+			encodeBuffer: new(swBytes.Buffer),
 		},
 	}
 	return a
 }
 
+// recvInfo holds the per-direction scratch state shared by the auth_aes128_*
+// and auth_chain_* protocol implementations. Encode runs under the conn's
+// writeMu while Decode runs under readMu, so each direction must keep its own
+// buffer; a single buffer would be a data race on full-duplex relays.
 type recvInfo struct {
 	recvID uint32
 	buffer *swBytes.Buffer
+	// encodeBuffer is the write-direction counterpart of buffer.
+	encodeBuffer *swBytes.Buffer
 }
 
 type authAES128 struct {
@@ -97,7 +104,7 @@ func (a *authAES128) packData(data []byte) (outData []byte) {
 	h := a.hmac(key, outData[0:2])
 	copy(outData[2:4], h[:2])
 	// 4~rand length+4, rand number
-	rand.Read(outData[4 : 4+randLength])
+	_, _ = rand.Read(outData[4 : 4+randLength])
 	// 4, rand length
 	if randLength < 128 {
 		outData[4] = byte(randLength & 0xFF)
@@ -127,7 +134,7 @@ func (a *authAES128) initUser() {
 	}
 
 	if a.userKey == nil {
-		rand.Read(a.uid[:])
+		_, _ = rand.Read(a.uid[:])
 		a.userKey = make([]byte, len(a.Key))
 		copy(a.userKey, a.Key)
 	}
@@ -150,16 +157,16 @@ func (a *authAES128) packAuthData(data []byte) (outData []byte) {
 	copy(key, a.IV)
 	copy(key[len(a.IV):], a.Key)
 
-	rand.Read(outData[dataOffset-randLength:])
+	_, _ = rand.Read(outData[dataOffset-randLength:])
 	a.data.connectionID++
 	if a.data.connectionID > 0xFF000000 {
 		a.data.clientID = nil
 	}
 	if len(a.data.clientID) == 0 {
 		a.data.clientID = make([]byte, 8)
-		rand.Read(a.data.clientID)
+		_, _ = rand.Read(a.data.clientID)
 		b := make([]byte, 4)
-		rand.Read(b)
+		_, _ = rand.Read(b)
 		a.data.connectionID = binary.LittleEndian.Uint32(b) & 0xFFFFFF
 	}
 	copy(encrypt[4:], a.data.clientID)
@@ -186,7 +193,7 @@ func (a *authAES128) packAuthData(data []byte) (outData []byte) {
 	h := a.hmac(key, encrypt[0:20])
 	copy(encrypt[20:], h[:4])
 
-	rand.Read(outData[0:1])
+	_, _ = rand.Read(outData[0:1])
 	h = a.hmac(key, outData[0:1])
 	copy(outData[1:], h[0:7-1])
 
@@ -200,8 +207,8 @@ func (a *authAES128) packAuthData(data []byte) (outData []byte) {
 }
 
 func (a *authAES128) EncodePkt(buf *swBytes.Buffer) (err error) {
-	buf.Write(a.uid[:])
-	buf.Write(a.hmac(a.userKey, buf.Bytes())[:4])
+	_, _ = buf.Write(a.uid[:])
+	_, _ = buf.Write(a.hmac(a.userKey, buf.Bytes())[:4])
 	return nil
 }
 
@@ -216,7 +223,7 @@ func (a *authAES128) DecodePkt(in []byte) (out pool.Bytes, err error) {
 }
 
 func (a *authAES128) Encode(plainData []byte) (outData []byte, err error) {
-	a.buffer.Reset()
+	a.encodeBuffer.Reset()
 	dataLength := len(plainData)
 	offset := 0
 	if dataLength > 0 && !a.hasSentHeader {
@@ -225,20 +232,20 @@ func (a *authAES128) Encode(plainData []byte) (outData []byte, err error) {
 			authLength = 1200
 		}
 		a.hasSentHeader = true
-		a.buffer.Write(a.packAuthData(plainData[:authLength]))
+		_, _ = a.encodeBuffer.Write(a.packAuthData(plainData[:authLength]))
 		dataLength -= authLength
 		offset += authLength
 	}
 	const blockSize = 4096
 	for dataLength > blockSize {
-		a.buffer.Write(a.packData(plainData[offset : offset+blockSize]))
+		_, _ = a.encodeBuffer.Write(a.packData(plainData[offset : offset+blockSize]))
 		dataLength -= blockSize
 		offset += blockSize
 	}
 	if dataLength > 0 {
-		a.buffer.Write(a.packData(plainData[offset:]))
+		_, _ = a.encodeBuffer.Write(a.packData(plainData[offset:]))
 	}
-	return a.buffer.Bytes(), nil
+	return a.encodeBuffer.Bytes(), nil
 }
 
 func (a *authAES128) Decode(plainData []byte) ([]byte, int, error) {
@@ -275,7 +282,7 @@ func (a *authAES128) Decode(plainData []byte) ([]byte, int, error) {
 		if pos > length-4 {
 			return nil, 0, ErrAuthAES128PosOutOfRange
 		}
-		a.buffer.Write(plainData[pos : length-4])
+		_, _ = a.buffer.Write(plainData[pos : length-4])
 		plainData = plainData[length:]
 		plainLength -= length
 		readlenth += length

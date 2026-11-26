@@ -1,7 +1,7 @@
 package bbr
 
 import (
-	"github.com/daeuniverse/quic-go/congestion"
+	"github.com/olicesx/quic-go/congestion"
 )
 
 // packetNumberIndexedQueue is a queue of mostly continuous numbered entries
@@ -25,24 +25,60 @@ import (
 // just two entries will cause it to consume all of the memory available.
 // Because of that, it is not a general-purpose container and should not be used
 // as one.
+//
+// The hazard above is contained by maxSlots: a packet-number span wider than
+// the budget is treated as a discontinuity and the queue restarts at the new
+// packet number instead of materialising the hole. The budget is the caller's
+// own bound on how many records can still be needed; see
+// newPacketNumberIndexedQueue.
 
 type entryWrapper[T any] struct {
 	present bool
 	entry   T
 }
 
+// shrinkDenominator is the occupancy divisor at which the backing array is
+// halved. Together with doubling on growth it leaves a 4x hysteresis band, so
+// the array can neither ratchet to the all-time high-water mark nor thrash
+// between grow and shrink; the amortised cost stays O(1) per operation.
+const shrinkDenominator = 4
+
 type packetNumberIndexedQueue[T any] struct {
 	entries                RingBuffer[entryWrapper[T]]
 	numberOfPresentEntries int
 	firstPacket            congestion.PacketNumber
+
+	// maxSlots is the hard slot budget. It is a backstop for a caller that
+	// stops trimming, not a policy: with the trim in place the live set never
+	// approaches it.
+	maxSlots int
+	// initialSlots is the capacity the queue returns to when it drains. A
+	// drained queue needs no slots at all, and an idle connection is the common
+	// case for a relay.
+	initialSlots int
+
+	// truncatedSlots counts records discarded because the budget was reached.
+	// Non-zero means the caller is not trimming and the estimator is running on
+	// a truncated send history; it is exported for telemetry.
+	truncatedSlots uint64
 }
 
-func newPacketNumberIndexedQueue[T any](size int) *packetNumberIndexedQueue[T] {
+// newPacketNumberIndexedQueue builds a queue that starts at initialSize slots
+// and refuses to hold more than maxSize.
+func newPacketNumberIndexedQueue[T any](initialSize, maxSize int) *packetNumberIndexedQueue[T] {
+	if initialSize < 1 {
+		initialSize = 1
+	}
+	if maxSize < initialSize {
+		maxSize = initialSize
+	}
 	q := &packetNumberIndexedQueue[T]{
-		firstPacket: invalidPacketNumber,
+		firstPacket:  invalidPacketNumber,
+		maxSlots:     maxSize,
+		initialSlots: initialSize,
 	}
 
-	q.entries.Init(size)
+	q.entries.Init(initialSize)
 
 	return q
 }
@@ -73,10 +109,37 @@ func (p *packetNumberIndexedQueue[T]) Emplace(packetNumber congestion.PacketNumb
 
 	// Handle potentially missing elements.
 	offset := int(packetNumber - p.FirstPacket())
-	if gap := offset - p.entries.Len(); gap > 0 {
-		for i := 0; i < gap; i++ {
-			p.entries.PushBack(entryWrapper[T]{})
-		}
+	gap := offset - p.entries.Len()
+	if gap < 0 {
+		gap = 0
+	}
+
+	if gap >= p.maxSlots {
+		// A span wider than the whole budget is a discontinuity, not a hole: the
+		// packet numbers it covers were either never sent or can no longer be
+		// acked or lost, and materialising them is the "two entries consume all
+		// the memory available" hazard this type documents. Restart at this
+		// packet number instead of allocating the hole.
+		p.restart(packetNumber)
+		p.entries.PushBack(entryWrapper[T]{
+			present: true,
+			entry:   *entry,
+		})
+		p.numberOfPresentEntries = 1
+		return true
+	}
+
+	if excess := p.entries.Len() + gap + 1 - p.maxSlots; excess > 0 {
+		// The budget is reached, which means the caller has stopped trimming.
+		// Keep the newest records — those are the ones an ack can still arrive
+		// for — by dropping the oldest, exactly as a working trim would have.
+		// Dropping from the front leaves the hole width unchanged, so gap stays
+		// valid below.
+		p.dropFront(excess)
+	}
+
+	for i := 0; i < gap; i++ {
+		p.entries.PushBack(entryWrapper[T]{})
 	}
 
 	p.entries.PushBack(entryWrapper[T]{
@@ -85,6 +148,63 @@ func (p *packetNumberIndexedQueue[T]) Emplace(packetNumber congestion.PacketNumb
 	})
 	p.numberOfPresentEntries++
 	return true
+}
+
+// dropFront removes the n oldest slots, present or not, advancing firstPacket.
+func (p *packetNumberIndexedQueue[T]) dropFront(n int) {
+	for i := 0; i < n && !p.entries.Empty(); i++ {
+		if p.entries.Front().present {
+			p.numberOfPresentEntries--
+		}
+		p.entries.PopFront()
+		p.firstPacket++
+		p.truncatedSlots++
+	}
+}
+
+// DropConsumedFront pops the front of the queue while it holds nothing that is
+// still needed: absent slots hold no record at all, and a present slot is
+// dropped only when isConsumed reports it. It stops at the first record that is
+// still live, so a record for an outstanding packet always survives and its
+// later ack or loss still finds it.
+//
+// This is not the budget backstop: what it drops has already been consumed, so
+// it does not count as truncation. It is what lets the queue's size follow the
+// outstanding window instead of its high-water mark.
+func (p *packetNumberIndexedQueue[T]) DropConsumedFront(isConsumed func(*T) bool) (n int) {
+	for !p.entries.Empty() {
+		ew := p.entries.Front()
+		if ew == nil {
+			break
+		}
+		if ew.present {
+			if !isConsumed(&ew.entry) {
+				break
+			}
+			p.numberOfPresentEntries--
+		}
+		p.entries.PopFront()
+		p.firstPacket++
+		n++
+	}
+	if p.entries.Empty() {
+		p.firstPacket = invalidPacketNumber
+	}
+	p.reclaim()
+	return n
+}
+
+// restart drops every record and re-anchors the queue at packetNumber. The
+// discarded records are counted so a missing trim shows up as telemetry instead
+// of as an out-of-memory kill. The caller pushes the new entry and owns
+// numberOfPresentEntries afterwards.
+func (p *packetNumberIndexedQueue[T]) restart(packetNumber congestion.PacketNumber) {
+	p.truncatedSlots += uint64(p.entries.Len())
+	// Init, not Clear: a queue that reached the budget should hand the memory
+	// back, and it will regrow only as far as the live window requires.
+	p.entries.Init(p.initialSlots)
+	p.numberOfPresentEntries = 0
+	p.firstPacket = packetNumber
 }
 
 // GetEntry Retrieve the entry associated with the packet number.  Returns the pointer
@@ -132,8 +252,6 @@ func (p *packetNumberIndexedQueue[T]) RemoveUpTo(packetNumber congestion.PacketN
 		p.firstPacket++
 	}
 	p.clearup()
-
-	return
 }
 
 // IsEmpty return if queue is empty.
@@ -150,6 +268,24 @@ func (p *packetNumberIndexedQueue[T]) NumberOfPresentEntries() int {
 // proportional to the memory usage of the queue.
 func (p *packetNumberIndexedQueue[T]) EntrySlotsUsed() int {
 	return p.entries.Len()
+}
+
+// EntrySlotsCapacity returns the slot capacity of the underlying deque. This,
+// not EntrySlotsUsed, is the queue's memory footprint.
+func (p *packetNumberIndexedQueue[T]) EntrySlotsCapacity() int {
+	return p.entries.Cap()
+}
+
+// Budget returns the hard slot budget, the cap the queue enforces on itself
+// when a caller stops reclaiming.
+func (p *packetNumberIndexedQueue[T]) Budget() int {
+	return p.maxSlots
+}
+
+// TruncatedSlots returns how many records the slot budget has discarded over
+// the queue's lifetime.
+func (p *packetNumberIndexedQueue[T]) TruncatedSlots() uint64 {
+	return p.truncatedSlots
 }
 
 // LastPacket returns packet number of the first entry in the queue.
@@ -176,6 +312,32 @@ func (p *packetNumberIndexedQueue[T]) clearup() {
 	if p.entries.Empty() {
 		p.firstPacket = invalidPacketNumber
 	}
+	p.reclaim()
+}
+
+// reclaim returns capacity that the live set no longer needs. It runs at the
+// end of every trim, so the common case must be a couple of comparisons: it
+// reallocates only when occupancy falls below a quarter of the capacity, and a
+// drained queue collapses all the way back to initialSlots. Without it a single
+// burst pins the backing array at its peak for the connection's lifetime, which
+// is how a transient 68 MiB ring became permanent.
+func (p *packetNumberIndexedQueue[T]) reclaim() {
+	live := p.entries.Len()
+	capacity := p.entries.Cap()
+	if capacity <= p.initialSlots {
+		return
+	}
+	target := p.initialSlots
+	if live > 0 {
+		target = capacity
+		for target > p.initialSlots && live*shrinkDenominator <= target {
+			target /= 2
+		}
+		if target >= capacity {
+			return
+		}
+	}
+	p.entries.ShrinkTo(target)
 }
 
 func (p *packetNumberIndexedQueue[T]) getEntryWraper(packetNumber congestion.PacketNumber) *entryWrapper[T] {

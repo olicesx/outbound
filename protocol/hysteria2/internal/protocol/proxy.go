@@ -1,14 +1,13 @@
 package protocol
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
 
 	"github.com/daeuniverse/outbound/protocol/hysteria2/errors"
 
-	"github.com/daeuniverse/quic-go/quicvarint"
+	"github.com/olicesx/quic-go/quicvarint"
 )
 
 const (
@@ -66,8 +65,7 @@ func ReadTCPRequest(r io.Reader) (string, error) {
 }
 
 func WriteTCPRequest(w io.Writer, addr string) error {
-	padding := tcpRequestPadding.String()
-	paddingLen := len(padding)
+	paddingLen := tcpRequestPadding.randomLen()
 	addrLen := len(addr)
 	sz := int(quicvarint.Len(FrameTypeTCPRequest)) +
 		int(quicvarint.Len(uint64(addrLen))) + addrLen +
@@ -77,7 +75,7 @@ func WriteTCPRequest(w io.Writer, addr string) error {
 	i += varintPut(buf[i:], uint64(addrLen))
 	i += copy(buf[i:], addr)
 	i += varintPut(buf[i:], uint64(paddingLen))
-	copy(buf[i:], padding)
+	writeRandomBytes(buf[i : i+paddingLen])
 	_, err := w.Write(buf)
 	return err
 }
@@ -128,8 +126,7 @@ func ReadTCPResponse(r io.Reader) (bool, string, error) {
 }
 
 func WriteTCPResponse(w io.Writer, ok bool, msg string) error {
-	padding := tcpResponsePadding.String()
-	paddingLen := len(padding)
+	paddingLen := tcpResponsePadding.randomLen()
 	msgLen := len(msg)
 	sz := 1 + int(quicvarint.Len(uint64(msgLen))) + msgLen +
 		int(quicvarint.Len(uint64(paddingLen))) + paddingLen
@@ -142,7 +139,7 @@ func WriteTCPResponse(w io.Writer, ok bool, msg string) error {
 	i := varintPut(buf[1:], uint64(msgLen))
 	i += copy(buf[1+i:], msg)
 	i += varintPut(buf[1+i:], uint64(paddingLen))
-	copy(buf[1+i:], padding)
+	writeRandomBytes(buf[1+i : 1+i+paddingLen])
 	_, err := w.Write(buf)
 	return err
 }
@@ -161,8 +158,17 @@ type UDPMessage struct {
 	PacketID  uint16 // 2
 	FragID    uint8  // 1
 	FragCount uint8  // 1
-	Addr      string // varint + bytes
-	Data      []byte
+	// Addr is the wire address bytes ("host:port"). It stays a byte slice
+	// so parsing subslices the datagram buffer instead of materializing a
+	// string per inbound message; consumers compare against the cached
+	// default target and only stringify non-default addresses.
+	Addr []byte // varint + bytes
+	Data []byte
+	// Release returns the backing datagram buffer (when the message was
+	// obtained via a pooled transport such as quic-go's ReceiveDatagram)
+	// to its pool. Must be called exactly once when Data is no longer
+	// referenced; nil when the message owns no pooled storage.
+	Release func()
 }
 
 func (m *UDPMessage) HeaderSize() int {
@@ -190,34 +196,32 @@ func (m *UDPMessage) Serialize(buf []byte) int {
 }
 
 func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
-	m := &UDPMessage{}
-	buf := bytes.NewBuffer(msg)
-	if err := binary.Read(buf, binary.BigEndian, &m.SessionID); err != nil {
-		return nil, err
+	// Fixed header: SessionID(4) + PacketID(2) + FragID(1) + FragCount(1) = 8 bytes.
+	// Parse directly from the slice instead of routing four fields through
+	// binary.Read (reflection) + bytes.Buffer wrapping. This mirrors Serialize.
+	if len(msg) < 8 {
+		return nil, errors.ProtocolError{Message: "invalid message: header too short"}
 	}
-	if err := binary.Read(buf, binary.BigEndian, &m.PacketID); err != nil {
-		return nil, err
+	m := &UDPMessage{
+		SessionID: binary.BigEndian.Uint32(msg[0:4]),
+		PacketID:  binary.BigEndian.Uint16(msg[4:6]),
+		FragID:    msg[6],
+		FragCount: msg[7],
 	}
-	if err := binary.Read(buf, binary.BigEndian, &m.FragID); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(buf, binary.BigEndian, &m.FragCount); err != nil {
-		return nil, err
-	}
-	lAddr, err := quicvarint.Read(buf)
+	lAddr, n, err := quicvarint.Parse(msg[8:])
 	if err != nil {
 		return nil, err
 	}
 	if lAddr == 0 || lAddr > MaxMessageLength {
 		return nil, errors.ProtocolError{Message: "invalid address length"}
 	}
-	bs := buf.Bytes()
-	if len(bs) <= int(lAddr) {
-		// We use <= instead of < here as we expect at least one byte of data after the address
+	body := msg[8+n:]
+	if int64(lAddr) > int64(len(body))-1 {
+		// We need at least one byte of data after the address.
 		return nil, errors.ProtocolError{Message: "invalid message length"}
 	}
-	m.Addr = string(bs[:lAddr])
-	m.Data = bs[lAddr:]
+	m.Addr = body[:lAddr]
+	m.Data = body[lAddr:]
 	return m, nil
 }
 

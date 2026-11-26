@@ -2,11 +2,13 @@ package hysteria2
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strings"
 	"time"
 
+	"github.com/daeuniverse/outbound/dialer/stickyip"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/client"
@@ -26,6 +28,17 @@ type Dialer struct {
 type Feature1 struct {
 	BandwidthConfig client.BandwidthConfig
 	UDPHopInterval  time.Duration
+	ObfsPassword    string
+}
+
+func toClientTLSConfig(config *tls.Config) client.TLSConfig {
+	return client.TLSConfig{
+		ServerName:                     config.ServerName,
+		InsecureSkipVerify:             config.InsecureSkipVerify,
+		VerifyPeerCertificate:          config.VerifyPeerCertificate,
+		RootCAs:                        config.RootCAs,
+		EncryptedClientHelloConfigList: config.EncryptedClientHelloConfigList,
+	}
 }
 
 func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
@@ -36,14 +49,9 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	}
 
 	config := &client.Config{
-		TLSConfig: client.TLSConfig{
-			ServerName:            header.TlsConfig.ServerName,
-			InsecureSkipVerify:    header.TlsConfig.InsecureSkipVerify,
-			VerifyPeerCertificate: header.TlsConfig.VerifyPeerCertificate,
-			RootCAs:               header.TlsConfig.RootCAs,
-		},
-		Auth:     header.User,
-		FastOpen: true,
+		TLSConfig: toClientTLSConfig(header.TlsConfig),
+		Auth:      header.User,
+		FastOpen:  true,
 	}
 	if header.SNI == "" {
 		config.TLSConfig.ServerName = host
@@ -52,15 +60,34 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		config.Auth = header.User + ":" + header.Password
 	}
 	if feature := header.Feature1; feature != nil {
-		config.BandwidthConfig = feature.(*Feature1).BandwidthConfig
-		config.UDPHopInterval = feature.(*Feature1).UDPHopInterval
+		// protocol.Header is an exported API, so an external caller can hand
+		// this dialer any value. A bare type assertion would panic inside
+		// NewDialer; a configuration error must come back as an error.
+		typed, ok := feature.(*Feature1)
+		if !ok {
+			return nil, fmt.Errorf("hysteria2: unexpected Feature1 type %T, want *Feature1", feature)
+		}
+		config.BandwidthConfig = typed.BandwidthConfig
+		config.UDPHopInterval = typed.UDPHopInterval
+		config.ObfsPassword = typed.ObfsPassword
+	}
+	// The override is client-local and never reaches the server. Validate it
+	// here so a typo fails at dialer construction, like tuic and juicity,
+	// instead of failing every connection at handshake time.
+	config.CCOverride = header.CongestionOverride
+	if err := client.ValidateCongestionOverride(config.CCOverride); err != nil {
+		return nil, err
 	}
 
 	var err error
 	if !isPortHoppingPort(port) {
-		config.ServerAddr, err = net.ResolveUDPAddr("udp", hostPort)
+		if ip := net.ParseIP(host); ip != nil {
+			config.ServerAddr, err = net.ResolveUDPAddr("udp", hostPort)
+		} else {
+			config.ServerAddr = hostnameUDPAddr(hostPort)
+		}
 	} else {
-		config.ServerAddr, err = udphop.ResolveUDPHopAddr(hostPort)
+		config.ServerAddr, err = udphop.ParseUDPHopAddr(hostPort)
 	}
 	if err != nil {
 		return nil, err
@@ -69,18 +96,22 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	if config.ServerAddr.Network() == "udphop" {
 		config.ConnFactory = &client.UdpConnFactory{
 			NewFunc: func(ctx context.Context) (net.PacketConn, error) {
-				dialFunc := func(addr net.Addr) (net.PacketConn, error) {
+				dialFunc := func(ctx context.Context, addr net.Addr) (net.PacketConn, error) {
 					conn, err := nextDialer.DialContext(ctx, "udp", addr.String())
 					if err != nil {
 						return nil, err
 					}
+					remoteAddr := addr
+					if actualAddr := remoteAddrOf(conn); actualAddr != nil {
+						remoteAddr = actualAddr
+					}
 					return netproxy.NewFakeNetPacketConn(
 						conn.(netproxy.PacketConn),
 						net.UDPAddrFromAddrPort(common.GetUniqueFakeAddrPort()),
-						addr,
+						remoteAddr,
 					), nil
 				}
-				return udphop.NewUDPHopPacketConn(config.ServerAddr.(*udphop.UDPHopAddr), config.UDPHopInterval, dialFunc)
+				return udphop.NewUDPHopPacketConnContext(ctx, config.ServerAddr.(*udphop.UDPHopAddr), config.UDPHopInterval, dialFunc)
 			},
 		}
 	} else {
@@ -90,10 +121,14 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 				if err != nil {
 					return nil, err
 				}
+				remoteAddr := config.ServerAddr
+				if addr := remoteAddrOf(conn); addr != nil {
+					remoteAddr = addr
+				}
 				return netproxy.NewFakeNetPacketConn(
 					conn.(netproxy.PacketConn),
 					net.UDPAddrFromAddrPort(common.GetUniqueFakeAddrPort()),
-					config.ServerAddr,
+					remoteAddr,
 				), nil
 			},
 		}
@@ -113,7 +148,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 // parseServerAddrString parses server address string.
 // Server address can be in either "host:port" or "host" format (in which case we assume port 443).
 func parseServerAddrString(addrStr string) (host, port, hostPort string) {
-	h, p, err := net.SplitHostPort(addrStr)
+	h, p, err := stickyip.SplitHostPort(addrStr)
 	if err != nil {
 		return addrStr, "443", net.JoinHostPort(addrStr, "443")
 	}
@@ -124,6 +159,26 @@ func parseServerAddrString(addrStr string) (host, port, hostPort string) {
 // We consider a port string to be a port hopping port if it contains "-" or ",".
 func isPortHoppingPort(port string) bool {
 	return strings.Contains(port, "-") || strings.Contains(port, ",")
+}
+
+type hostnameUDPAddr string
+
+func (a hostnameUDPAddr) Network() string {
+	return "udp"
+}
+
+func (a hostnameUDPAddr) String() string {
+	return string(a)
+}
+
+func remoteAddrOf(conn netproxy.Conn) net.Addr {
+	type remoteAddrConn interface {
+		RemoteAddr() net.Addr
+	}
+	if c, ok := conn.(remoteAddrConn); ok {
+		return c.RemoteAddr()
+	}
+	return nil
 }
 
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (netproxy.Conn, error) {
@@ -140,4 +195,11 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (netp
 	default:
 		return nil, fmt.Errorf("unsupported network: %s", network)
 	}
+}
+
+func (d *Dialer) Close() error {
+	if d == nil || d.client == nil {
+		return nil
+	}
+	return d.client.Close()
 }

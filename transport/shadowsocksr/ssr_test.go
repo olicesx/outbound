@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
@@ -17,7 +18,18 @@ import (
 	"github.com/daeuniverse/outbound/transport/shadowsocksr/proto"
 )
 
+func requireSSRIntegration(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping shadowsocksr integration test in short mode")
+	}
+	if os.Getenv("OUTBOUND_INTEGRATION") == "" {
+		t.Skip("skipping shadowsocksr integration test; set OUTBOUND_INTEGRATION=1 to enable")
+	}
+}
+
 func TestTcp(t *testing.T) {
+	requireSSRIntegration(t)
 	// https://github.com/winterssy/SSR-Docker
 	// Remember to set protocol_param to 3000# (max_client)
 	d := direct.SymmetricDirect
@@ -66,12 +78,13 @@ func TestTcp(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf := new(bytes.Buffer)
-	buf.ReadFrom(resp.Body)
-	defer resp.Body.Close()
+	_, _ = buf.ReadFrom(resp.Body)
+	defer func() { _ = resp.Body.Close() }()
 	t.Log(buf.String())
 }
 
 func TestUdp(t *testing.T) {
+	requireSSRIntegration(t)
 	// https://github.com/winterssy/SSR-Docker
 	// Remember to set protocol_param to 3000# (max_client)
 	d := direct.SymmetricDirect

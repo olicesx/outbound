@@ -44,15 +44,25 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		return nil, err
 	}
 	//log.Trace("vmess.NewDialer: metadata: %v, password: %v", metadata, password)
+	// protocol.Header is an exported API: a caller passing a non-string
+	// Feature1 must get an error, not a panic inside NewDialer.
+	grpcServiceName, ok := header.Feature1.(string)
+	if !ok {
+		return nil, fmt.Errorf("vmess: unexpected Feature1 type %T, want string", header.Feature1)
+	}
 	return &Dialer{
 		proxyAddress:      header.ProxyAddress,
 		proxySNI:          header.SNI,
-		grpcServiceName:   header.Feature1.(string),
+		grpcServiceName:   grpcServiceName,
 		nextDialer:        nextDialer,
 		metadata:          metadata,
 		key:               NewID(id).CmdKey(),
 		featurePacketAddr: header.Flags&protocol.Flags_VMess_UsePacketAddr > 0,
 	}, nil
+}
+
+func (d *Dialer) UnwrapDialer() netproxy.Dialer {
+	return d.nextDialer
 }
 
 func NewDialerFactory(proto protocol.Protocol) func(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
@@ -65,18 +75,6 @@ func NewDialerFactory(proto protocol.Protocol) func(nextDialer netproxy.Dialer, 
 		dd.protocol = proto
 		return dd, nil
 	}
-}
-
-func (d *Dialer) DialTcp(ctx context.Context, addr string) (c netproxy.Conn, err error) {
-	return d.DialContext(ctx, "tcp", addr)
-}
-
-func (d *Dialer) DialUdp(ctx context.Context, addr string) (c netproxy.PacketConn, err error) {
-	pktConn, err := d.DialContext(ctx, "udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	return pktConn.(netproxy.PacketConn), nil
 }
 
 func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (c netproxy.Conn, err error) {
@@ -97,9 +95,10 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 			mdata.Type = protocol.MetadataTypeDomain
 		}
 
+		underlayDialer := d.nextDialer
 		if d.protocol == protocol.ProtocolVMessTlsGrpc {
-			d.nextDialer = &grpc.Dialer{
-				NextDialer:  d,
+			underlayDialer = &grpc.Dialer{
+				NextDialer:  d.nextDialer,
 				ServiceName: d.grpcServiceName,
 				ServerName:  d.proxySNI,
 			}
@@ -109,10 +108,13 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 			Mark:    magicNetwork.Mark,
 			Mptcp:   magicNetwork.Mptcp,
 		}.Encode()
-		conn, err := d.nextDialer.DialContext(ctx, tcpNetwork, d.proxyAddress)
+		conn, err := underlayDialer.DialContext(ctx, tcpNetwork, d.proxyAddress)
 		if err != nil {
 			return nil, err
 		}
+		// Buffer reads: vmess issues many small io.ReadFull calls per chunk
+		// (size header, nonce, payload). Without buffering each costs a syscall.
+		conn = netproxy.NewBufferedReaderConn(conn, 0)
 
 		return NewConn(conn, Metadata{
 			Metadata: mdata,

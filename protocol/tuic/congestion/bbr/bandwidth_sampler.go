@@ -4,13 +4,34 @@ import (
 	"math"
 	"time"
 
-	"github.com/daeuniverse/quic-go/congestion"
+	"github.com/olicesx/quic-go/congestion"
 )
 
 const (
-	infRTT                             = time.Duration(math.MaxInt64)
-	defaultConnectionStateMapQueueSize = 256
-	defaultCandidatesBufferSize        = 256
+	infRTT = time.Duration(math.MaxInt64)
+
+	// initialConnectionStateMapSlots is the send-record capacity a fresh
+	// connection starts with. The initial congestion window is 10 packets, so
+	// this covers it plus the first probe-up burst; growth is amortised O(1)
+	// per send. The reference implementation's 256 slots would reserve 34.8 KiB
+	// per connection for a window that rarely exceeds it, and a relay holds
+	// thousands of connections, not one.
+	initialConnectionStateMapSlots = 64
+
+	// maxConnectionStateMapSlots is the hard per-connection budget for the
+	// send-record map, and it is derived rather than guessed: it is quic-go's
+	// own bound on how many sent packets it can still ack or lose, namely
+	// internal/protocol.MaxTrackedSentPackets = MaxOutstandingSentPackets * 5/4
+	// = (2 * MaxCongestionWindowPackets) * 5/4. Once the ackhandler stops
+	// tracking a packet, its record can never produce a sample again, so no
+	// correct connection needs more slots than this. At 136 bytes per record
+	// that is ~6.8 MiB, against the 71.3 MiB (524,288 records) the untrimmed
+	// map reached on a single hysteria2 connection.
+	maxConnectionStateMapSlots = 5 * congestion.MaxCongestionWindowPackets / 2
+
+	// defaultCandidatesBufferSize is the A0-candidate ring, used only while
+	// overestimate avoidance is enabled; see EnableOverestimateAvoidance.
+	defaultCandidatesBufferSize = 256
 )
 
 type roundTripCount uint64
@@ -199,7 +220,7 @@ func (m *maxAckHeightTracker) Update(
 	// Compute how many extra bytes were delivered vs max bandwidth.
 	extraBytesAcked := m.aggregationEpochBytes - expectedBytesAcked
 	newEvent := extraAckedEvent{
-		extraAcked: expectedBytesAcked,
+		extraAcked: extraBytesAcked,
 		bytesAcked: m.aggregationEpochBytes,
 		timeDelta:  aggregationDelta,
 	}
@@ -299,6 +320,13 @@ type connectionStateOnSentPacket struct {
 	// Send time states that are returned to the congestion controller when the
 	// packet is acked or lost.
 	sendTimeState sendTimeState
+	// consumed marks a record whose packet has already been acked or declared
+	// lost, so nothing a later rate sample needs can still come from it. Those
+	// records are what the queue reclaims from the front. A record that is not
+	// consumed belongs to a packet that may still be acked or lost and must
+	// stay: onPacketAcknowledged skips the delivered-byte accounting when it
+	// cannot find a record, so dropping a live one under-counts delivery.
+	consumed bool
 }
 
 // Snapshot constructor. Records the current state of the bandwidth
@@ -482,9 +510,6 @@ type bandwidthSampler struct {
 	recentAckPoints recentAckPoints
 	a0Candidates    RingBuffer[ackPoint]
 
-	// Maximum number of tracked packets.
-	maxTrackedPackets congestion.ByteCount
-
 	maxAckHeightTracker              *maxAckHeightTracker
 	totalBytesAckedAfterLastAckEvent congestion.ByteCount
 
@@ -497,14 +522,13 @@ type bandwidthSampler struct {
 
 func newBandwidthSampler(maxAckHeightTrackerWindowLength roundTripCount) *bandwidthSampler {
 	b := &bandwidthSampler{
-		maxAckHeightTracker:  newMaxAckHeightTracker(maxAckHeightTrackerWindowLength),
-		connectionStateMap:   newPacketNumberIndexedQueue[connectionStateOnSentPacket](defaultConnectionStateMapQueueSize),
+		maxAckHeightTracker: newMaxAckHeightTracker(maxAckHeightTrackerWindowLength),
+		connectionStateMap: newPacketNumberIndexedQueue[connectionStateOnSentPacket](
+			initialConnectionStateMapSlots, maxConnectionStateMapSlots),
 		lastSentPacket:       invalidPacketNumber,
 		lastAckedPacket:      invalidPacketNumber,
 		endOfAppLimitedPhase: invalidPacketNumber,
 	}
-
-	b.a0Candidates.Init(defaultCandidatesBufferSize)
 
 	return b
 }
@@ -543,6 +567,10 @@ func (b *bandwidthSampler) EnableOverestimateAvoidance() {
 	}
 
 	b.overestimateAvoidance = true
+	// a0Candidates and recentAckPoints only participate while this is enabled,
+	// so the ring is allocated here instead of reserving 8 KiB in every
+	// sampler that never turns it on.
+	b.a0Candidates.Init(defaultCandidatesBufferSize)
 	b.maxAckHeightTracker.SetAckAggregationBandwidthThreshold(2.0)
 }
 
@@ -603,6 +631,10 @@ func (b *bandwidthSampler) OnCongestionEvent(
 	roundTripCount roundTripCount,
 ) congestionEventSample {
 	eventSample := newCongestionEventSample()
+	// The records this event consumes give their slots back as soon as the front
+	// of the map reaches them. Deferred so the loss-only early return below
+	// reclaims too.
+	defer b.reclaimConsumed()
 
 	var lastLostPacketSendState sendTimeState
 
@@ -676,6 +708,7 @@ func (b *bandwidthSampler) OnCongestionEvent(
 func (b *bandwidthSampler) OnPacketLost(packetNumber congestion.PacketNumber, bytesLost congestion.ByteCount) (s sendTimeState) {
 	b.totalBytesLost += bytesLost
 	if sentPacketPointer := b.connectionStateMap.GetEntry(packetNumber); sentPacketPointer != nil {
+		sentPacketPointer.consumed = true
 		sentPacketToSendTimeState(sentPacketPointer, &s)
 	}
 	return s
@@ -690,6 +723,23 @@ func (b *bandwidthSampler) OnPacketNeutered(packetNumber congestion.PacketNumber
 func (b *bandwidthSampler) OnAppLimited() {
 	b.isAppLimited = true
 	b.endOfAppLimitedPhase = b.lastSentPacket
+}
+
+// reclaimConsumed drops the records this event consumed from the front of the
+// connection-state map.
+//
+// Only records already marked consumed are dropped, so a record for a packet
+// that is still outstanding always survives and its later ack or loss still
+// finds it. Deriving the frontier from the event vector instead -- the
+// reference sender's "highest ack minus the reorder margin" -- deletes records
+// for packets still inside the reorder window; measured on a lossy path that
+// cost 37% of throughput (1.50 GB delivered against 2.39 GB, cwnd 78 KB against
+// 191 KB) because the missing records made onPacketAcknowledged skip those
+// packets' delivered bytes.
+func (b *bandwidthSampler) reclaimConsumed() {
+	b.connectionStateMap.DropConsumedFront(func(e *connectionStateOnSentPacket) bool {
+		return e.consumed
+	})
 }
 
 func (b *bandwidthSampler) RemoveObsoletePackets(leastUnacked congestion.PacketNumber) {
@@ -723,10 +773,6 @@ func (b *bandwidthSampler) IsAppLimited() bool {
 
 func (b *bandwidthSampler) EndOfAppLimitedPhase() congestion.PacketNumber {
 	return b.endOfAppLimitedPhase
-}
-
-func (b *bandwidthSampler) max_ack_height() congestion.ByteCount {
-	return b.maxAckHeightTracker.Get()
 }
 
 func (b *bandwidthSampler) chooseA0Point(totalBytesAcked congestion.ByteCount, a0 *ackPoint) bool {
@@ -765,6 +811,7 @@ func (b *bandwidthSampler) onPacketAcknowledged(ackTime time.Time, packetNumber 
 	if sentPacketPointer == nil {
 		return *sample
 	}
+	sentPacketPointer.consumed = true
 
 	// OnPacketAcknowledgedInner
 	b.totalBytesAcked += sentPacketPointer.size
@@ -862,13 +909,7 @@ func sentPacketToSendTimeState(sentPacket *connectionStateOnSentPacket, sendTime
 	sendTimeState.isValid = true
 }
 
-// BytesFromBandwidthAndTimeDelta calculates the bytes
-// from a bandwidth(bits per second) and a time delta
 func bytesFromBandwidthAndTimeDelta(bandwidth Bandwidth, delta time.Duration) congestion.ByteCount {
 	return (congestion.ByteCount(bandwidth) * congestion.ByteCount(delta)) /
 		(congestion.ByteCount(time.Second) * 8)
-}
-
-func timeDeltaFromBytesAndBandwidth(bytes congestion.ByteCount, bandwidth Bandwidth) time.Duration {
-	return time.Duration(bytes*8) * time.Second / time.Duration(bandwidth)
 }

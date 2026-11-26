@@ -3,6 +3,7 @@ package juicity
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,13 +11,14 @@ import (
 	"time"
 
 	"github.com/daeuniverse/outbound/ciphers"
+	outbounderrors "github.com/daeuniverse/outbound/common/errors"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol/trojanc"
 	"github.com/daeuniverse/outbound/protocol/tuic"
 	"github.com/daeuniverse/outbound/protocol/tuic/common"
-	"github.com/daeuniverse/quic-go"
+	"github.com/olicesx/quic-go"
 )
 
 var (
@@ -37,6 +39,7 @@ type UnderlayAuth struct {
 	IV       []byte
 	Psk      []byte
 	Metadata *trojanc.Metadata
+	result   chan error
 }
 
 func (a *UnderlayAuth) PackFromPool() (buf pool.PB) {
@@ -73,7 +76,7 @@ type ClientOption struct {
 	Uuid                 [16]byte
 	Password             string
 	CongestionController string
-	CWND                 int
+	CWND                 uint64
 	Ctx                  context.Context
 	Cancel               func()
 	UnderlayAuth         chan *UnderlayAuth
@@ -93,6 +96,12 @@ func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, di
 	t.connMutex.Lock()
 	defer t.connMutex.Unlock()
 	if t.quicConn != nil {
+		select {
+		case <-t.quicConn.Context().Done():
+			t.closeConnectionLocked(quicContextErr(t.quicConn.Context()))
+			return nil, common.ErrClientClosed
+		default:
+		}
 		return t.quicConn, nil
 	}
 	transport, addr, err := dialFn(ctx, dialer)
@@ -101,29 +110,49 @@ func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, di
 	}
 	quicConn, err := transport.Dial(ctx, addr, t.TlsConfig, t.QuicConfig)
 	if err != nil {
-		transport.Close()
-		transport.Conn.Close()
+		// A failed dial is attempt-scoped: the caller context may have been
+		// cancelled (a routine dial timeout) or the handshake hit a transient
+		// failure. Poisoning the shared client (t.Cancel + detach) here would
+		// permanently kill the node for every user over one failed attempt —
+		// the neighboring failure paths below only tear down this transport,
+		// and the next getQuicConn call dials again.
+		_ = transport.Close()
+		if transport.Conn != nil {
+			_ = transport.Conn.Close()
+		}
 		return nil, err
 	}
 
 	common.SetCongestionController(quicConn, t.CongestionController, t.CWND)
 
-	go func() {
-		if err := t.sendAuthentication(quicConn); err != nil {
-			_ = t.Close()
+	uniStream, err := quicConn.OpenUniStreamSync(ctx)
+	if err != nil {
+		_ = quicConn.CloseWithError(tuic.ProtocolError, err.Error())
+		_ = transport.Close()
+		if transport.Conn != nil {
+			_ = transport.Conn.Close()
 		}
-	}()
+		return nil, err
+	}
+	if err = t.writeAuthenticationHeader(quicConn, uniStream); err != nil {
+		_ = uniStream.Close()
+		_ = quicConn.CloseWithError(tuic.ProtocolError, err.Error())
+		_ = transport.Close()
+		if transport.Conn != nil {
+			_ = transport.Conn.Close()
+		}
+		return nil, err
+	}
 
+	authCh := make(chan *UnderlayAuth, 64)
 	t.underConn = transport.Conn
 	t.quicConn = quicConn
+	t.UnderlayAuth = authCh
+	go t.writeUnderlayAuthentications(quicConn, uniStream, authCh)
 	return quicConn, nil
 }
 
-func (t *clientImpl) sendAuthentication(quicConn quic.Connection) (err error) {
-	uniStream, err := quicConn.OpenUniStream()
-	if err != nil {
-		return err
-	}
+func (t *clientImpl) writeAuthenticationHeader(quicConn quic.Connection, uniStream quic.SendStream) (err error) {
 	buf := pool.GetBuffer()
 	defer pool.PutBuffer(buf)
 	token, err := tuic.GenToken(quicConn.ConnectionState(), t.Uuid, t.Password)
@@ -135,33 +164,37 @@ func (t *clientImpl) sendAuthentication(quicConn quic.Connection) (err error) {
 		return err
 	}
 	_, err = buf.WriteTo(uniStream)
-	if err != nil {
-		return err
-	}
-	defer uniStream.Close()
+	return err
+}
+
+func (t *clientImpl) writeUnderlayAuthentications(quicConn quic.Connection, uniStream quic.SendStream, authCh <-chan *UnderlayAuth) {
+	defer func() { _ = uniStream.Close() }()
 	for {
 		var auth *UnderlayAuth
 		select {
 		case <-t.Ctx.Done():
-			return t.Ctx.Err()
-		case auth = <-t.UnderlayAuth:
+			return
+		case <-quicConn.Context().Done():
+			return
+		case auth = <-authCh:
 		}
 		buf := auth.PackFromPool()
-		_, err = uniStream.Write(buf)
+		_, err := uniStream.Write(buf)
 		buf.Put()
+		auth.result <- err
 		if err != nil {
-			t.Close()
-			return err
+			_ = t.Close()
+			return
 		}
 	}
 }
 
-func (t *clientImpl) Close() (err error) {
+func (t *clientImpl) Close() error {
 	t.connMutex.Lock()
 	select {
 	case <-t.Ctx.Done():
 		t.connMutex.Unlock()
-		return
+		return nil
 	default:
 		t.Cancel()
 	}
@@ -175,15 +208,15 @@ func (t *clientImpl) Close() (err error) {
 		t.connMutex.Lock()
 		defer t.connMutex.Unlock()
 		if t.quicConn != nil {
-			err = t.quicConn.CloseWithError(tuic.ProtocolError, common.ErrClientClosed.Error())
+			_ = t.quicConn.CloseWithError(tuic.ProtocolError, common.ErrClientClosed.Error())
 			t.quicConn = nil
 		}
 		if t.underConn != nil {
-			err = t.underConn.Close()
+			_ = t.underConn.Close()
 			t.underConn = nil
 		}
 	})
-	return err
+	return nil
 }
 
 func (t *clientImpl) DialContext(ctx context.Context, metadata *trojanc.Metadata, dialer netproxy.Dialer, dialFn common.DialFunc) (*Conn, error) {
@@ -196,26 +229,103 @@ func (t *clientImpl) DialContext(ctx context.Context, metadata *trojanc.Metadata
 	}
 	quicConn, err := t.getQuicConn(ctx, dialer, dialFn)
 	if err != nil {
+		if errors.Is(err, common.ErrClientClosed) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("getQuicConn: %w", err)
 	}
 	quicStream, err := quicConn.OpenStream()
 	if err != nil {
-		t.connMutex.Lock()
-		// Detach it from pool due to bad connection.
-		if t.detachCallback != nil {
-			go t.detachCallback()
-			t.detachCallback = nil
+		if isStreamLimitReached(err) {
+			return nil, common.ErrTooManyOpenStreams
 		}
-		t.connMutex.Unlock()
+		if t.handleIfConnectionClosed(err, quicConn) {
+			return nil, common.ErrClientClosed
+		}
 		return nil, fmt.Errorf("OpenStream: %w", err)
 	}
 	stream := NewConn(
 		quicStream,
 		metadata,
 		nil,
+		quicConn.Context().Done(),
 	)
 	return stream, nil
 }
+
+// handleIfConnectionClosed detaches the connection from the client pool and
+// closes it when a permanent error (non-temporary) is encountered, matching
+// the recovery pattern proven in hysteria2. originConn is the connection that
+// produced err; a replacement must not be torn down for a stale failure.
+func (t *clientImpl) handleIfConnectionClosed(err error, originConn quic.Connection) bool {
+	if err == nil {
+		return false
+	}
+	var streamErr *quic.StreamError
+	if errors.As(err, &streamErr) {
+		return false
+	}
+	if outbounderrors.IsTemporaryError(err) {
+		return false
+	}
+	t.connMutex.Lock()
+	defer t.connMutex.Unlock()
+	if t.quicConn != originConn {
+		return false
+	}
+	t.closeConnectionLocked(err)
+	return true
+}
+
+func quicContextErr(ctx context.Context) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return common.ErrClientClosed
+}
+
+func (t *clientImpl) closeConnectionLocked(err error) {
+	if t.detachCallback != nil {
+		go t.detachCallback()
+		t.detachCallback = nil
+	}
+	if t.Cancel != nil {
+		if t.Ctx != nil {
+			select {
+			case <-t.Ctx.Done():
+			default:
+				t.Cancel()
+			}
+		} else {
+			t.Cancel()
+		}
+	}
+	if t.quicConn != nil {
+		errStr := common.ErrClientClosed.Error()
+		if err != nil {
+			errStr = err.Error()
+		}
+		_ = t.quicConn.CloseWithError(tuic.ProtocolError, errStr)
+		t.quicConn = nil
+	}
+	if t.underConn != nil {
+		_ = t.underConn.Close()
+		t.underConn = nil
+	}
+}
+
+func isStreamLimitReached(err error) bool {
+	var streamLimitPtr *quic.StreamLimitReachedError
+	if errors.As(err, &streamLimitPtr) {
+		return true
+	}
+	var streamLimit quic.StreamLimitReachedError
+	return errors.As(err, &streamLimit) || outbounderrors.IsStreamExhausted(err)
+}
+
 func (t *clientImpl) DialAuth(ctx context.Context, metadata *trojanc.Metadata, dialer netproxy.Dialer, dialFn common.DialFunc) (iv []byte, psk []byte, err error) {
 	select {
 	case <-t.Ctx.Done():
@@ -224,21 +334,67 @@ func (t *clientImpl) DialAuth(ctx context.Context, metadata *trojanc.Metadata, d
 		return nil, nil, ctx.Err()
 	default:
 	}
-	_, err = t.getQuicConn(ctx, dialer, dialFn)
-	if err != nil {
-		return nil, nil, fmt.Errorf("getQuicConn: %w", err)
+	var quicConn quic.Connection
+	var authCh chan *UnderlayAuth
+	for {
+		quicConn, err = t.getQuicConn(ctx, dialer, dialFn)
+		if err != nil {
+			if errors.Is(err, common.ErrClientClosed) {
+				return nil, nil, err
+			}
+			return nil, nil, fmt.Errorf("getQuicConn: %w", err)
+		}
+		t.connMutex.Lock()
+		if t.quicConn == quicConn {
+			authCh = t.UnderlayAuth
+			t.connMutex.Unlock()
+			break
+		}
+		t.connMutex.Unlock()
 	}
 	iv = make([]byte, CipherConf.SaltLen)
 	psk = make([]byte, CipherConf.KeyLen)
 	iv[0], iv[1] = 0, 0
 	_, _ = fastrand.Read(iv[2:])
 	_, _ = fastrand.Read(psk)
-	t.UnderlayAuth <- &UnderlayAuth{
+	auth := &UnderlayAuth{
 		IV:       iv,
 		Psk:      psk,
 		Metadata: metadata,
+		result:   make(chan error, 1),
 	}
-	return iv, psk, nil
+	select {
+	case authCh <- auth:
+	case <-quicConn.Context().Done():
+		// The QUIC connection itself is gone. Detach that origin even if the
+		// context cause looks like a cancellation, but never close a replacement.
+		err := quicContextErr(quicConn.Context())
+		t.connMutex.Lock()
+		if t.quicConn == quicConn {
+			t.closeConnectionLocked(err)
+			t.connMutex.Unlock()
+			return nil, nil, common.ErrClientClosed
+		}
+		t.connMutex.Unlock()
+		return nil, nil, err
+	case <-t.Ctx.Done():
+		return nil, nil, common.ErrClientClosed
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+	select {
+	case err = <-auth.result:
+		if err != nil {
+			return nil, nil, err
+		}
+		return iv, psk, nil
+	case <-quicConn.Context().Done():
+		return nil, nil, quicContextErr(quicConn.Context())
+	case <-t.Ctx.Done():
+		return nil, nil, common.ErrClientClosed
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
 }
 
 func (t *clientImpl) setOnClose(f func()) {

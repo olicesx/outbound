@@ -61,9 +61,13 @@ func parseAnytlsURL(link string) (*Anytls, error) {
 }
 
 func (s *Anytls) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, *dialer.Property, error) {
+	skipVerify := s.Insecure
+	if option != nil && option.AllowInsecure {
+		skipVerify = true
+	}
 	tlsConfig := &tls.Config{
 		ServerName:         s.Sni,
-		InsecureSkipVerify: s.Insecure,
+		InsecureSkipVerify: skipVerify,
 	}
 	if tlsConfig.ServerName == "" {
 		// disable the SNI

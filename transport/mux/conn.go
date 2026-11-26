@@ -8,6 +8,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
+
+	"github.com/daeuniverse/outbound/netproxy"
 )
 
 type SessionStatus = byte
@@ -41,6 +44,16 @@ type Conn struct {
 	status [2]byte
 	otb    []byte
 	remain int
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
+// forwarding the declaration of the wrapped conn. This type embeds net.Conn,
+// so SetWriteDeadline is promoted while the optional declaration is not.
+func (m *Conn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(m.Conn)
 }
 
 func (m *Conn) Read(b []byte) (int, error) {
@@ -52,7 +65,7 @@ func (m *Conn) Read(b []byte) (int, error) {
 
 		n, err := m.Conn.Read(b[:length])
 		if err != nil {
-			return 0, err
+			return n, err
 		}
 		m.remain -= n
 		return n, nil
@@ -73,7 +86,7 @@ func (m *Conn) Read(b []byte) (int, error) {
 			return 0, err
 		}
 
-		_, err = m.Conn.Read(m.status[:])
+		_, err = io.ReadFull(m.Conn, m.status[:])
 		if err != nil {
 			return 0, err
 		}
@@ -114,22 +127,36 @@ func (m *Conn) Write(b []byte) (int, error) {
 		m.otb = nil
 	}
 	m.buf.Reset()
-	binary.Write(&m.buf, binary.BigEndian, uint16(4))
+	if len(b) > 0xFFFF {
+		// The frame length field is uint16: silently truncating would
+		// desync the peer's framing mid-stream.
+		return 0, errors.New("mux: frame payload exceeds 65535 bytes")
+	}
+	_ = binary.Write(&m.buf, binary.BigEndian, uint16(4))
 	m.buf.Write(m.id[:])
 	m.buf.WriteByte(SessionStatusKeep)
 	m.buf.WriteByte(OptionData)
-	binary.Write(&m.buf, binary.BigEndian, uint16(len(b)))
+	_ = binary.Write(&m.buf, binary.BigEndian, uint16(len(b)))
 	m.buf.Write(b)
 
 	return m.Conn.Write(m.buf.Bytes())
 }
 
 func (m *Conn) Close() error {
-	_, err := m.Conn.Write([]byte{0x0, 0x4, m.id[0], m.id[1], SessionStatusEnd, OptionNone})
-	if err != nil {
-		return err
-	}
-	return m.Conn.Close()
+	// Defensive closes must be idempotent: a second Close would otherwise
+	// write an END frame into a dead conn and surface net.ErrClosed.
+	m.closeOnce.Do(func() {
+		_, err := m.Conn.Write([]byte{0x0, 0x4, m.id[0], m.id[1], SessionStatusEnd, OptionNone})
+		// The underlay must close even when the END frame could not be
+		// delivered; returning early here leaked the raw connection.
+		closeErr := m.Conn.Close()
+		if err != nil {
+			m.closeErr = err
+		} else {
+			m.closeErr = closeErr
+		}
+	})
+	return m.closeErr
 }
 
 func NewConn(conn net.Conn, option MuxOption) *Conn {
@@ -149,7 +176,7 @@ func NewConn(conn net.Conn, option MuxOption) *Conn {
 	buf.WriteByte(netType)
 
 	// port
-	binary.Write(buf, binary.BigEndian, option.Port)
+	_ = binary.Write(buf, binary.BigEndian, option.Port)
 
 	// address
 	ip := net.ParseIP(option.Host)

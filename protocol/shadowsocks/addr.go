@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol"
@@ -83,11 +84,17 @@ func NewMetadata(bytesMetadata []byte) (*Metadata, error) {
 	}
 	switch meta.Type {
 	case protocol.MetadataTypeIPv4:
-		meta.Hostname = net.IP(bytesMetadata[1:5]).String()
+		// Keep the address binary: hot reply paths consume meta.IP without
+		// a Hostname string round-trip.
+		if ip, ok := netip.AddrFromSlice(bytesMetadata[1:5]); ok {
+			meta.IP = ip
+		}
 		meta.Port = binary.BigEndian.Uint16(bytesMetadata[5:])
 		return meta, nil
 	case protocol.MetadataTypeIPv6:
-		meta.Hostname = net.IP(bytesMetadata[1:17]).String()
+		if ip, ok := netip.AddrFromSlice(bytesMetadata[1:17]); ok {
+			meta.IP = ip
+		}
 		meta.Port = binary.BigEndian.Uint16(bytesMetadata[17:])
 		return meta, nil
 	case protocol.MetadataTypeDomain:
@@ -117,24 +124,35 @@ func (meta *Metadata) Bytes() (b []byte, err error) {
 func (meta *Metadata) BytesFromPool() (b []byte, err error) {
 	switch meta.Type {
 	case protocol.MetadataTypeIPv4:
-		ip := net.ParseIP(meta.Hostname)
-		if ip == nil {
-			return nil, fmt.Errorf("not a valid ipv4: %v", meta.Hostname)
+		var ip4 [4]byte
+		if meta.IP.Is4() {
+			ip4 = meta.IP.As4()
+		} else if ip := net.ParseIP(meta.Hostname); ip != nil && ip.To4() != nil {
+			copy(ip4[:], ip.To4()[:4])
+		} else {
+			return nil, fmt.Errorf("not a valid ipv4: %v (type %v)", meta.Hostname, meta.Type)
 		}
 		b = pool.Get(1 + 4 + 2)
-		copy(b[1:], ip.To4()[:4])
+		copy(b[1:], ip4[:])
 		binary.BigEndian.PutUint16(b[5:], meta.Port)
 	case protocol.MetadataTypeIPv6:
-		ip := net.ParseIP(meta.Hostname)
-		if ip == nil {
-			return nil, fmt.Errorf("not a valid ipv6: %v", meta.Hostname)
+		var ip16 [16]byte
+		if meta.IP.IsValid() && !meta.IP.Is4() {
+			ip16 = meta.IP.As16()
+		} else if ip := net.ParseIP(meta.Hostname); ip != nil && ip.To16() != nil {
+			copy(ip16[:], ip.To16()[:16])
+		} else {
+			return nil, fmt.Errorf("not a valid ipv6: %v (type %v)", meta.Hostname, meta.Type)
 		}
 		b = pool.Get(1 + 16 + 2)
-		copy(b[1:], ip[:16])
+		copy(b[1:], ip16[:])
 		binary.BigEndian.PutUint16(b[17:], meta.Port)
 	case protocol.MetadataTypeDomain:
 		hostname := []byte(meta.Hostname)
 		lenDN := len(hostname)
+		if lenDN > 255 {
+			return nil, fmt.Errorf("domain name too long: %d", lenDN)
+		}
 		b = pool.Get(1 + 1 + lenDN + 2)
 		b[1] = uint8(lenDN)
 		copy(b[2:], hostname)

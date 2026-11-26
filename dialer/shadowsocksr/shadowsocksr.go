@@ -124,6 +124,10 @@ func ParseSSRURL(u string) (data *ShadowsocksR, err error) {
 		}
 		return v, true
 	}
+	if len(u) < len("ssr://") {
+		err = fmt.Errorf("%w: unrecognized ssr address", dialer.InvalidParameterErr)
+		return
+	}
 	content := u[6:]
 	var (
 		info ShadowsocksR

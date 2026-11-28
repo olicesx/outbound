@@ -54,12 +54,15 @@ func NewHTTPProxyWithTLSOptions(u *url.URL, forward netproxy.Dialer, defaults *d
 			serverName = u.Hostname()
 		}
 
-		options := dialer.ExtraOption{TlsImplementation: "tls"}
+		var options dialer.ExtraOption
 		if defaults != nil {
 			options = *defaults
 		}
 		if impl := query.Get("tlsImplementation"); impl != "" {
 			options.TlsImplementation = impl
+		}
+		if options.TlsImplementation == "" {
+			options.TlsImplementation = "tls"
 		}
 		if imitate := query.Get("utlsImitate"); imitate != "" {
 			options.UtlsImitate = imitate

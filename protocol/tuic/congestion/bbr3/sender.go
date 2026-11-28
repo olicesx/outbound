@@ -51,7 +51,7 @@ type Bbr3Sender struct {
 var _ congestion.CongestionControl = &Bbr3Sender{}
 
 // MaxHintBytesPerSecond is the largest supported access-link hint.
-const MaxHintBytesPerSecond = 1 << 40
+const MaxHintBytesPerSecond uint64 = 1 << 40
 
 // NewBbr3Sender builds a sender with DefaultParams. hintBps is the access-link
 // upper bound in bytes per second; zero disables the cap.

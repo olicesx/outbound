@@ -15,6 +15,7 @@ import (
 	"github.com/olicesx/quic-go"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/pool"
 	coreErrs "github.com/daeuniverse/outbound/protocol/hysteria2/errors"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/frag"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/protocol"
@@ -32,13 +33,6 @@ const (
 	// demux worker.
 	udpMessageChanSize = 128
 )
-
-// sendBufPool recycles the per-session MaxUDPSize send buffer. Sessions are
-// created/closed frequently (game ticks, DNS), so pooling avoids a 4KB
-// allocation churn and its GC pressure on each session churn.
-var sendBufPool = sync.Pool{
-	New: func() any { return make([]byte, protocol.MaxUDPSize) },
-}
 
 type udpIO interface {
 	ReceiveMessage() (*protocol.UDPMessage, error)
@@ -281,7 +275,7 @@ func (u *udpConn) tryReleaseSendBuf() {
 		return
 	}
 	if u.SendBuf != nil {
-		sendBufPool.Put(u.SendBuf)
+		pool.Put(u.SendBuf)
 		u.SendBuf = nil
 	}
 	u.writeMu.Unlock()
@@ -622,7 +616,7 @@ func (m *udpSessionManager) NewUDP(addr string) (netproxy.Conn, error) {
 		ID:            id,
 		D:             &frag.Defragger{},
 		ReceiveCh:     make(chan *protocol.UDPMessage, udpMessageChanSize),
-		SendBuf:       sendBufPool.Get().([]byte),
+		SendBuf:       pool.Get(protocol.MaxUDPSize),
 		SendFunc:      m.io.SendMessage,
 		transportDone: m.done,
 

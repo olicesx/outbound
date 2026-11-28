@@ -243,7 +243,7 @@ func TestForwardCloseWriteUnderlyingForwarderTCP(t *testing.T) {
 	inner := &testUnderlyingWrapper{Conn: client, underlying: client}
 	forwarder := NewUnderlyingConnForwarder(inner, func() net.Conn { return client })
 	conn := NewBufferedReaderConn(forwarder, 0)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := ForwardCloseWrite(conn); err != nil {
 		t.Fatalf("ForwardCloseWrite: %v", err)

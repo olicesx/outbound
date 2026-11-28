@@ -108,8 +108,8 @@ func TestNewBufferedReaderConnWrapsPlainUnderlay(t *testing.T) {
 
 func TestNewBufferedReaderConnFollowsForwarderReadPath(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	tlsConn := gotls.Client(client, &gotls.Config{ServerName: "underlay.test"})
 	for _, tc := range []struct {

@@ -36,7 +36,7 @@ func TestDialContextPreservesTLSBufferAndHalfClose(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer listener.Close()
+			defer func() { _ = listener.Close() }()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -73,7 +73,7 @@ func TestDialContextPreservesTLSBufferAndHalfClose(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer raw.Close()
+			defer func() { _ = raw.Close() }()
 			if err := raw.SetDeadline(deadline); err != nil {
 				t.Fatal(err)
 			}
@@ -87,7 +87,7 @@ func TestDialContextPreservesTLSBufferAndHalfClose(t *testing.T) {
 				t.Fatalf("dial: %v", r.err)
 			}
 			conn := r.conn
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			if err := conn.SetDeadline(deadline); err != nil {
 				t.Fatal(err)
 			}

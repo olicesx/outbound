@@ -50,11 +50,9 @@ func benchmarkDeliverMessage(b *testing.B, messageAddr string) {
 		ID:                1,
 		D:                 &frag.Defragger{},
 		ReceiveCh:         make(chan *protocol.UDPMessage, udpMessageChanSize),
-		SendBuf:           sendBufPool.Get().([]byte),
 		target:            target,
 		defaultTargetAddr: netip.MustParseAddrPort(target),
 	}
-	defer sendBufPool.Put(u.SendBuf)
 
 	msg := &protocol.UDPMessage{
 		SessionID: 1,

@@ -44,12 +44,12 @@ func dialTCPTestConn(t *testing.T, underlay netproxy.Conn) *TCPConn {
 
 func TestTCPDialRetainsTLSForwarder(t *testing.T) {
 	client, peer := net.Pipe()
-	defer client.Close()
-	defer peer.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = peer.Close() }()
 	records := tls.Client(client, &tls.Config{ServerName: "proxy.test"})
 	underlay := netproxy.NewUnderlyingConnForwarder(records, func() net.Conn { return client })
 	conn := dialTCPTestConn(t, underlay)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if conn.Conn != underlay {
 		t.Fatalf("TCP underlay = %T, want the original TLS forwarder", conn.Conn)
@@ -126,10 +126,10 @@ func TestTCPConnHonorsPresetDeadlines(t *testing.T) {
 		t.Run(stage, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				client, peer := net.Pipe()
-				defer peer.Close()
+				defer func() { _ = peer.Close() }()
 				underlay := &tcpDeadlineRecorder{Conn: client}
 				conn := dialTCPTestConn(t, underlay)
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				if stage == "steady state" {
 					exchangeTCPTestHandshake(t, conn, peer)
 					requireTCPTestDeadlines(t, underlay, time.Time{}, time.Time{})
@@ -200,10 +200,10 @@ func TestTCPConnUpdatesBlockedHandshakeDeadlines(t *testing.T) {
 		t.Run(update, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				client, peer := net.Pipe()
-				defer peer.Close()
+				defer func() { _ = peer.Close() }()
 				underlay := &tcpDeadlineRecorder{Conn: client}
 				conn := dialTCPTestConn(t, underlay)
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				start := time.Now()
 				initial := start.Add(10 * time.Second)
 				if err := conn.SetDeadline(initial); err != nil {

@@ -174,3 +174,40 @@ func TestDeferQuicConnRetiresClosedConnectionOnTemporaryError(t *testing.T) {
 		t.Fatal("closed-connection temporary errors must invoke the client close callback")
 	}
 }
+
+type dissociateStream struct {
+	quic.SendStream
+	ctx context.Context
+}
+
+func (s *dissociateStream) Write(p []byte) (int, error) { return len(p), nil }
+func (s *dissociateStream) Close() error                { return errors.New("send stream stopped") }
+func (s *dissociateStream) Context() context.Context    { return s.ctx }
+
+type dissociateConn struct {
+	lifecycleQuicConn
+	stream quic.SendStream
+}
+
+func (c *dissociateConn) OpenUniStream() (quic.SendStream, error) { return c.stream, nil }
+
+func TestDissociateKeepsLiveConnectionOnStreamCancellation(t *testing.T) {
+	connCtx, closeConn := context.WithCancel(context.Background())
+	t.Cleanup(closeConn)
+	streamCtx, stopStream := context.WithCancelCause(connCtx)
+	stopStream(&quic.StreamError{Remote: true})
+	conn := &dissociateConn{stream: &dissociateStream{ctx: streamCtx}}
+	conn.ctx = connCtx
+	client := &clientImpl{quicConn: conn}
+	newAssociation := func() *quicStreamPacketConn {
+		return &quicStreamPacketConn{quicConn: conn, incomingPackets: NewPackets(), deferQuicConnFn: client.deferQuicConn}
+	}
+	if err := newAssociation().Close(); err != nil || client.closed.Load() {
+		t.Fatalf("Dissociate of live connection: err=%v, retired=%v", err, client.closed.Load())
+	}
+	closeConn()
+	_ = newAssociation().Close()
+	if !client.closed.Load() {
+		t.Fatal("Dissociate must still retire a closed connection")
+	}
+}

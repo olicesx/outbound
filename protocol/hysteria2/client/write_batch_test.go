@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/protocol"
@@ -127,5 +128,50 @@ func TestWriteBatchEmptyIsNoOp(t *testing.T) {
 	}
 	if got := rec.count(); got != 0 {
 		t.Fatalf("transport sent %d datagrams, want 0", got)
+	}
+}
+
+func TestCloseDoesNotWaitForBlockedDatagramWriter(t *testing.T) {
+	manager := &udpSessionManager{io: noopUDPTestIO{}, m: make(map[uint32]*udpConn)}
+	conn, err := manager.NewUDP("192.0.2.1:53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := conn.(*udpConn)
+	entered, release, wrote := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	u.SendFunc = func(buf []byte, msg *protocol.UDPMessage) error {
+		close(entered)
+		<-release
+		msg.Serialize(buf)
+		return nil
+	}
+	go func() {
+		defer close(wrote)
+		_, _ = u.WriteTo([]byte("payload"), "192.0.2.1:53")
+	}()
+	t.Cleanup(func() {
+		close(release)
+		<-wrote
+		if u.SendBuf != nil {
+			t.Error("writer did not return the send buffer on exit")
+		}
+	})
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("writer never entered SendFunc")
+	}
+	closed := make(chan struct{})
+	go func() {
+		_ = u.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		if manager.Count() != 0 {
+			t.Fatal("manager still owns the retired association")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close waited for the datagram send")
 	}
 }

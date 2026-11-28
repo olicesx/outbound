@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/daeuniverse/outbound/protocol/tuic/congestion"
+	"github.com/daeuniverse/outbound/protocol/tuic/congestion/bbr3"
 	"github.com/olicesx/quic-go"
 	"github.com/sirupsen/logrus"
 )
@@ -41,7 +42,6 @@ func CWNDFromFeature(v interface{}) uint64 {
 // an unrecognized value is a configuration error, never a silent BBR fallback.
 var supportedCongestionControllers = map[string]struct{}{
 	"bbr":      {},
-	"cubic":    {},
 	"new_reno": {},
 	"brutal":   {},
 	"bbr3":     {},
@@ -77,16 +77,32 @@ const FixedRateCongestionController = "brutal"
 // A non-empty override still wins, and must be in the allowlist, otherwise an
 // error is returned so a typo fails fast instead of being silently downgraded.
 func SelectCongestionController(serverCC, override string, brutalTarget uint64) (string, error) {
-	if override == "" {
+	cc := override
+	if cc == "" {
+		cc = DefaultCongestionController
 		if serverCC == FixedRateCongestionController && brutalTarget > 0 {
-			return FixedRateCongestionController, nil
+			cc = FixedRateCongestionController
 		}
-		return DefaultCongestionController, nil
 	}
-	if _, ok := supportedCongestionControllers[override]; !ok {
-		return "", fmt.Errorf("unsupported cc_override %q: must be one of bbr, cubic, new_reno, brutal, bbr3", override)
+	if err := ValidateCongestionConfig(cc, brutalTarget); err != nil {
+		if override != "" {
+			return "", fmt.Errorf("cc_override: %w", err)
+		}
+		return "", err
 	}
-	return override, nil
+	return cc, nil
+}
+
+// ValidateCongestionConfig validates controller and rate for a directly configured client.
+// An empty name keeps the legacy BBR default for these clients.
+func ValidateCongestionConfig(cc string, rate uint64) error {
+	if _, ok := supportedCongestionControllers[cc]; !ok && cc != "" {
+		return fmt.Errorf("unsupported congestion controller %q: must be one of bbr, new_reno, brutal, bbr3", cc)
+	}
+	if cc == "bbr3" && rate > bbr3.MaxHintBytesPerSecond {
+		return fmt.Errorf("bbr3 bandwidth hint %d exceeds %d bytes/s", rate, bbr3.MaxHintBytesPerSecond)
+	}
+	return nil
 }
 
 // SetCongestionController wires the configured congestion controller into
@@ -95,8 +111,15 @@ func SelectCongestionController(serverCC, override string, brutalTarget uint64) 
 // forks); when it is zero the connection falls back to BBR. "bbr3" uses the
 // same field as the access-link upper bound in bytes per second, which caps
 // pacing and inflight but is never a target; zero leaves it purely probing.
+// A fresh QUIC connection already uses Reno, so new_reno keeps that sender.
 func SetCongestionController(quicConn quic.Connection, cc string, cwnd uint64) {
+	if err := ValidateCongestionConfig(cc, cwnd); err != nil {
+		logrus.WithError(err).Warn("invalid QUIC congestion configuration")
+		return
+	}
 	switch cc {
+	case "new_reno":
+		return
 	case "brutal":
 		if cwnd == 0 {
 			congestion.UseBBR(quicConn)

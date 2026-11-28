@@ -322,35 +322,35 @@ func (s *session) run() error {
 
 func (s *session) Close() error {
 	if s.closed.CompareAndSwap(false, true) {
-		s.state.Store(sessionStateClosing)
-		close(s.done)
-		s.streamLock.Lock()
-		streams := make([]*stream, 0, len(s.streams))
-		for _, stream := range s.streams {
-			streams = append(streams, stream)
-		}
-		s.streams = make(map[uint32]*stream)
-		s.activeStreams.Store(0)
-		s.streamLock.Unlock()
-		for _, stream := range streams {
-			stream.markClosed(net.ErrClosed)
-		}
-		// Drain the coalescer before the raw close: Close itself no
-		// longer flushes (a blocked flush must not delay teardown), so a
-		// pending close_notify or final frame is pushed here instead.
-		if s.flusher != nil {
-			_ = s.flusher.Flush()
-		}
-		_ = s.conn.Close()
-		s.connLock.Lock()
-		s.writeBuf = nil
-		s.connLock.Unlock()
-		s.state.Store(sessionStateClosed)
-		return nil
+		s.finishClose(true)
 	}
 	return nil
 }
 
+// finishClose runs once, after the caller has claimed the close via s.closed.
+func (s *session) finishClose(flush bool) {
+	s.state.Store(sessionStateClosing)
+	close(s.done)
+	s.streamLock.Lock()
+	streams := make([]*stream, 0, len(s.streams))
+	for _, stream := range s.streams {
+		streams = append(streams, stream)
+	}
+	s.streams = make(map[uint32]*stream)
+	s.activeStreams.Store(0)
+	s.streamLock.Unlock()
+	for _, stream := range streams {
+		stream.markClosed(net.ErrClosed)
+	}
+	if flush && s.flusher != nil {
+		_ = s.flusher.Flush()
+	}
+	_ = s.conn.Close()
+	s.connLock.Lock()
+	s.writeBuf = nil
+	s.connLock.Unlock()
+	s.state.Store(sessionStateClosed)
+}
 func (s *session) borrowWriteBuf(size int) []byte {
 	if cap(s.writeBuf) < size {
 		s.writeBuf = make([]byte, size)
@@ -425,31 +425,39 @@ drained:
 	}
 }
 
-// writeConnLockedWithDeadline applies an optional write deadline then writes.
+// writeAndUnlock releases connLock and retires the session on an uncertain
+// packet write. Another stream must not write behind a partially sent frame.
+func (s *session) writeAndUnlock(b []byte, deadline time.Time, retireOnFailure bool) error {
+	started, err := s.writeConnLockedWithDeadline(b, deadline)
+	closeSession := retireOnFailure && started && err != nil && s.closed.CompareAndSwap(false, true)
+	s.connLock.Unlock()
+	if closeSession {
+		s.finishClose(false)
+	}
+	return err
+}
+
+// writeConnLockedWithDeadline reports whether transport I/O was attempted.
+// Once it was attempted, a failure may leave framing partially delivered.
 // Caller must hold connLock.
-func (s *session) writeConnLockedWithDeadline(b []byte, deadline time.Time) (n int, err error) {
+func (s *session) writeConnLockedWithDeadline(b []byte, deadline time.Time) (started bool, err error) {
 	if !deadline.IsZero() {
 		if !deadline.After(time.Now()) {
-			return 0, os.ErrDeadlineExceeded
+			return false, os.ErrDeadlineExceeded
 		}
 		if err := s.conn.SetWriteDeadline(deadline); err != nil {
-			return 0, err
+			return false, err
 		}
 		defer func() { _ = s.conn.SetWriteDeadline(time.Time{}) }()
 	}
-	n, err = s.writeConnLocked(b)
-	if err != nil {
-		return n, err
+	if _, err := s.writeConnLocked(b); err != nil {
+		return true, err
 	}
-	// Drain the TLS record coalescer so the burst leaves in one socket write.
-	// Without this the caller believes the data is out while records sit in
-	// the coalescing buffer.
+	// Drain the TLS record coalescer so success means the burst was flushed.
 	if s.flusher != nil {
-		if ferr := s.flusher.Flush(); ferr != nil {
-			return n, ferr
-		}
+		return true, s.flusher.Flush()
 	}
-	return n, nil
+	return true, nil
 }
 
 func (s *session) writeConnLocked(b []byte) (n int, err error) {

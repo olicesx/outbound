@@ -1,6 +1,13 @@
 package common
 
-import "testing"
+import (
+	"net"
+	"testing"
+
+	"github.com/daeuniverse/outbound/protocol/tuic/congestion/bbr3"
+	"github.com/olicesx/quic-go"
+	"github.com/olicesx/quic-go/congestion"
+)
 
 func TestCWNDFromFeature(t *testing.T) {
 	cases := []struct {
@@ -89,10 +96,10 @@ func TestSelectCongestionController(t *testing.T) {
 			want:     "bbr",
 		},
 		{
-			name:     "override cubic",
+			name:     "override cubic is unavailable on this QUIC pin",
 			serverCC: "bbr",
 			override: "cubic",
-			want:     "cubic",
+			wantErr:  true,
 		},
 		{
 			name:     "override new_reno",
@@ -140,5 +147,40 @@ func TestSelectCongestionController(t *testing.T) {
 					tc.serverCC, tc.override, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestSelectCongestionControllerValidatesBBR3Hint(t *testing.T) {
+	const limit = bbr3.MaxHintBytesPerSecond
+	if cc, err := SelectCongestionController("", "", limit); err != nil || cc != "bbr3" {
+		t.Fatalf("select at maximum hint = (%q, %v)", cc, err)
+	}
+	if _, err := SelectCongestionController("", "", limit+1); err == nil {
+		t.Fatal("accepted excessive BBR3 hint")
+	}
+	if cc, err := SelectCongestionController("", "bbr", limit+1); err != nil || cc != "bbr" {
+		t.Fatalf("BBRv1 should ignore BBR3-only hint limit: (%q, %v)", cc, err)
+	}
+}
+
+type congestionRecorder struct {
+	quic.Connection
+	controller congestion.CongestionControl
+}
+
+func (c *congestionRecorder) RemoteAddr() net.Addr { return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+func (c *congestionRecorder) SetCongestionControl(controller congestion.CongestionControl) {
+	c.controller = controller
+}
+
+func TestSetCongestionControllerPreservesNativeReno(t *testing.T) {
+	c := &congestionRecorder{}
+	SetCongestionController(c, "new_reno", 0)
+	if c.controller != nil {
+		t.Fatalf("Reno must keep the native QUIC sender, installed %T", c.controller)
+	}
+	SetCongestionController(c, "bbr", 0)
+	if c.controller == nil {
+		t.Fatal("BBR must install a controller")
 	}
 }

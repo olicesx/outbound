@@ -524,3 +524,36 @@ func TestNewUDPHopPacketConnKeepsOOBOnDirectUnderlay(t *testing.T) {
 		t.Error("direct underlay must keep advertising the raw socket")
 	}
 }
+
+type closeTrackedHopConn struct {
+	stubPacketConn
+	closed bool
+}
+
+func (c *closeTrackedHopConn) Close() error {
+	c.closed = true
+	return nil
+}
+
+func TestUDPHopKeepsSocketWhenReplacementCannotSendOOB(t *testing.T) {
+	var direct net.PacketConn
+	proxy := &closeTrackedHopConn{}
+	addr := &UDPHopAddr{Host: "127.0.0.1", Ports: []uint16{443}}
+	conn, err := NewUDPHopPacketConnContext(context.Background(), addr, time.Hour, func(_ context.Context, _ net.Addr) (net.PacketConn, error) {
+		if direct != nil {
+			return proxy, nil
+		}
+		var err error
+		direct, err = net.ListenPacket("udp4", "127.0.0.1:0")
+		return direct, err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	hop := conn.(*udpHopPacketConn)
+	hop.hop()
+	if !proxy.closed || hop.currentConn != direct {
+		t.Fatalf("incompatible hop: replacement closed=%v current=%T", proxy.closed, hop.currentConn)
+	}
+}

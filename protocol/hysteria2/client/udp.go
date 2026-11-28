@@ -263,8 +263,28 @@ func (u *udpConn) queueIfNoReceiver(msg *protocol.UDPMessage) bool {
 
 func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 	u.writeMu.Lock()
-	defer u.writeMu.Unlock()
+	defer u.finishWrite()
 	return u.writeLocked(b, addr)
+}
+
+// finishWrite hands scratch cleanup back to Close, or performs it if Close
+// published retirement while this writer owned the buffer.
+func (u *udpConn) finishWrite() {
+	u.writeMu.Unlock()
+	if u.closed.Load() {
+		u.tryReleaseSendBuf()
+	}
+}
+
+func (u *udpConn) tryReleaseSendBuf() {
+	if !u.writeMu.TryLock() {
+		return
+	}
+	if u.SendBuf != nil {
+		sendBufPool.Put(u.SendBuf)
+		u.SendBuf = nil
+	}
+	u.writeMu.Unlock()
 }
 
 // writeLocked sends one datagram; callers hold writeMu.
@@ -299,6 +319,9 @@ func (u *udpConn) writeLocked(b []byte, addr string) (n int, err error) {
 			return 0, fragErr
 		}
 		for _, fMsg := range fMsgs {
+			if u.closed.Load() {
+				return 0, coreErrs.ClosedError{}
+			}
 			err := u.SendFunc(u.SendBuf, &fMsg)
 			if err != nil {
 				return 0, err
@@ -319,7 +342,7 @@ func (u *udpConn) writeLocked(b []byte, addr string) (n int, err error) {
 // holds the session write lock once for the whole batch.
 func (u *udpConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
 	u.writeMu.Lock()
-	defer u.writeMu.Unlock()
+	defer u.finishWrite()
 	sent := 0
 	for _, item := range items {
 		if _, err := u.writeLocked(item.Data, item.Addr); err != nil {
@@ -652,15 +675,9 @@ func (m *udpSessionManager) closeLocked(conn *udpConn) func() {
 		releaseUDPMessage(msg)
 	}
 	delete(m.m, conn.ID)
-	// WriteTo holds writeMu around Serialize+SendDatagram. Take it before
-	// returning SendBuf so a concurrent write cannot use-after-put the
-	// serialize buffer.
-	conn.writeMu.Lock()
-	if conn.SendBuf != nil {
-		sendBufPool.Put(conn.SendBuf)
-		conn.SendBuf = nil
-	}
-	conn.writeMu.Unlock()
+	// An active sender owns the scratch until it returns from QUIC. Never
+	// wait for its datagram queue while holding the session manager lock.
+	conn.tryReleaseSendBuf()
 	if m.draining && len(m.m) == 0 {
 		onIdle := m.onIdle
 		m.onIdle = nil

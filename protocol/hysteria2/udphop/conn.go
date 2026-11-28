@@ -43,6 +43,14 @@ type oobReadMsgUDP interface {
 	ReadMsgUDP(b, oob []byte) (n int, oobn int, flags int, addr *net.UDPAddr, err error)
 }
 
+func supportsHopOOB(conn net.PacketConn) bool {
+	_, ok := conn.(interface {
+		syscall.Conn
+		oobWriteMsgUDP
+	})
+	return ok
+}
+
 type udpHopPacketConn struct {
 	Addr        net.Addr
 	Addrs       []net.Addr
@@ -55,6 +63,7 @@ type udpHopPacketConn struct {
 	prevConn    net.PacketConn
 	currentAddr net.Addr
 	currentConn net.PacketConn
+	useOOB      bool // fixed when the QUIC transport is constructed
 
 	readBufferSize  int
 	writeBufferSize int
@@ -170,13 +179,14 @@ func NewUDPHopPacketConnContext(ctx context.Context, addr *UDPHopAddr, hopInterv
 		prevConn:    nil,
 		currentAddr: curAddr,
 		currentConn: curConn,
+		useOOB:      supportsHopOOB(curConn),
 		recvQueue:   make(chan *udpPacket, packetQueueSize),
 		closeChan:   make(chan struct{}),
 		bufPool:     newHopBufPool(),
 	}
 	go hConn.recvLoop(curConn)
 	go hConn.hopLoop()
-	if _, ok := curConn.(syscall.Conn); !ok {
+	if !hConn.useOOB {
 		// Proxied underlay (no raw socket fd). Hide the OOB/batch surface
 		// from QUIC's capability probes: udpHopPacketConn advertises
 		// ReadMsgUDP/WriteMsgUDP/SyscallConn/ReadBatch, and a transport that
@@ -384,7 +394,9 @@ func (u *udpHopPacketConn) hop() {
 
 	u.connMutex.Lock()
 	defer u.connMutex.Unlock()
-	if u.closed {
+	if u.closed || (u.useOOB && !supportsHopOOB(newConn)) {
+		// QUIC probes the method set once. Keep the working socket if a
+		// replacement cannot send the ancillary data QUIC already uses.
 		_ = newConn.Close()
 		return
 	}
@@ -482,18 +494,15 @@ func (u *udpHopPacketConn) WriteMsgUDP(b, oob []byte, _ *net.UDPAddr) (n, oobn i
 		return 0, 0, net.ErrClosed
 	}
 	wc, ok := u.currentConn.(oobWriteMsgUDP)
-	if !ok {
-		// Proxied transport without a raw socket: degrade to WriteTo so
-		// the packet still reaches the server, just without GSO.
-		n, err := u.currentConn.WriteTo(b, u.currentAddr)
-		return n, 0, err
-	}
 	addr, _ := u.currentAddr.(*net.UDPAddr)
-	if addr == nil {
-		n, err := u.currentConn.WriteTo(b, u.currentAddr)
-		return n, 0, err
+	if ok && addr != nil {
+		return wc.WriteMsgUDP(b, oob, addr)
 	}
-	return wc.WriteMsgUDP(b, oob, addr)
+	if len(oob) != 0 {
+		return 0, 0, errors.New("UDP hop cannot send ancillary data on the active socket")
+	}
+	n, err = u.currentConn.WriteTo(b, u.currentAddr)
+	return n, 0, err
 }
 
 // ReadBatch implements quic-go's (unexported) batchConn interface via Go's

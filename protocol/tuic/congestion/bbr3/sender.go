@@ -50,6 +50,9 @@ type Bbr3Sender struct {
 
 var _ congestion.CongestionControl = &Bbr3Sender{}
 
+// MaxHintBytesPerSecond is the largest supported access-link hint.
+const MaxHintBytesPerSecond = 1 << 40
+
 // NewBbr3Sender builds a sender with DefaultParams. hintBps is the access-link
 // upper bound in bytes per second; zero disables the cap.
 func NewBbr3Sender(maxDatagramSize congestion.ByteCount, hintBps uint64) *Bbr3Sender {
@@ -61,7 +64,7 @@ func NewBbr3SenderWithParams(maxDatagramSize congestion.ByteCount, hintBps uint6
 	if err := params.Validate(); err != nil {
 		panic(err)
 	}
-	if hintBps > 1<<40 {
+	if hintBps > MaxHintBytesPerSecond {
 		panic("bbr3: hint exceeds supported bytes/s")
 	}
 	m := newModel(params, maxDatagramSize)

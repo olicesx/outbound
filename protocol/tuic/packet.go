@@ -1,6 +1,7 @@
 package tuic
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -521,7 +522,13 @@ func (q *quicStreamPacketConn) close() (err error) {
 		}
 		err = stream.Close()
 		if err != nil {
-			return
+			// The command was written in full. A peer may stop reading the
+			// one-shot stream before FIN, as with Authenticate.
+			var streamErr *quic.StreamError
+			if q.quicConn.Context().Err() == nil && errors.As(context.Cause(stream.Context()), &streamErr) {
+				return nil
+			}
+			return err
 		}
 	}
 	return

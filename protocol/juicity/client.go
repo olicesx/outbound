@@ -104,6 +104,9 @@ func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, di
 		}
 		return t.quicConn, nil
 	}
+	if err := common.ValidateCongestionConfig(t.CongestionController, t.CWND); err != nil {
+		return nil, err
+	}
 	transport, addr, err := dialFn(ctx, dialer)
 	if err != nil {
 		return nil, err

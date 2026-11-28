@@ -158,6 +158,9 @@ func (t *clientImpl) getQuicConnLocked(ctx context.Context, dialer netproxy.Dial
 		}
 		return t.quicConn, nil
 	}
+	if err := common.ValidateCongestionConfig(t.CongestionController, t.CWND); err != nil {
+		return nil, err
+	}
 	transport, addr, err := dialFn(ctx, dialer)
 	if err != nil {
 		return nil, err
@@ -445,15 +448,15 @@ func (t *clientImpl) noteMalformedDatagram(ctx context.Context, quicConn quic.Co
 }
 
 func (t *clientImpl) deferQuicConn(quicConn quic.Connection, err error) {
-	var streamErr *quic.StreamError
-	if errors.As(err, &streamErr) {
-		return
-	}
 	// A closed QUIC connection can surface as a temporary net.Error
 	// (stateless reset) or context.Canceled. Those must still retire the
 	// shared tunnel; otherwise getQuicConn keeps handing out the dead conn.
 	if quicConn != nil && quicConn.Context().Err() != nil {
 		t.forceClose(quicConn, err)
+		return
+	}
+	var streamErr *quic.StreamError
+	if errors.As(err, &streamErr) {
 		return
 	}
 	// Only close connection on non-temporary errors. Stream exhaustion is a

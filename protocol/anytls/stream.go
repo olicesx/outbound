@@ -323,7 +323,7 @@ type packetStream struct {
 	// path used to re-run netip.ParseAddrPort on every ReadFrom for an
 	// address that never changes.
 	addrPort     netip.AddrPort
-	udpWriteAddr atomic.Bool
+	udpWriteAddr bool // guarded by writeMutex
 }
 
 func (ps *packetStream) TransportDone() <-chan struct{} {
@@ -409,13 +409,12 @@ func (ps *packetStream) WriteTo(p []byte, addr string) (n int, err error) {
 	// fails that write without pinning the stream to unconnected framing,
 	// which the server could never parse.
 	var tgtAddr []byte
-	sendAddr := !ps.udpWriteAddr.Load()
+	sendAddr := !ps.udpWriteAddr
 	if sendAddr {
 		tgtAddr, err = socks.ParseAddr(addr)
 		if err != nil {
 			return 0, err
 		}
-		ps.udpWriteAddr.Store(true)
 
 		data := pool.Get(1 + len(tgtAddr) + 2 + len(p))
 		defer pool.Put(data)
@@ -425,9 +424,10 @@ func (ps *packetStream) WriteTo(p []byte, addr string) (n int, err error) {
 		binary.BigEndian.PutUint16(data[1+len(tgtAddr):], uint16(len(p)))
 		copy(data[1+len(tgtAddr)+2:], p)
 
-		if _, err := writeDataFrames(ps.session, ps.id, data, unixNanoToTime(ps.writeDeadline.Load())); err != nil {
+		if err := ps.writePacket(data); err != nil {
 			return 0, err
 		}
+		ps.udpWriteAddr = true
 		return len(p), nil
 	}
 
@@ -436,10 +436,22 @@ func (ps *packetStream) WriteTo(p []byte, addr string) (n int, err error) {
 	binary.BigEndian.PutUint16(data, uint16(len(p)))
 	copy(data[2:], p)
 
-	if _, err := writeDataFrames(ps.session, ps.id, data, unixNanoToTime(ps.writeDeadline.Load())); err != nil {
+	if err := ps.writePacket(data); err != nil {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+// writePacket retains the one-frame fast path and sends a split datagram under
+// a single session write when it crosses the frame payload limit.
+func (ps *packetStream) writePacket(data []byte) error {
+	deadline := unixNanoToTime(ps.writeDeadline.Load())
+	if len(data) <= maxFramePayloadSize {
+		frame := newFrame(cmdPSH, ps.id)
+		frame.data = data
+		return writeFrameWithDeadline(ps.session, frame, deadline, true)
+	}
+	return writeDataFramesBatch(ps.session, ps.id, [][]byte{data}, deadline)
 }
 
 // WriteBatch implements netproxy.PacketBatchWriter: several datagrams for
@@ -469,7 +481,7 @@ func (ps *packetStream) WriteBatch(items []netproxy.BatchItem) (n int, err error
 	// Same contract as WriteTo: decide the addressing mode for this batch
 	// before building any frame, and only after the first address parses,
 	// so a malformed address cannot pin the stream to unconnected framing.
-	sendAddr := !ps.udpWriteAddr.Load()
+	sendAddr := !ps.udpWriteAddr
 	var firstTgtAddr []byte
 	if sendAddr {
 		firstAddr := ps.addr
@@ -480,7 +492,6 @@ func (ps *packetStream) WriteBatch(items []netproxy.BatchItem) (n int, err error
 		if err != nil {
 			return 0, err
 		}
-		ps.udpWriteAddr.Store(true)
 	}
 	datas := make([][]byte, 0, len(items))
 	for i, item := range items {
@@ -504,9 +515,10 @@ func (ps *packetStream) WriteBatch(items []netproxy.BatchItem) (n int, err error
 			pool.Put(data)
 		}
 	}()
-	if _, err := writeDataFramesBatch(ps.session, ps.id, datas, unixNanoToTime(ps.writeDeadline.Load())); err != nil {
+	if err := writeDataFramesBatch(ps.session, ps.id, datas, unixNanoToTime(ps.writeDeadline.Load())); err != nil {
 		return 0, err
 	}
+	ps.udpWriteAddr = true
 	return len(items), nil
 }
 

@@ -68,27 +68,25 @@ func (h rawHeader) Length() uint16 {
 }
 
 func writeFrame(session *session, frame frame) (int, error) {
-	return writeFrameWithDeadline(session, frame, time.Time{})
+	if err := writeFrameWithDeadline(session, frame, time.Time{}, false); err != nil {
+		return 0, err
+	}
+	return len(frame.data), nil
 }
 
-func writeFrameWithDeadline(session *session, frame frame, deadline time.Time) (int, error) {
+func writeFrameWithDeadline(session *session, frame frame, deadline time.Time, packetWrite bool) error {
 	size, err := encodedFrameSize(frame)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	session.connLock.Lock()
 	if session.closed.Load() {
 		session.connLock.Unlock()
-		return 0, net.ErrClosed
+		return net.ErrClosed
 	}
 	buffer := session.borrowWriteBuf(size)
 	encodeFrame(buffer, frame)
-	if _, err = session.writeConnLockedWithDeadline(buffer, deadline); err != nil {
-		session.connLock.Unlock()
-		return 0, err
-	}
-	session.connLock.Unlock()
-	return len(frame.data), nil
+	return session.writeAndUnlock(buffer, deadline, packetWrite)
 }
 
 func writeFrames(session *session, frames ...frame) (int, error) {
@@ -150,10 +148,9 @@ func encodeFrame(dst []byte, frame frame) int {
 // netproxy.PacketBatchWriter path so N datagrams cost one syscall instead
 // of N. Sizes must be pre-validated; deadline semantics match
 // writeConnLockedWithDeadline.
-func writeDataFramesBatch(session *session, sid uint32, datas [][]byte, deadline time.Time) (int, error) {
+func writeDataFramesBatch(session *session, sid uint32, datas [][]byte, deadline time.Time) error {
 	frames := make([]frame, 0, len(datas))
 	totalSize := 0
-	totalData := 0
 	for _, data := range datas {
 		for written := 0; written < len(data); {
 			end := written + maxFramePayloadSize
@@ -164,33 +161,27 @@ func writeDataFramesBatch(session *session, sid uint32, datas [][]byte, deadline
 			frame.data = data[written:end]
 			size, err := encodedFrameSize(frame)
 			if err != nil {
-				return 0, err
+				return err
 			}
 			frames = append(frames, frame)
 			totalSize += size
-			totalData += len(frame.data)
 			written = end
 		}
 	}
 	if len(frames) == 0 {
-		return 0, nil
+		return nil
 	}
 	session.connLock.Lock()
 	if session.closed.Load() {
 		session.connLock.Unlock()
-		return 0, net.ErrClosed
+		return net.ErrClosed
 	}
 	buffer := session.borrowWriteBuf(totalSize)
 	offset := 0
 	for _, frame := range frames {
 		offset += encodeFrame(buffer[offset:], frame)
 	}
-	if _, err := session.writeConnLockedWithDeadline(buffer, deadline); err != nil {
-		session.connLock.Unlock()
-		return 0, err
-	}
-	session.connLock.Unlock()
-	return totalData, nil
+	return session.writeAndUnlock(buffer, deadline, true)
 }
 
 func writeDataFrames(session *session, sid uint32, data []byte, deadline time.Time) (int, error) {
@@ -206,7 +197,7 @@ func writeDataFrames(session *session, sid uint32, data []byte, deadline time.Ti
 		}
 		frame := newFrame(cmdPSH, sid)
 		frame.data = data[written:end]
-		if _, err := writeFrameWithDeadline(session, frame, deadline); err != nil {
+		if err := writeFrameWithDeadline(session, frame, deadline, false); err != nil {
 			return written, err
 		}
 		written = end

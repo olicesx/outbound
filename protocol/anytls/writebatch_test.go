@@ -2,7 +2,10 @@ package anytls
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -201,5 +204,77 @@ func TestWriteBatchMalformedAddrDoesNotPinUnconnectedFraming(t *testing.T) {
 	}
 	if !bytes.Equal(refConn.bytes(), conn.bytes()) {
 		t.Fatal("write after a malformed batch lost connected framing: the stream was pinned to unconnected framing")
+	}
+}
+
+func TestPacketStreamRetriesFirstWriteAfterExpiredDeadline(t *testing.T) {
+	const addr = "1.2.3.4:53"
+	payload := []byte("request")
+	for _, mode := range []string{"single", "batch"} {
+		t.Run(mode, func(t *testing.T) {
+			rc := &batchRecConn{}
+			s := newBatchTestSession(t, rc)
+			ps := &packetStream{stream: newStream(s, 7), addr: addr}
+			send := func() (int, error) { return ps.WriteTo(payload, addr) }
+			want := len(payload)
+			if mode == "batch" {
+				send = func() (int, error) { return ps.WriteBatch([]netproxy.BatchItem{{Data: payload, Addr: addr}}) }
+				want = 1
+			}
+			if err := ps.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := send(); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) || len(rc.writes) != 0 {
+				t.Fatalf("expired first write = (%d, %v), transport writes = %d", n, err, len(rc.writes))
+			}
+			if err := ps.SetWriteDeadline(time.Time{}); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := send(); n != want || err != nil {
+				t.Fatalf("retried first write = (%d, %v), want (%d, nil)", n, err, want)
+			}
+			first := rc.bytes()[headerOverHeadSize:]
+			wantPrefix := []byte{1, 1, 1, 2, 3, 4, 0, 53, 0, byte(len(payload))}
+			if !bytes.Equal(first, append(wantPrefix, payload...)) {
+				t.Fatalf("first datagram = %x, want address then payload", first)
+			}
+			if n, err := send(); n != want || err != nil {
+				t.Fatalf("second write = (%d, %v)", n, err)
+			}
+			second := rc.writes[1][headerOverHeadSize:]
+			if !bytes.Equal(second, append([]byte{0, byte(len(payload))}, payload...)) {
+				t.Fatalf("second datagram = %x, want length then payload", second)
+			}
+		})
+	}
+}
+
+type partialPacketSessionConn struct {
+	batchRecConn
+}
+
+func (c *partialPacketSessionConn) Write(p []byte) (int, error) {
+	_, _ = c.batchRecConn.Write(p[:1])
+	return 1, io.ErrUnexpectedEOF
+}
+
+func TestPacketWriteRetiresSessionAfterPartialFrame(t *testing.T) {
+	c := &partialPacketSessionConn{}
+	s := newBatchTestSession(t, &c.batchRecConn)
+	s.conn = c
+	const addr = "1.2.3.4:53"
+	first := &packetStream{stream: newStream(s, 1), addr: addr}
+	sibling := &packetStream{stream: newStream(s, 3), addr: addr}
+	if _, err := first.WriteTo([]byte("payload"), addr); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("partial write error = %v", err)
+	}
+	if !s.Closed() || !c.closed {
+		t.Fatal("partially written frame left the session reusable")
+	}
+	if n, err := sibling.WriteBatch([]netproxy.BatchItem{{Data: []byte("next"), Addr: addr}}); n != 0 || !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("sibling write on retired session = (%d, %v)", n, err)
+	}
+	if len(c.writes) != 1 {
+		t.Fatalf("transport writes = %d, want 1", len(c.writes))
 	}
 }

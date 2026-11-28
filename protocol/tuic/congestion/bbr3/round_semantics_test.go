@@ -28,9 +28,10 @@ import (
 //   - a round cannot advance until the sender has put a new packet on the wire
 //     after the boundary, so a round can never be shorter than that packet's
 //     RTT: rounds are timed by packet exchange, not by ack events;
-//   - a loss-only event carries no ack, and quic-go only declares lost the
-//     packets at or below the largest acked packet number, so the loss path
-//     cannot cross a boundary either.
+//   - a loss-only event carries no ack, and a lost packet number can exceed
+//     the round boundary: quic-go bounds loss detection by the peer's largest
+//     acked number, which can be a non-ack-eliciting packet that never reaches
+//     the acked vector. Rounds therefore advance on acked packets only.
 
 // roundDriver drives the sender through the congestion-control interface the way
 // quic-go's sentPacketHandler does (bytesInFlight includes the packet being sent
@@ -160,10 +161,8 @@ func TestPipelinedWindowsAdvanceOneRoundEach(t *testing.T) {
 }
 
 // TestLossOnlyEventCannotAdvanceARound pins the loss path. quic-go reports a
-// loss-only event (no acked packets) when its loss timer fires, and it only
-// declares lost the packets at or below the largest acked packet number, which
-// the previous test's invariant keeps at or below the round boundary. The loss
-// path therefore carries no packet number that can cross the boundary.
+// loss-only event (no acked packets) when its loss timer fires. The lost packet
+// numbers may lie beyond the round boundary, so none of them may end a round.
 func TestLossOnlyEventCannotAdvanceARound(t *testing.T) {
 	d := newRoundDriver()
 	d.send(50)
@@ -175,15 +174,56 @@ func TestLossOnlyEventCannotAdvanceARound(t *testing.T) {
 	if d.rounds() != 1 {
 		t.Fatalf("round = %d after a loss-only event inside the round, want 1", d.rounds())
 	}
+	d.lose(51, 52)
+	if d.rounds() != 1 {
+		t.Fatalf("round = %d after a loss-only event beyond the boundary, want 1", d.rounds())
+	}
 	if got := d.s.model.roundEnd; got != 50 {
 		t.Fatalf("round boundary = %d after a loss-only event, want 50", got)
 	}
 }
 
-// TestRoundBoundaryNeverLagsTheLargestAck pins the invariant the loss argument
-// rests on: after every ack event the boundary is at or above the largest entity
-// acknowledged so far, so a later loss declaration - which quic-go bounds by
-// that largest acked packet number - can never pass the boundary.
+// TestLostPacketBeyondLastAckedCannotAdvanceARound covers the ACK-driven form.
+// The peer's largest acked can be a non-ack-eliciting packet above every acked
+// data packet, which lets that ACK declare a loss above the round boundary.
+func TestLostPacketBeyondLastAckedCannotAdvanceARound(t *testing.T) {
+	ackedTwo := congestion.AckedPacketInfo{PacketNumber: 2, BytesAcked: 1200}
+	lostThree := []congestion.LostPacketInfo{{PacketNumber: 3, BytesLost: 1200}}
+	for name, report := range map[string]func(*roundDriver){
+		"with the ack": func(d *roundDriver) {
+			d.inFly -= 2400
+			d.s.OnCongestionEventEx(d.inFly+2400, d.now, []congestion.AckedPacketInfo{ackedTwo}, lostThree)
+		},
+		"loss-only before the ack": func(d *roundDriver) {
+			d.inFly -= 1200
+			d.s.OnCongestionEventEx(d.inFly+1200, d.now, nil, lostThree)
+			d.ack(2)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := newRoundDriver()
+			d.send(2) // 1, 2
+			d.ack(1)  // round 1, boundary = 2
+			d.send(2) // 3 (lost), 4
+			report(d)
+			if d.rounds() != 1 {
+				t.Fatalf("round = %d after losing packet 3 beyond the boundary, want 1", d.rounds())
+			}
+			if got := d.s.model.roundEnd; got != 2 {
+				t.Fatalf("round boundary = %d, want 2", got)
+			}
+			d.ack(4)
+			if d.rounds() != 2 {
+				t.Fatalf("round = %d after acking a packet sent beyond the boundary, want 2", d.rounds())
+			}
+		})
+	}
+}
+
+// TestRoundBoundaryNeverLagsTheLargestAck pins that the boundary follows the
+// acked stream: after every ack event it is at or above the largest packet
+// acknowledged so far. The loss path does not rely on this, since a peer's
+// largest acked number can be a non-ack-eliciting packet.
 func TestRoundBoundaryNeverLagsTheLargestAck(t *testing.T) {
 	d := newRoundDriver()
 	var largest congestion.PacketNumber

@@ -219,18 +219,15 @@ func (b *Bbr3Sender) onAckEvent(now time.Time, acked []congestion.AckedPacketInf
 	b.expireHint(now)
 
 	var ackedBytes, lostBytes congestion.ByteCount
-	var maxPn congestion.PacketNumber = -1
+	var maxAckedPn congestion.PacketNumber = -1
 	for _, p := range acked {
 		ackedBytes += p.BytesAcked
-		if p.PacketNumber > maxPn {
-			maxPn = p.PacketNumber
+		if p.PacketNumber > maxAckedPn {
+			maxAckedPn = p.PacketNumber
 		}
 	}
 	for _, p := range lost {
 		lostBytes += p.BytesLost
-		if p.PacketNumber > maxPn {
-			maxPn = p.PacketNumber
-		}
 	}
 
 	b.maybeApplimited(priorInFlight)
@@ -240,7 +237,11 @@ func (b *Bbr3Sender) onAckEvent(now time.Time, acked []congestion.AckedPacketInf
 		m.bytesInFlight = 0
 	}
 
-	roundStart := m.accountEvent(ackedBytes, lostBytes, len(lost), maxPn)
+	// Only an acknowledged packet ends a round. quic-go bounds loss detection
+	// by the peer's largest acked number, which can be a non-ack-eliciting
+	// packet that never reaches the acked vector, and loss-timer events carry
+	// no acks at all.
+	roundStart := m.accountEvent(ackedBytes, lostBytes, len(lost), maxAckedPn)
 
 	// One call into the shared reference estimator for the whole ack/loss
 	// vector: it owns the per-packet send records, the delivery-rate sample and

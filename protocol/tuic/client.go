@@ -65,6 +65,14 @@ type clientImpl struct {
 
 	udpIncomingPacketsMap sync.Map
 
+	// udpAssociations is the number of live UDP associations, i.e. entries
+	// in udpIncomingPacketsMap. The ring reads it as its placement gate for
+	// UDP (see udpAssociationsPerConn) under its permit, where no other UDP
+	// dial can be inserting. It changes only alongside the table, in
+	// addUDPAssociation and the two take methods, so the two are equal
+	// whenever no insertion or removal is in flight.
+	udpAssociations atomic.Int64
+
 	streamSem chan struct{}
 
 	// malformedDatagrams counts inbound datagrams the shared tunnel dropped
@@ -256,8 +264,8 @@ func (t *clientImpl) handleUniStream(quicConn quic.Connection) (err error) {
 			defer func() {
 				t.deferQuicConn(quicConn, err)
 				if err != nil && assocId != 0 {
-					if val, loaded := t.udpIncomingPacketsMap.LoadAndDelete(assocId); loaded {
-						_ = val.(*Packets).Close()
+					if q := t.takeUDPAssociationByID(assocId); q != nil {
+						_ = q.Close()
 					}
 				}
 				stream.CancelRead(0)
@@ -329,8 +337,8 @@ func (t *clientImpl) processDatagram(quicConn quic.Connection, message []byte) {
 	defer func() {
 		t.deferQuicConn(quicConn, err)
 		if err != nil && assocId != 0 {
-			if val, loaded := t.udpIncomingPacketsMap.LoadAndDelete(assocId); loaded {
-				_ = val.(*Packets).Close()
+			if q := t.takeUDPAssociationByID(assocId); q != nil {
+				_ = q.Close()
 			}
 		}
 	}()
@@ -498,8 +506,9 @@ func (t *clientImpl) forceClose(quicConn quic.Connection, err error) {
 	// period after the transport is already dead. This runs outside
 	// connMutex and drains/releases each queue via Packets.Close.
 	t.udpIncomingPacketsMap.Range(func(key, value any) bool {
-		_ = value.(*Packets).Close()
-		t.udpIncomingPacketsMap.Delete(key)
+		if q := t.takeUDPAssociation(key.(uint16), value.(*Packets)); q != nil {
+			_ = q.Close()
+		}
 		return true
 	})
 	// Give the transport its grace period. The timer only captures and
@@ -625,14 +634,10 @@ func (t *clientImpl) ListenPacketWithDialer(ctx context.Context, metadata *proto
 		return nil, err
 	}
 
-	var connId uint16
 	incomingPackets := NewPackets()
-	for {
-		connId = uint16(fastrand.Intn(0xFFFF))
-		_, loaded := t.udpIncomingPacketsMap.LoadOrStore(connId, incomingPackets)
-		if !loaded {
-			break
-		}
+	connId, ok := t.addUDPAssociation(incomingPackets)
+	if !ok {
+		return nil, common.ErrUDPAssociationsExhausted
 	}
 	pc := &quicStreamPacketConn{
 		connId:                connId,
@@ -643,10 +648,76 @@ func (t *clientImpl) ListenPacketWithDialer(ctx context.Context, metadata *proto
 		deferQuicConnFn:       t.deferQuicConn,
 		done:                  t.done,
 		closeDeferFn: func() {
-			t.udpIncomingPacketsMap.CompareAndDelete(connId, incomingPackets)
+			t.takeUDPAssociation(connId, incomingPackets)
 		},
 	}
 	return pc, nil
+}
+
+// udpAssociationIDSpace is the number of association IDs: 0..0xFFFE.
+const udpAssociationIDSpace = 0xFFFF
+
+// addUDPAssociation registers packets under a free association ID and
+// counts the association. It is the only way an entry enters the table. The
+// count moves first, so it is never below the table size, whatever a
+// concurrent taker does between the two steps.
+func (t *clientImpl) addUDPAssociation(packets *Packets) (connId uint16, ok bool) {
+	t.udpAssociations.Add(1)
+	connId, ok = allocateConnId(&t.udpIncomingPacketsMap, packets, udpAssociationIDSpace)
+	if !ok {
+		t.udpAssociations.Add(-1)
+	}
+	return connId, ok
+}
+
+// allocateConnId registers packets in table under a free ID out of
+// spaceSize IDs (0..spaceSize-1). The sweep starts at a random ID so the
+// space fills uniformly, and it visits every ID at most once: at the few
+// percent of the space udpAssociationsPerConn keeps in use, one probe is
+// the norm, and even a full table costs a single pass and is reported
+// instead of being searched forever. An ID released while the sweep is
+// already past it is not seen by this allocation; at that occupancy it does
+// not arise in practice, and the ring answers a refusal with another
+// connection.
+func allocateConnId(table *sync.Map, packets *Packets, spaceSize int) (uint16, bool) {
+	start := fastrand.Intn(spaceSize)
+	for i := 0; i < spaceSize; i++ {
+		connId := uint16((start + i) % spaceSize)
+		if _, loaded := table.LoadOrStore(connId, packets); !loaded {
+			return connId, true
+		}
+	}
+	return 0, false
+}
+
+// takeUDPAssociation removes the association that owns connId and returns
+// its queue, or nil when the ID was already taken (by forceClose, or by a
+// packet error) or now belongs to a newer association. The owner check is
+// what lets a Close that arrives late leave a reused ID alone.
+func (t *clientImpl) takeUDPAssociation(connId uint16, owner *Packets) *Packets {
+	if !t.udpIncomingPacketsMap.CompareAndDelete(connId, owner) {
+		return nil
+	}
+	t.udpAssociations.Add(-1)
+	return owner
+}
+
+// takeUDPAssociationByID removes whichever association holds connId and
+// returns its queue, or nil when none does. The inbound packet error paths
+// know only the ID on the wire, so they cannot check an owner. Together
+// with takeUDPAssociation this is the only way an entry leaves the table.
+func (t *clientImpl) takeUDPAssociationByID(connId uint16) *Packets {
+	val, loaded := t.udpIncomingPacketsMap.LoadAndDelete(connId)
+	if !loaded {
+		return nil
+	}
+	t.udpAssociations.Add(-1)
+	return val.(*Packets)
+}
+
+// udpAssociationCount reports the live UDP associations on this connection.
+func (t *clientImpl) udpAssociationCount() int64 {
+	return t.udpAssociations.Load()
 }
 
 func (t *clientImpl) setOnClose(f func()) {

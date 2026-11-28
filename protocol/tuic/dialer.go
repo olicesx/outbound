@@ -82,7 +82,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 				CWND:                  cwnd,
 				MaxUdpRelayPacketSize: maxDatagramFrameSize,
 			}, true, 64)
-		}, 10),
+		}, 10, udpAssociationsPerConn),
 		proxyAddress: header.ProxyAddress,
 		proxyUDPAddr: proxyUDPAddr,
 		nextDialer:   nextDialer,

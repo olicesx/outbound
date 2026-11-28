@@ -141,7 +141,7 @@ func TestClientRingCanceledCtxFailsWithoutNewClient(t *testing.T) {
 	r := newClientRing(func(func(int64)) *clientImpl {
 		constructed.Add(1)
 		return newClientImpl(&ClientOption{}, true, 8)
-	}, 0)
+	}, 0, udpAssociationsPerConn)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -172,7 +172,7 @@ func TestWriteToBadAddrDoesNotForceCloseSharedClient(t *testing.T) {
 	c.setOnClose(func() { onCloseFired <- struct{}{} })
 
 	secondPackets := NewPackets() // another user's association sharing this client
-	c.udpIncomingPacketsMap.Store(uint16(0x2222), secondPackets)
+	registerUDPAssociationAt(c, 0x2222, secondPackets)
 	victimPackets := NewPackets()
 	victimId := uint16(0x1111)
 	pc := &quicStreamPacketConn{
@@ -182,10 +182,10 @@ func TestWriteToBadAddrDoesNotForceCloseSharedClient(t *testing.T) {
 		udpRelayMode:    common.NATIVE,
 		deferQuicConnFn: c.deferQuicConn,
 		closeDeferFn: func() {
-			c.udpIncomingPacketsMap.CompareAndDelete(victimId, victimPackets)
+			c.takeUDPAssociation(victimId, victimPackets)
 		},
 	}
-	c.udpIncomingPacketsMap.Store(victimId, victimPackets)
+	registerUDPAssociationAt(c, victimId, victimPackets)
 
 	if _, werr := pc.WriteTo([]byte("x"), "bad-addr-without-port"); werr == nil {
 		t.Fatal("expected addressForAddr parse error, got nil")

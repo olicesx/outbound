@@ -34,6 +34,9 @@ var (
 	ErrClientClosed    = errors.New("client closed")
 	ErrClientClosing   = errors.New("client closing")
 	ErrOperationHold   = errors.New("hold on")
+	// ErrUDPAssociationsExhausted reports that every UDP association ID of a
+	// QUIC connection is in use. Another connection has a free ID space.
+	ErrUDPAssociationsExhausted = errors.New("too many UDP associations")
 )
 
 // ============================================================================

@@ -75,12 +75,14 @@ func loopbackEchoTarget(t *testing.T) net.Addr {
 	return ln.Addr()
 }
 
-// startUDPEchoTarget echoes datagrams back to their sender.
+// startUDPEchoTarget echoes datagrams back to their sender, on the
+// loopback address the in-test server listens on.
 func startUDPEchoTarget(t *testing.T) net.Addr {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	host := udpLoopbackHost(t)
+	pc, err := net.ListenPacket("udp", net.JoinHostPort(host, "0"))
 	if err != nil {
-		t.Fatalf("udp echo listen: %v", err)
+		t.Fatalf("udp echo listen on %s: %v", host, err)
 	}
 	t.Cleanup(func() { _ = pc.Close() })
 	go func() {
@@ -342,27 +344,55 @@ type tuicE2EServer struct {
 	done  chan struct{}
 }
 
-// startTUICE2EServer runs the in-test TUIC v5 server on a real loopback UDP
-// socket. rejectAuth forces the AuthenticationFailed path regardless of the
-// credentials the client presents.
+// tuicE2EServerOptions configures startTUICE2EServerWithOptions.
+type tuicE2EServerOptions struct {
+	// host is the loopback IP the server listens on.
+	host string
+	// password is the credential the Authentication command must carry.
+	password string
+	// rejectAuth forces the AuthenticationFailed path regardless of the
+	// credentials the client presents.
+	rejectAuth bool
+	// maxBidiStreams caps the bidirectional streams the server accepts
+	// (0 keeps quic-go's default).
+	maxBidiStreams int64
+}
+
+// startTUICE2EServer runs the in-test TUIC v5 server on the loopback
+// address that answers UDP on this host.
 func startTUICE2EServer(t *testing.T, password string, rejectAuth bool) *tuicE2EServer {
 	t.Helper()
-	listener, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
-		Certificates: []tls.Certificate{e2eSelfSignedCert(t)},
-		NextProtos:   []string{"h3"},
-		MinVersion:   tls.VersionTLS13,
-	}, &quic.Config{
+	return startTUICE2EServerWithOptions(t, tuicE2EServerOptions{
+		host:       udpLoopbackHost(t),
+		password:   password,
+		rejectAuth: rejectAuth,
+	})
+}
+
+// startTUICE2EServerWithOptions runs the in-test TUIC v5 server on a real
+// loopback UDP socket.
+func startTUICE2EServerWithOptions(t *testing.T, opts tuicE2EServerOptions) *tuicE2EServer {
+	t.Helper()
+	quicConfig := &quic.Config{
 		EnableDatagrams: true,
 		Allow0RTT:       true,
 		MaxIdleTimeout:  30 * time.Second,
-	})
+	}
+	if opts.maxBidiStreams > 0 {
+		quicConfig.MaxIncomingStreams = opts.maxBidiStreams
+	}
+	listener, err := quic.ListenAddr(net.JoinHostPort(opts.host, "0"), &tls.Config{
+		Certificates: []tls.Certificate{e2eSelfSignedCert(t)},
+		NextProtos:   []string{"h3"},
+		MinVersion:   tls.VersionTLS13,
+	}, quicConfig)
 	if err != nil {
-		t.Fatalf("quic listen: %v", err)
+		t.Fatalf("quic listen on %s: %v", opts.host, err)
 	}
 	s := &tuicE2EServer{
 		listener:   listener,
-		password:   password,
-		rejectAuth: rejectAuth,
+		password:   opts.password,
+		rejectAuth: opts.rejectAuth,
 		done:       make(chan struct{}),
 	}
 	t.Cleanup(s.Close)

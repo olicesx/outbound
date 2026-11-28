@@ -176,7 +176,7 @@ func TestMalformedDatagramIsNotCountedForValidTraffic(t *testing.T) {
 	c := newCancelTestClient(t, conn)
 
 	packets := NewPackets()
-	c.udpIncomingPacketsMap.Store(uint16(7), packets)
+	registerUDPAssociationAt(c, 7, packets)
 
 	msg := buildPacketMessageForTest(t, 7, []byte("hello"))
 	c.processDatagram(conn, msg)

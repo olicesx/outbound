@@ -15,14 +15,16 @@ import (
 )
 
 // IsFailoverError reports whether err is one of the conditions the ring
-// treats as "try the next client": stream exhaustion, a closed client, or
-// the capability hold gate. Stream exhaustion additionally matches the
-// quic-go native *quic.StreamLimitReachedError via its message, so a raw
-// transport error fails over instead of aborting the attempt.
+// treats as "try the next client": stream exhaustion, a closed client, the
+// capability hold gate, or a connection whose UDP association IDs are all
+// taken. Stream exhaustion additionally matches the quic-go native
+// *quic.StreamLimitReachedError via its message, so a raw transport error
+// fails over instead of aborting the attempt.
 func IsFailoverError(err error) bool {
 	return outbounderrors.IsStreamExhausted(err) ||
 		errors.Is(err, outbounderrors.ErrClientClosed) ||
-		errors.Is(err, outbounderrors.ErrOperationHold)
+		errors.Is(err, outbounderrors.ErrOperationHold) ||
+		errors.Is(err, outbounderrors.ErrUDPAssociationsExhausted)
 }
 
 // Node is one ring entry: the protocol client plus its last reported
@@ -199,6 +201,21 @@ func (r *Ring[T]) Len() int {
 	}
 	defer r.sem.Release(1)
 	return r.ring.Len()
+}
+
+// CurrentCapability reports the capability the ring's current client last
+// reported (-1 when none arrived yet, or when the ring is empty). It waits
+// for the ring permit, so it must not be called from inside an attempt
+// callback, which already holds that permit.
+func (r *Ring[T]) CurrentCapability() int64 {
+	if err := r.sem.Acquire(context.Background(), 1); err != nil {
+		return -1
+	}
+	defer r.sem.Release(1)
+	if r.current == nil {
+		return -1
+	}
+	return r.current.Value.(*Node[T]).Capability()
 }
 
 // Close tears down every client in the ring.

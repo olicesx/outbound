@@ -62,7 +62,7 @@ func TestAcquireUniStreamSlotSucceedsAfterRelease(t *testing.T) {
 }
 
 func TestClientRingCloseClosesClientsAndClearsRing(t *testing.T) {
-	r := newClientRing(func(func(int64)) *clientImpl { return &clientImpl{} }, 0)
+	r := newClientRing(func(func(int64)) *clientImpl { return &clientImpl{} }, 0, udpAssociationsPerConn)
 	// Prime the ring with one client (a failure on a freshly created node
 	// returns directly without walking), then fail on it so a second
 	// client is inserted and the attempt succeeds there.

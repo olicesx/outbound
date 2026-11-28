@@ -13,6 +13,8 @@ var (
 	ErrClientClosed       = outbounderrors.ErrClientClosed
 	ErrTooManyOpenStreams = outbounderrors.ErrStreamExhausted
 	ErrHoldOn             = outbounderrors.ErrOperationHold
+
+	ErrUDPAssociationsExhausted = outbounderrors.ErrUDPAssociationsExhausted
 )
 
 type DialFunc func(ctx context.Context, dialer netproxy.Dialer) (transport *quic.Transport, addr net.Addr, err error)

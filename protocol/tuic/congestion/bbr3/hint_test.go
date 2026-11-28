@@ -62,10 +62,27 @@ func TestHintValidatesAndRevokesThroughCallbacks(t *testing.T) {
 	if h.s.HintStatus().State != "validated" {
 		t.Fatal("did not revalidate after clean evidence")
 	}
-	// Loss without an ACK vector is a real QUIC callback, including ECN with zero.
+	// ECN is reported by the legacy callback with zero lost bytes.
 	h.s.OnCongestionEvent(h.pn, 0, h.inflight)
 	if h.s.HintStatus().State != "revoked" {
 		t.Fatal("ECN did not revoke")
+	}
+}
+
+func TestHintCountsLossOnceAcrossCongestionCallbacks(t *testing.T) {
+	h := newHintTraffic(100_000, true)
+	for range 150 {
+		h.step(1000)
+	}
+	if h.s.HintStatus().State != "validated" {
+		t.Fatal("hint did not validate")
+	}
+	h.s.OnCongestionEvent(h.pn, 1000, h.inflight)
+	h.s.OnCongestionEventEx(h.inflight, h.now, nil, []congestion.LostPacketInfo{
+		{PacketNumber: h.pn, BytesLost: 1000},
+	})
+	if st := h.s.HintStatus(); st.RejectionsTotal["loss"] != 1 || st.Withdrawals["loss"] != 1 {
+		t.Fatalf("one reported loss must reject and withdraw the hint once: %+v", st)
 	}
 }
 

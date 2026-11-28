@@ -191,15 +191,13 @@ func (b *Bbr3Sender) GetCongestionWindow() congestion.ByteCount {
 func (b *Bbr3Sender) OnPacketAcked(number congestion.PacketNumber, ackedBytes congestion.ByteCount, priorInFlight congestion.ByteCount, eventTime time.Time) {
 }
 
-// OnCongestionEvent withdraws hint authorization for loss or ECN signals.
+// OnCongestionEvent handles ECN signals, which arrive with zero lost bytes.
+// Packet losses are reported by OnCongestionEventEx, including on loss timer expiry.
 func (b *Bbr3Sender) OnCongestionEvent(number congestion.PacketNumber, lostBytes congestion.ByteCount, priorInFlight congestion.ByteCount) {
-	// This callback also carries ECN and timer-only loss without a vector event.
-	// Revoke the hint here; vector loss accounting remains in onAckEvent.
-	reason := reasonEcnOrTimer
-	if lostBytes > 0 {
-		reason = reasonLoss
+	if lostBytes != 0 {
+		return
 	}
-	b.revokeHint(time.Now(), reason)
+	b.revokeHint(time.Now(), reasonEcnOrTimer)
 	b.recalc()
 }
 

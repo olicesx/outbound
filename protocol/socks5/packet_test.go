@@ -400,3 +400,29 @@ func TestPktConnReadFromMalformedDatagramIsDropped(t *testing.T) {
 		})
 	}
 }
+
+type shortPacketWriter struct {
+	netproxy.PacketConn
+	short bool
+}
+
+func (w *shortPacketWriter) WriteTo(p []byte, _ string) (int, error) {
+	if w.short {
+		return len(p) - 1, nil
+	}
+	return len(p), nil
+}
+
+func TestPktConnBatchFallbackRejectsShortWireWrite(t *testing.T) {
+	const target = "192.0.2.1:53"
+	underlay := &shortPacketWriter{short: true}
+	c := NewPktConn(underlay, "127.0.0.1:1080", target, nil)
+	items := []netproxy.BatchItem{{Addr: target}}
+	if n, err := c.WriteBatch(items); n != 0 || !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("short batch = (%d, %v), want (0, short write)", n, err)
+	}
+	underlay.short = false
+	if n, err := c.WriteBatch(items); n != 1 || err != nil {
+		t.Fatalf("empty datagram batch = (%d, %v), want (1, nil)", n, err)
+	}
+}

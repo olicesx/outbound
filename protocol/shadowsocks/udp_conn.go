@@ -3,6 +3,7 @@ package shadowsocks
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"strconv"
@@ -30,6 +31,9 @@ import (
 // func isUDPCipherCacheEnabled() bool {
 //     return atomic.LoadInt32(&enableUDPCipherCache) == 1
 // }
+
+// maxUDPWireSize covers the full 16-bit length used by UDP underlays.
+const maxUDPWireSize = 1<<16 - 1
 
 type UdpConn struct {
 	netproxy.PacketConn
@@ -403,10 +407,15 @@ func encryptUDPInPlace(key *Key, buf []byte, payloadLen int, reusedInfo []byte) 
 	return buf[:key.CipherConf.SaltLen+len(encrypted)], nil
 }
 
-func (c *UdpConn) ReadFrom(b []byte) (n int, addr netip.AddrPort, err error) {
-	enc := pool.Get(len(b) + c.cipherConf.SaltLen)
-	defer pool.Put(enc)
-	n, addr, err = c.PacketConn.ReadFrom(enc)
+func (c *UdpConn) ReadFrom(b []byte) (int, netip.AddrPort, error) {
+	// The underlay may silently truncate. Receive the whole datagram to
+	// authenticate it before checking whether the decoded payload fits.
+	enc := b
+	if len(enc) < maxUDPWireSize {
+		enc = pool.Get(maxUDPWireSize)
+		defer pool.Put(enc)
+	}
+	n, _, err := c.PacketConn.ReadFrom(enc)
 	if err != nil {
 		return 0, netip.AddrPort{}, err
 	}
@@ -415,23 +424,22 @@ func (c *UdpConn) ReadFrom(b []byte) (n int, addr netip.AddrPort, err error) {
 		CipherConf: c.cipherConf,
 		MasterKey:  c.masterKey,
 	}
-
-	n, err = DecryptUDP(b, key, enc[:n], ShadowsocksReusedInfo)
-
+	// Open in place after the salt, which is still needed for replay checks.
+	saltLen := c.cipherConf.SaltLen
+	plain := enc[saltLen:]
+	n, err = DecryptUDP(plain, key, enc[:n], ShadowsocksReusedInfo)
 	if err != nil {
 		return 0, netip.AddrPort{}, err
 	}
-
-	if c.bloom != nil {
-		if exist := c.bloom.ExistOrAdd(enc[:c.cipherConf.SaltLen]); exist {
-			err = protocol.ErrReplayAttack
-			return
-		}
+	if c.bloom != nil && c.bloom.ExistOrAdd(enc[:saltLen]) {
+		return 0, netip.AddrPort{}, protocol.ErrReplayAttack
 	}
-	payload, addr, err := splitDecryptedUdp(b[:n])
+	payload, addr, err := splitDecryptedUdp(plain[:n])
 	if err != nil {
 		return 0, netip.AddrPort{}, err
 	}
-	n = copy(b, payload)
-	return n, addr, nil
+	if len(payload) > len(b) {
+		return 0, addr, netproxy.DatagramDropped(io.ErrShortBuffer)
+	}
+	return copy(b, payload), addr, nil
 }

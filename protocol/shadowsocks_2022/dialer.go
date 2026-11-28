@@ -16,8 +16,7 @@ import (
 const maxPSKListLength = 8
 
 // FakeNetPacketConn wraps a PacketConn to override the target address.
-// It embeds netproxy.PacketConn directly, so it implements the interface correctly.
-// The Addr field is used by UdpConn.WriteTo to determine the actual target.
+// Addr is the default inner destination used by Write.
 type FakeNetPacketConn struct {
 	netproxy.PacketConn
 	Addr string
@@ -40,11 +39,22 @@ func (c *FakeNetPacketConn) WriteDeadlineClosesSession() bool {
 	return netproxy.WriteDeadlineClosesSession(c.PacketConn)
 }
 
-// WriteBatch forwards the optional batched writer through this net.Conn
-// compatibility wrapper: embedding the netproxy.PacketConn interface does
-// not promote methods the dynamic type has beyond it, so without this
-// forward the dae aggregator would not see the capability. A wrapped conn
-// without the capability falls back to ordered synchronous sends.
+func (c *FakeNetPacketConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) (func(), bool) {
+	if receiver, ok := c.PacketConn.(netproxy.PacketReceiver); ok {
+		return receiver.RegisterPacketReceiver(handler)
+	}
+	return nil, false
+}
+
+func (c *FakeNetPacketConn) TransportDone() <-chan struct{} {
+	if lifecycle, ok := c.PacketConn.(netproxy.TransportLifecycle); ok {
+		return lifecycle.TransportDone()
+	}
+	return nil
+}
+
+// WriteBatch forwards the wrapped connection's optional batched writer and
+// falls back to ordered synchronous sends when the wrapped connection lacks it.
 func (c *FakeNetPacketConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
 	bw, ok := c.PacketConn.(netproxy.PacketBatchWriter)
 	if !ok {
@@ -167,17 +177,10 @@ func (d *Dialer) ListenPacket(ctx context.Context, network string, addr string) 
 	// Shadowsocks transfer UDP traffic via UDP tunnel.
 	magicNetwork.Network = "udp"
 	network = magicNetwork.Encode()
-	conn, err := d.parentDialer.DialContext(ctx, network, d.proxyAddress)
+	proxyAddress := d.proxyAddress
+	conn, err := d.parentDialer.DialContext(ctx, network, proxyAddress)
 	if err != nil {
 		return nil, err
 	}
-	// UdpConn embeds net.Conn; a future parent wrapper that does not carry
-	// the address accessors must surface as a dial error, not a panic (the
-	// TCP branch above turns the same condition into an error).
-	netConn, ok := conn.(net.Conn)
-	if !ok {
-		_ = conn.Close()
-		return nil, fmt.Errorf("shadowsocks_2022: UDP underlay does not implement net.Conn: %T", conn)
-	}
-	return NewUdpConn(netConn, d.core, nil)
+	return newUdpConn(conn, proxyAddress, d.core, nil), nil
 }

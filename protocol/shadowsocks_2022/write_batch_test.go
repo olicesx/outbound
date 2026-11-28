@@ -2,6 +2,7 @@ package shadowsocks_2022
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
@@ -12,7 +13,9 @@ import (
 
 	"github.com/daeuniverse/outbound/ciphers"
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/socks5"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // wbNetConn is a fake connected UDP socket that records every datagram and
@@ -82,10 +85,14 @@ func (c *wbBatchNetConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
 // fallback.
 type wbSeqNetConn struct {
 	wbNetConnBase
+	writeTailError error
 }
 
 func (c *wbSeqNetConn) Write(p []byte) (int, error) {
 	c.record(p)
+	if c.count() == c.failAt {
+		return len(p), c.writeTailError
+	}
 	return len(p), nil
 }
 
@@ -215,6 +222,22 @@ func TestWriteBatchSequentialFallbackCoversNonBatchedUnderlay(t *testing.T) {
 	}
 }
 
+func TestWriteBatchSequentialFallbackCountsAcceptedDatagramOnError(t *testing.T) {
+	underlay := &wbSeqNetConn{
+		wbNetConnBase:  wbNetConnBase{failAt: 2},
+		writeTailError: io.ErrClosedPipe,
+	}
+	conn := newWriteBatch2022Conn(t, underlay)
+	n, err := conn.WriteBatch([]netproxy.BatchItem{
+		{Data: []byte("one"), Addr: "203.0.113.10:443"},
+		{Data: []byte("two"), Addr: "203.0.113.10:443"},
+		{Data: []byte("three"), Addr: "203.0.113.10:443"},
+	})
+	if n != 2 || err != io.ErrClosedPipe || underlay.count() != 2 {
+		t.Fatalf("WriteBatch: n=%d err=%v underlay sent=%d, want 2 and closed pipe", n, err, underlay.count())
+	}
+}
+
 // TestWriteBatchPartialSuccessPassesThrough verifies partial-success
 // semantics: the underlay's accepted prefix count and error surface verbatim.
 func TestWriteBatchPartialSuccessPassesThrough(t *testing.T) {
@@ -323,3 +346,132 @@ func (c *noBatchConn) Close() error                     { return nil }
 func (c *noBatchConn) SetDeadline(time.Time) error      { return nil }
 func (c *noBatchConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *noBatchConn) SetWriteDeadline(time.Time) error { return nil }
+
+// wbChainedConn has connected UDP I/O and a batch writer that consumes
+// explicit destination addresses. It supplies only one net.Conn address.
+type wbChainedConn struct {
+	netproxy.Conn
+	batch      *wbBatchNetConn
+	batchAddrs []string
+	done       <-chan struct{}
+}
+
+func (c *wbChainedConn) LocalAddr() net.Addr { return udpConnTestAddr("chained-local") }
+
+func (c *wbChainedConn) TransportDone() <-chan struct{} { return c.done }
+
+func (c *wbChainedConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
+	for _, item := range items {
+		if _, _, err := net.SplitHostPort(item.Addr); err != nil {
+			return 0, err
+		}
+		c.batchAddrs = append(c.batchAddrs, item.Addr)
+	}
+	return c.batch.WriteBatch(items)
+}
+
+type wbDialer func(context.Context, string, string) (netproxy.Conn, error)
+
+func (d wbDialer) DialContext(ctx context.Context, network, addr string) (netproxy.Conn, error) {
+	return d(ctx, network, addr)
+}
+
+func TestDialUDPWriteBatchUsesDialedProxyAddress(t *testing.T) {
+	const proxyAddress = "Proxy.EXAMPLE.:08388"
+	const defaultTarget = "203.0.113.10:443"
+	items := []netproxy.BatchItem{
+		{Data: []byte("first"), Addr: "198.51.100.20:53"},
+		{Data: []byte("second"), Addr: "[2001:db8::20]:443"},
+		{Data: []byte("third"), Addr: "198.51.100.20:53"},
+	}
+	for _, cipherName := range []string{"2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305"} {
+		t.Run(cipherName, func(t *testing.T) {
+			wire := &wbBatchNetConn{wbNetConnBase: wbNetConnBase{failAt: 1, failErr: io.ErrShortWrite}}
+			done := make(chan struct{})
+			underlay := &wbChainedConn{Conn: wire, batch: wire, done: done}
+			parent := wbDialer(func(_ context.Context, _, addr string) (netproxy.Conn, error) {
+				if addr != proxyAddress {
+					t.Fatalf("underlay dial address = %q, want %q", addr, proxyAddress)
+				}
+				return underlay, nil
+			})
+			dialer, err := NewDialer(parent, protocol.Header{
+				Cipher:       cipherName,
+				Password:     pskBase64(32, 0x62),
+				ProxyAddress: proxyAddress,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn, err := dialer.DialContext(t.Context(), "udp", defaultTarget)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bw, ok := conn.(netproxy.PacketBatchWriter)
+			if !ok {
+				t.Fatal("dialed UDP connection does not expose PacketBatchWriter")
+			}
+			inner := conn.(*FakeNetPacketConn).PacketConn.(*UdpConn)
+			if inner.LocalAddr() != underlay.LocalAddr() || inner.RemoteAddr() != nil {
+				t.Fatalf("unexpected adapted addresses: local=%v remote=%v", inner.LocalAddr(), inner.RemoteAddr())
+			}
+			if conn.(netproxy.TransportLifecycle).TransportDone() != done {
+				t.Fatal("dialed UDP connection hid TransportDone")
+			}
+			if n, err := conn.Write([]byte("connected")); n != len("connected") || err != nil {
+				t.Fatalf("Write: n=%d err=%v", n, err)
+			}
+			n, err := bw.WriteBatch(items)
+			if n != 1 || err != io.ErrShortWrite || wire.count() != 2 {
+				t.Fatalf("partial WriteBatch: n=%d err=%v total sent=%d", n, err, wire.count())
+			}
+			wire.failAt = -1
+			if sent, err := bw.WriteBatch(items[n:]); sent != len(items)-n || err != nil {
+				t.Fatalf("retry WriteBatch: n=%d err=%v", sent, err)
+			}
+			if got := wire.count(); got != len(items)+1 {
+				t.Fatalf("underlay received %d datagrams, want %d", got, len(items)+1)
+			}
+			if got := len(underlay.batchAddrs); got != len(items)+2 {
+				t.Fatalf("underlay saw %d batch destinations, want %d", got, len(items)+2)
+			}
+			for i, addr := range underlay.batchAddrs {
+				if addr != proxyAddress {
+					t.Fatalf("batch destination %d = %q, want %q", i, addr, proxyAddress)
+				}
+			}
+			decode := decodeClientBlockPacket
+			if !inner.IsUsingBlockCipher() {
+				decode = decodeClientChachaPacket
+			}
+			want := append([]netproxy.BatchItem{{Data: []byte("connected"), Addr: defaultTarget}}, items...)
+			for i, item := range want {
+				payload, addr := decode(t, inner, wire.datagram(i))
+				if !bytes.Equal(payload, item.Data) || addr != netip.MustParseAddrPort(item.Addr) {
+					t.Fatalf("datagram %d = %q to %v, want %q to %v", i, payload, addr, item.Data, item.Addr)
+				}
+			}
+		})
+	}
+}
+
+func decodeClientChachaPacket(t *testing.T, conn *UdpConn, wire []byte) ([]byte, netip.AddrPort) {
+	t.Helper()
+	aead, err := chacha20poly1305.NewX(conn.UPSK())
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := aead.Open(nil, wire[:udpPacketNonceSize], wire[udpPacketNonceSize:], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg[16] != HeaderTypeClientStream {
+		t.Fatalf("header type = %d, want %d", msg[16], HeaderTypeClientStream)
+	}
+	body := msg[27+int(binary.BigEndian.Uint16(msg[25:27])):]
+	addr, addrLen, err := parseAddrPort(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body[addrLen:], addr
+}

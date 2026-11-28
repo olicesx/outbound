@@ -171,11 +171,10 @@ func (pc *PktConn) WriteTo(b []byte, addr string) (int, error) {
 	copy(buf[3+tgtLen:], b)
 
 	n, err := pc.PacketConn.WriteTo(buf, pc.proxyAddr)
-	if n > tgtLen+3 {
-		return n - tgtLen - 3, err
+	if err == nil && n != len(buf) {
+		err = io.ErrShortWrite
 	}
-
-	return 0, err
+	return max(0, min(n, len(buf))-3-tgtLen), err
 }
 
 // WriteBatch implements netproxy.PacketBatchWriter: encapsulate every

@@ -1,6 +1,7 @@
 package shadowsocks_2022
 
 import (
+	"bytes"
 	"encoding/binary"
 	stderrors "errors"
 	"io"
@@ -45,8 +46,7 @@ func (c *udpReadBufferConn) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	c.read = true
-	copy(p, c.packet)
-	return len(c.packet), nil
+	return copy(p, c.packet), nil
 }
 
 func (c *udpReadBufferConn) Write(p []byte) (int, error)        { return len(p), nil }
@@ -57,12 +57,22 @@ func (c *udpReadBufferConn) SetDeadline(_ time.Time) error      { return nil }
 func (c *udpReadBufferConn) SetReadDeadline(_ time.Time) error  { return nil }
 func (c *udpReadBufferConn) SetWriteDeadline(_ time.Time) error { return nil }
 
+type udpReceiverUnderlay struct {
+	netproxy.Conn
+	netproxy.PacketReceiver
+}
+
 type udpConnTestAddr string
 
 func (a udpConnTestAddr) Network() string { return "udp-test" }
 func (a udpConnTestAddr) String() string  { return string(a) }
 
 func buildServerPacket(t *testing.T, core *SS2022Core, serverSessionID, clientSessionID [8]byte, packetID uint64, addr string, payload []byte) []byte {
+	t.Helper()
+	return buildServerPacketWithPadding(t, core, serverSessionID, clientSessionID, packetID, addr, payload, 0)
+}
+
+func buildServerPacketWithPadding(t *testing.T, core *SS2022Core, serverSessionID, clientSessionID [8]byte, packetID uint64, addr string, payload []byte, paddingLen int) []byte {
 	t.Helper()
 
 	var separateHeader [16]byte
@@ -81,16 +91,18 @@ func buildServerPacket(t *testing.T, core *SS2022Core, serverSessionID, clientSe
 		t.Fatalf("addrInfoEncodedLen: %v", err)
 	}
 
-	messageLen := 1 + 8 + 8 + 2 + addrLen + len(payload)
+	messageLen := 1 + 8 + 8 + 2 + paddingLen + addrLen + len(payload)
 	message := make([]byte, messageLen)
 	message[0] = HeaderTypeServerStream
 	binary.BigEndian.PutUint64(message[1:9], uint64(time.Now().Unix()))
 	copy(message[9:17], clientSessionID[:])
-	addrWritten, err := writeAddrInfoTo(message[19:], addrInfo)
+	binary.BigEndian.PutUint16(message[17:19], uint16(paddingLen))
+	addrOffset := 19 + paddingLen
+	addrWritten, err := writeAddrInfoTo(message[addrOffset:], addrInfo)
 	if err != nil {
 		t.Fatalf("writeAddrInfoTo: %v", err)
 	}
-	copy(message[19+addrWritten:], payload)
+	copy(message[addrOffset+addrWritten:], payload)
 
 	sessionCipher, err := CreateCipher(core.UPSK(), serverSessionID[:], core.CipherConf())
 	if err != nil {
@@ -100,6 +112,11 @@ func buildServerPacket(t *testing.T, core *SS2022Core, serverSessionID, clientSe
 }
 
 func buildServerPacketChacha(t *testing.T, core *SS2022Core, serverSessionID, clientSessionID [8]byte, packetID uint64, addr string, payload []byte) []byte {
+	t.Helper()
+	return buildServerPacketChachaWithPadding(t, core, serverSessionID, clientSessionID, packetID, addr, payload, 0)
+}
+
+func buildServerPacketChachaWithPadding(t *testing.T, core *SS2022Core, serverSessionID, clientSessionID [8]byte, packetID uint64, addr string, payload []byte, paddingLen int) []byte {
 	t.Helper()
 
 	addrInfo, err := socks5.AddressFromString(addr)
@@ -111,18 +128,20 @@ func buildServerPacketChacha(t *testing.T, core *SS2022Core, serverSessionID, cl
 		t.Fatalf("addrInfoEncodedLen: %v", err)
 	}
 
-	messageLen := 16 + 1 + 8 + 8 + 2 + addrLen + len(payload)
+	messageLen := 16 + 1 + 8 + 8 + 2 + paddingLen + addrLen + len(payload)
 	message := make([]byte, messageLen)
 	copy(message[:8], serverSessionID[:])
 	binary.BigEndian.PutUint64(message[8:16], packetID)
 	message[16] = HeaderTypeServerStream
 	binary.BigEndian.PutUint64(message[17:25], uint64(time.Now().Unix()))
 	copy(message[25:33], clientSessionID[:])
-	addrWritten, err := writeAddrInfoTo(message[35:], addrInfo)
+	binary.BigEndian.PutUint16(message[33:35], uint16(paddingLen))
+	addrOffset := 35 + paddingLen
+	addrWritten, err := writeAddrInfoTo(message[addrOffset:], addrInfo)
 	if err != nil {
 		t.Fatalf("writeAddrInfoTo: %v", err)
 	}
-	copy(message[35+addrWritten:], payload)
+	copy(message[addrOffset+addrWritten:], payload)
 
 	udpCipher, err := chacha20poly1305.NewX(core.UPSK())
 	if err != nil {
@@ -130,9 +149,7 @@ func buildServerPacketChacha(t *testing.T, core *SS2022Core, serverSessionID, cl
 	}
 
 	nonce := make([]byte, udpPacketNonceSize)
-	for i := range nonce {
-		nonce[i] = byte(i + 1)
-	}
+	binary.BigEndian.PutUint64(nonce[16:], packetID)
 
 	packet := make([]byte, udpPacketNonceSize, udpPacketNonceSize+messageLen+core.CipherConf().TagLen)
 	copy(packet, nonce)
@@ -401,24 +418,29 @@ func TestUdpConnPacketReceiverDecodesBlockAndChachaPackets(t *testing.T) {
 			if conf == nil {
 				t.Fatalf("missing cipher config %q", tc.cipherName)
 			}
-			psk := make([]byte, conf.KeyLen)
-			for i := range psk {
-				psk[i] = byte(i + 0x20)
-			}
-			core, err := NewSS2022Core(conf, [][]byte{psk}, psk)
-			if err != nil {
-				t.Fatal(err)
-			}
-			packet := tc.build(t, core, tc.serverID, tc.clientID, 1, tc.addr, tc.payload)
 			receiver := &udpReceiverConn{udpReadBufferConn: &udpReadBufferConn{}}
-			conn, err := NewUdpConn(receiver, core, nil)
+			underlay := &udpReceiverUnderlay{Conn: receiver, PacketReceiver: receiver}
+			dialer, err := NewDialer(recordingPacketDialer{conn: underlay}, protocol.Header{
+				Cipher:       tc.cipherName,
+				Password:     pskBase64(conf.KeyLen, 0x20),
+				ProxyAddress: "127.0.0.1:8388",
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			conn.sessionID = tc.clientID
+			packet := tc.build(t, dialer.(*Dialer).core, tc.serverID, tc.clientID, 1, tc.addr, tc.payload)
+			conn, err := dialer.DialContext(t.Context(), "udp", tc.addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn.(*FakeNetPacketConn).PacketConn.(*UdpConn).sessionID = tc.clientID
+			registrar, ok := conn.(netproxy.PacketReceiver)
+			if !ok {
+				t.Fatal("dialed UDP connection does not expose PacketReceiver")
+			}
 
 			var got *netproxy.ReceivedPacket
-			stop, ok := conn.RegisterPacketReceiver(func(packet *netproxy.ReceivedPacket) bool {
+			stop, ok := registrar.RegisterPacketReceiver(func(packet *netproxy.ReceivedPacket) bool {
 				got = packet
 				return true
 			})
@@ -477,57 +499,67 @@ func TestUdpConn_DecryptCipherCacheDropsToLowWatermarkAfterBurst(t *testing.T) {
 	}
 }
 
-// TestUdpConn_ReadFromChachaSurfacesOversizeAsDropped pins the typed
-// datagram-dropped contract on the chacha read path: the read buffer carries
-// +320 bytes of headroom, so a wire datagram that decodes to more than the
-// caller's buffer is received and authenticated in full — and must surface as
-// a dropped datagram (session stays usable) instead of a silently truncated
-// successful read.
-func TestUdpConn_ReadFromChachaSurfacesOversizeAsDropped(t *testing.T) {
-	conf := ciphers.Aead2022CiphersConf["2022-blake3-chacha20-poly1305"]
-	if conf == nil {
-		t.Fatal("missing ss2022 chacha cipher config")
-	}
-	psk := make([]byte, conf.KeyLen)
-	for i := range psk {
-		psk[i] = 0x41
-	}
-	core, err := NewSS2022Core(conf, [][]byte{psk}, psk)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestUdpConnReadFromDatagramSizes(t *testing.T) {
+	for _, cipherName := range []string{
+		"2022-blake3-aes-128-gcm",
+		"2022-blake3-aes-256-gcm",
+		"2022-blake3-chacha20-poly1305",
+	} {
+		t.Run(cipherName, func(t *testing.T) {
+			conf := ciphers.Aead2022CiphersConf[cipherName]
+			psk := bytes.Repeat([]byte{0x41}, conf.KeyLen)
+			core, err := NewSS2022Core(conf, [][]byte{psk}, psk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			underlay := &recordingPacketNetConn{}
+			conn, err := NewUdpConn(underlay, core, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			build := buildServerPacketWithPadding
+			if !core.IsUsingBlockCipher() {
+				build = buildServerPacketChachaWithPadding
+			}
+			remoteID := [8]byte{2, 4, 6, 8, 10, 12, 14, 16}
+			addr4 := netip.MustParseAddrPort("198.51.100.7:443")
+			addr6 := netip.MustParseAddrPort("[2001:db8::7]:443")
+			const size = 1500
+			exact := bytes.Repeat([]byte{0x5a}, size)
+			oversized := bytes.Repeat([]byte{0x6b}, 6000)
+			wire4 := build(t, core, remoteID, conn.sessionID, 1, addr4.String(), exact, 0)
+			wire6 := build(t, core, remoteID, conn.sessionID, 2, addr6.String(), exact, 1024)
+			wireOversized := build(t, core, remoteID, conn.sessionID, 3, addr6.String(), oversized, 1024)
+			bad := bytes.Clone(wire6)
+			bad[len(bad)-1] ^= 1
+			underlay.readBufs = [][]byte{
+				wire4, bad, wire6, wireOversized, wireOversized,
+				build(t, core, remoteID, conn.sessionID, 4, addr4.String(), exact, 0),
+			}
 
-	localSessionID := [8]byte{1, 3, 5, 7, 9, 11, 13, 15}
-	remoteSessionID := [8]byte{2, 4, 6, 8, 10, 12, 14, 16}
-	wantAddr := netip.MustParseAddrPort("198.51.100.7:443")
-	// 1700 decoded bytes > the 1500-byte caller buffer, while the wire packet
-	// still fits the len(b)+nonce+tag+320 read buffer.
-	payload := make([]byte, 1700)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
-
-	packet := buildServerPacketChacha(t, core, remoteSessionID, localSessionID, 1, wantAddr.String(), payload)
-	conn, err := NewUdpConn(&udpReadBufferConn{packet: packet}, core, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn.sessionID = localSessionID
-
-	buf := make([]byte, 1500)
-	n, addr, err := conn.ReadFrom(buf)
-	if err == nil {
-		t.Fatalf("expected the oversize datagram to surface as dropped, got a silent success with n=%d (want the drop, not a truncated copy)", n)
-	}
-	if !stderrors.Is(err, io.ErrShortBuffer) {
-		t.Fatalf("error should unwrap to io.ErrShortBuffer: %v", err)
-	}
-	var dropped *netproxy.ErrDatagramDropped
-	if !stderrors.As(err, &dropped) {
-		t.Fatalf("error should carry the typed datagram-dropped contract: %v", err)
-	}
-	if addr != wantAddr {
-		t.Fatalf("unexpected addr on the dropped datagram: got %v want %v", addr, wantAddr)
+			assertRead := func(buf []byte, wantAddr netip.AddrPort) {
+				t.Helper()
+				n, addr, err := conn.ReadFrom(buf)
+				if err != nil || n != size || addr != wantAddr || !bytes.Equal(buf[:n], exact) {
+					t.Fatalf("ReadFrom: n=%d addr=%v err=%v, want %d bytes from %v", n, addr, err, size, wantAddr)
+				}
+			}
+			buf := make([]byte, size)
+			assertRead(buf, addr4)
+			if n, _, err := conn.ReadFrom(buf); n != 0 || err == nil || stderrors.Is(err, io.ErrShortBuffer) {
+				t.Fatalf("ReadFrom tampered datagram: n=%d err=%v, want authentication error", n, err)
+			}
+			assertRead(buf, addr6)
+			n, addr, err := conn.ReadFrom(buf)
+			var dropped *netproxy.ErrDatagramDropped
+			if n != 0 || addr != addr6 || !stderrors.As(err, &dropped) || !stderrors.Is(err, io.ErrShortBuffer) {
+				t.Fatalf("ReadFrom oversized datagram: n=%d addr=%v err=%v, want typed short-buffer drop from %v", n, addr, err, addr6)
+			}
+			if n, _, err := conn.ReadFrom(buf); n != 0 || !stderrors.Is(err, protocol.ErrReplayAttack) {
+				t.Fatalf("ReadFrom replayed datagram: n=%d err=%v, want replay error", n, err)
+			}
+			assertRead(make([]byte, 65536), addr4)
+		})
 	}
 }
 

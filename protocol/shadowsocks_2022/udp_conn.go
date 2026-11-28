@@ -30,8 +30,9 @@ type UdpConn struct {
 
 	net.Conn
 
-	sessionID [8]byte
-	packetID  atomic.Uint64
+	proxyAddress string
+	sessionID    [8]byte
+	packetID     atomic.Uint64
 
 	// cipher is derived from the local session ID and reused for outbound
 	// packets. Inbound packets must decrypt against the remote session ID
@@ -68,6 +69,9 @@ const (
 	decryptCipherLowWatermark = maxDecryptCipherEntries / 2
 )
 
+// maxUDPWireSize covers the full 16-bit length used by UDP underlays.
+const maxUDPWireSize = 1<<16 - 1
+
 type udpSessionReplayState struct {
 	filter   *ciphers.SlidingWindowFilter
 	lastSeen atomic.Int64
@@ -77,16 +81,59 @@ type udpSessionReplayState struct {
 // The connection is not bound to the dial context: UDP sessions are
 // long-lived and must not be torn down by the dial's timeout or cancellation.
 func NewUdpConn(conn net.Conn, core *SS2022Core, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
+	return newUdpConn(conn, "", core, bloom), nil
+}
+
+func newUdpConn(conn netproxy.Conn, proxyAddress string, core *SS2022Core, bloom *disk_bloom.FilterGroup) *UdpConn {
+	netConn, ok := conn.(net.Conn)
+	if !ok {
+		netConn = &udpUnderlayConn{Conn: conn}
+	}
 	u := &UdpConn{
 		SS2022Core:     core,
-		Conn:           conn,
+		Conn:           netConn,
+		proxyAddress:   proxyAddress,
 		bloom:          bloom,
 		decryptCiphers: make(map[[8]byte]cipher.AEAD, 16),
 	}
 
 	// Generate session ID
 	_, _ = fastrand.Read(u.sessionID[:])
-	return u, nil
+	return u
+}
+
+// udpUnderlayConn supplies net.Conn address accessors for dialed packet
+// transports that only implement netproxy.Conn. It preserves any address
+// the underlay provides and returns nil for an unavailable address.
+type udpUnderlayConn struct {
+	netproxy.Conn
+}
+
+func (c *udpUnderlayConn) LocalAddr() net.Addr {
+	if conn, ok := c.Conn.(interface{ LocalAddr() net.Addr }); ok {
+		return conn.LocalAddr()
+	}
+	return nil
+}
+
+func (c *udpUnderlayConn) RemoteAddr() net.Addr {
+	if conn, ok := c.Conn.(interface{ RemoteAddr() net.Addr }); ok {
+		return conn.RemoteAddr()
+	}
+	return nil
+}
+
+func (c *udpUnderlayConn) WriteDeadlineClosesSession() bool {
+	return netproxy.WriteDeadlineClosesSession(c.Conn)
+}
+
+// underlay lets optional packet capabilities be queried on the transport
+// itself. The address adapter only needs to delegate connected I/O.
+func (c *UdpConn) underlay() netproxy.Conn {
+	if conn, ok := c.Conn.(*udpUnderlayConn); ok {
+		return conn.Conn
+	}
+	return c.Conn
 }
 
 func (c *UdpConn) ensureCipher() error {
@@ -374,8 +421,9 @@ func (c *UdpConn) sealChachaPacket(b []byte, addrInfo *socks5.AddressInfo, packe
 // nonce) and hand the sealed batch to the underlay's batched writer when it
 // has one (sendmmsg on a direct UDP socket), else send them sequentially.
 // Every destination is resolved and sealed before anything is sent, so a
-// pre-send failure is all-or-nothing (n == 0). Items leave with an empty
-// Addr on the batched underlay path, matching WriteTo's connected write.
+// pre-send failure is all-or-nothing (n == 0). The batch destination is the
+// dialed proxy for every ciphertext. NewUdpConn callers supply a connected
+// underlay and leave that address implicit.
 func (c *UdpConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
 	if len(items) == 0 {
 		return 0, nil
@@ -391,7 +439,12 @@ func (c *UdpConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
 		}
 		addrInfos[i] = addrInfo
 	}
-	packets := make([]pool.PB, len(items))
+	packets := make([]netproxy.BatchItem, len(items))
+	defer func() {
+		for _, packet := range packets {
+			pool.Put(packet.Data)
+		}
+	}()
 	for i, item := range items {
 		packetID := c.nextPacketID()
 		var packet pool.PB
@@ -402,40 +455,28 @@ func (c *UdpConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
 			packet, err = c.sealChachaPacket(item.Data, &addrInfos[i], packetID)
 		}
 		if err != nil {
-			for _, prev := range packets[:i] {
-				pool.Put(prev)
-			}
 			return 0, err
 		}
-		packets[i] = packet
+		packets[i] = netproxy.BatchItem{Data: packet, Addr: c.proxyAddress}
 	}
-	if bw, ok := c.Conn.(netproxy.PacketBatchWriter); ok {
-		defer func() {
-			for _, packet := range packets {
-				pool.Put(packet)
-			}
-		}()
-		enc := make([]netproxy.BatchItem, len(items))
-		for i, packet := range packets {
-			enc[i] = netproxy.BatchItem{Data: packet}
-		}
-		return bw.WriteBatch(enc)
+	if bw, ok := c.underlay().(netproxy.PacketBatchWriter); ok {
+		return bw.WriteBatch(packets)
 	}
 	// No batched underlay: sequential synchronous sends in order. Each sealed
 	// datagram returns to the pool right after its send.
 	sent := 0
-	for i := range items {
-		packet := packets[i]
-		n, err := c.Write(packet)
-		if err == nil && n < len(packet) {
+	for i, packet := range packets {
+		n, err := c.Write(packet.Data)
+		if n >= len(packet.Data) {
+			sent++
+		} else if err == nil {
 			err = io.ErrShortWrite
 		}
-		pool.Put(packet)
-		packets[i] = nil
+		pool.Put(packet.Data)
+		packets[i].Data = nil
 		if err != nil {
 			return sent, err
 		}
-		sent++
 	}
 	return sent, nil
 }
@@ -455,20 +496,22 @@ func (c *UdpConn) targetAddrInfo(addr string) (socks5.AddressInfo, error) {
 var _ netproxy.PacketReceiver = (*UdpConn)(nil)
 
 func (c *UdpConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) (func(), bool) {
-	receiver, ok := c.Conn.(netproxy.PacketReceiver)
+	receiver, ok := c.underlay().(netproxy.PacketReceiver)
 	if !ok {
 		return nil, false
 	}
 	return netproxy.RegisterMappedPacketReceiver(receiver, handler, c.mapReceivedPacket)
 }
 
-// WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
-// forwarding the declaration of the wrapped conn: the exported
-// SetWriteDeadline is the promoted delegate of the embedded net.Conn, so the
-// semantics — and the declaration — belong to that conn. A plain UDP socket
-// reports false; a marker-bearing wrapper in its place reports true.
 func (c *UdpConn) WriteDeadlineClosesSession() bool {
-	return netproxy.WriteDeadlineClosesSession(c.Conn)
+	return netproxy.WriteDeadlineClosesSession(c.underlay())
+}
+
+func (c *UdpConn) TransportDone() <-chan struct{} {
+	if lifecycle, ok := c.underlay().(netproxy.TransportLifecycle); ok {
+		return lifecycle.TransportDone()
+	}
+	return nil
 }
 
 func (c *UdpConn) mapReceivedPacket(packet *netproxy.ReceivedPacket) (*netproxy.ReceivedPacket, bool) {
@@ -493,20 +536,37 @@ func (c *UdpConn) mapReceivedPacket(packet *netproxy.ReceivedPacket) (*netproxy.
 	return packet, true
 }
 
-func (c *UdpConn) ReadFrom(b []byte) (n int, addr netip.AddrPort, err error) {
-	if !c.IsUsingBlockCipher() {
-		return c.readFromChacha(b)
+func (c *UdpConn) ReadFrom(b []byte) (int, netip.AddrPort, error) {
+	blockCipher := c.IsUsingBlockCipher()
+	if !blockCipher {
+		if err := c.ensureCipher(); err != nil {
+			return 0, netip.AddrPort{}, err
+		}
 	}
 
-	buf := pool.Get(len(b) + 16 + c.CipherConf().TagLen)
-	defer pool.Put(buf)
-	n, err = c.Read(buf)
+	// Read the entire wire datagram before authenticating. Some underlays
+	// silently truncate, and the padding length is inside the ciphertext.
+	buf := b
+	if len(buf) < maxUDPWireSize {
+		buf = pool.Get(maxUDPWireSize)
+		defer pool.Put(buf)
+	}
+	n, err := c.Read(buf)
 	if err != nil {
 		return 0, netip.AddrPort{}, err
 	}
-	payload, addr, err := c.decodeBlockPacket(buf[:n], time.Now())
+	var payload []byte
+	var addr netip.AddrPort
+	if blockCipher {
+		payload, addr, err = c.decodeBlockPacket(buf[:n], time.Now())
+	} else {
+		payload, addr, err = c.decodeChachaPacket(buf[:n], time.Now())
+	}
 	if err != nil {
 		return 0, netip.AddrPort{}, err
+	}
+	if len(payload) > len(b) {
+		return 0, addr, netproxy.DatagramDropped(io.ErrShortBuffer)
 	}
 	return copy(b, payload), addr, nil
 }
@@ -547,32 +607,6 @@ func (c *UdpConn) decodeBlockPacket(buf []byte, now time.Time) ([]byte, netip.Ad
 		return nil, netip.AddrPort{}, protocol.ErrReplayAttack
 	}
 	return out, addr, nil
-}
-
-func (c *UdpConn) readFromChacha(b []byte) (n int, addr netip.AddrPort, err error) {
-	if err := c.ensureCipher(); err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-
-	buf := pool.Get(len(b) + udpPacketNonceSize + c.CipherConf().TagLen + 320)
-	defer pool.Put(buf)
-	n, err = c.Read(buf)
-	if err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-	payload, addr, err := c.decodeChachaPacket(buf[:n], time.Now())
-	if err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-	if len(payload) > len(b) {
-		// The decrypted datagram does not fit the caller's buffer. The read
-		// buffer's slack (+320) lets the wire datagram arrive and
-		// authenticate fully, so the oversize is known exactly here:
-		// surface it as a dropped datagram per the typed read contract
-		// instead of silently truncating a successful return.
-		return 0, addr, netproxy.DatagramDropped(io.ErrShortBuffer)
-	}
-	return copy(b, payload), addr, nil
 }
 
 func (c *UdpConn) decodeChachaPacket(buf []byte, now time.Time) ([]byte, netip.AddrPort, error) {

@@ -194,68 +194,59 @@ func (vc *Conn) WriteTo(w io.Writer) (n int64, err error) {
 }
 
 func (vc *Conn) read(b []byte) (int, error) {
-	if vc.readRemainingContent > 0 {
-		if vc.readRemainingContent < len(b) {
-			b = b[:vc.readRemainingContent]
+	var headerScratch []byte
+	for {
+		if vc.readRemainingContent > 0 {
+			n, err := vc.reader.Read(b[:min(len(b), vc.readRemainingContent)])
+			vc.readRemainingContent -= n
+			vc.FilterTLS(b[:n])
+			return n, err
 		}
-		n, err := vc.reader.Read(b)
-		vc.readRemainingContent -= n
-		vc.FilterTLS(b[:n])
-		// logrus.Println("isTLS4", vc.isTLS, vc.readRemainingContent, n)
-		return n, err
-	}
-	if vc.readRemainingPadding > 0 {
-		_, err := io.CopyN(io.Discard, vc.reader, int64(vc.readRemainingPadding))
-		if err != nil {
-			return 0, err
-		}
-		vc.readRemainingPadding = 0
-	}
-	n := 0
-	if !vc.toReadDirect {
-		switch vc.readLastCommand {
-		case commandPaddingContinue:
-			headerUUIDLen := 0
-			if vc.readFilterUUID {
-				headerUUIDLen = len(uuid.Nil)
-			}
-			var header []byte
-			if need := headerUUIDLen + PaddingHeaderLen - len(uuid.Nil); len(b) < need {
-				header = make([]byte, need)
-			} else {
-				header = b[:need]
-			}
-			// logrus.Println("read 1")
-			_, err := io.ReadFull(vc.reader, header)
+		if vc.readRemainingPadding > 0 {
+			n, err := io.CopyN(io.Discard, vc.reader, int64(vc.readRemainingPadding))
+			vc.readRemainingPadding -= int(n)
 			if err != nil {
 				return 0, err
 			}
-			// logrus.Println("read 2")
+		}
+		if vc.toReadDirect {
+			return vc.reader.Read(b)
+		}
+
+		switch vc.readLastCommand {
+		case commandPaddingContinue:
+			need := PaddingHeaderLen - len(uuid.Nil)
+			if vc.readFilterUUID {
+				need = PaddingHeaderLen
+			}
+			header := b[:min(len(b), need)]
+			if len(header) < need {
+				if headerScratch == nil {
+					headerScratch = make([]byte, PaddingHeaderLen)
+				}
+				header = headerScratch[:need]
+			}
+			if _, err := io.ReadFull(vc.reader, header); err != nil {
+				return 0, err
+			}
 			if vc.readFilterUUID {
 				vc.readFilterUUID = false
 				if subtle.ConstantTimeCompare(vc.userUUID[:], header[:len(uuid.Nil)]) != 1 {
-					id, e := uuid.FromBytes(header[:len(uuid.Nil)])
-					err = fmt.Errorf("XTLS Vision server responded unknown UUID: %s: %w",
-						id.String(), e)
-					// logrus.Errorln(err.Error())
-					return 0, err
+					id, err := uuid.FromBytes(header[:len(uuid.Nil)])
+					return 0, fmt.Errorf("XTLS Vision server responded unknown UUID: %s: %w", id.String(), err)
 				}
 				header = header[len(uuid.Nil):]
 			}
 			vc.readRemainingPadding = int(binary.BigEndian.Uint16(header[3:]))
 			vc.readRemainingContent = int(binary.BigEndian.Uint16(header[1:]))
 			vc.readLastCommand = header[0]
-			// logrus.Infof("XTLS Vision read padding: command=%d, payloadLen=%d, paddingLen=%d",
-			// vc.readLastCommand, vc.readRemainingContent, vc.readRemainingPadding)
-			return vc.read(b)
+			// A frame may contain only padding. Advance without growing the stack.
 		case commandPaddingEnd:
 			vc.toReadDirect = true
-			return vc.read(b)
 		case commandPaddingDirect:
-			// logrus.Infoln("commandPaddingDirect")
+			n := 0
 			needReturn := false
 			if vc.input != nil {
-				// logrus.Infoln("commandPaddingDirect: 1", vc.input.Len())
 				if vc.input.Len() > 0 {
 					_n, err := vc.input.Read(b)
 					if err != nil {
@@ -263,17 +254,14 @@ func (vc *Conn) read(b []byte) (int, error) {
 					}
 					n += _n
 				}
-				// logrus.Infoln("commandPaddingDirect: 1?", vc.input.Len())
 				if vc.input.Len() == 0 {
 					needReturn = true
 					vc.input = nil
 				} else { // buffer is full
-					// logrus.Infoln("commandPaddingDirect: 1? full")
 					return len(b), nil
 				}
 			}
 			if vc.rawInput != nil {
-				// logrus.Infoln("commandPaddingDirect: 2")
 				if vc.rawInput.Len() > 0 {
 					_n, err := vc.rawInput.Read(b[n:])
 					if err != nil {
@@ -282,7 +270,6 @@ func (vc *Conn) read(b []byte) (int, error) {
 					n += _n
 				}
 				needReturn = true
-				// logrus.Infoln("commandPaddingDirect: 2?", vc.rawInput.Len())
 				if vc.rawInput.Len() == 0 {
 					vc.rawInput = nil
 				}
@@ -290,18 +277,15 @@ func (vc *Conn) read(b []byte) (int, error) {
 			if vc.input == nil && vc.rawInput == nil {
 				vc.toReadDirect = true
 				vc.reader.directRead = true
-				// logrus.Infoln("XTLS Vision direct read start")
 			}
 			if needReturn {
 				return n, nil
 			}
+			return vc.reader.Read(b)
 		default:
-			err := fmt.Errorf("XTLS Vision read unknown command: %d", vc.readLastCommand)
-			// log.Debugln(err.Error())
-			return 0, err
+			return 0, fmt.Errorf("XTLS Vision read unknown command: %d", vc.readLastCommand)
 		}
 	}
-	return vc.reader.Read(b[n:])
 }
 
 func (vc *Conn) Write(p []byte) (int, error) {

@@ -26,6 +26,12 @@ type HttpProxy struct {
 }
 
 func NewHTTPProxy(u *url.URL, forward netproxy.Dialer) (netproxy.Dialer, error) {
+	return NewHTTPProxyWithTLSOptions(u, forward, nil)
+}
+
+// NewHTTPProxyWithTLSOptions applies the caller's TLS defaults to HTTPS proxies.
+// URL options override implementation and fingerprint, and can opt out of verification.
+func NewHTTPProxyWithTLSOptions(u *url.URL, forward netproxy.Dialer, defaults *dialer.ExtraOption) (netproxy.Dialer, error) {
 	s := new(HttpProxy)
 	query := u.Query()
 	s.Addr = u.Host
@@ -48,9 +54,15 @@ func NewHTTPProxy(u *url.URL, forward netproxy.Dialer) (netproxy.Dialer, error) 
 			serverName = u.Hostname()
 		}
 
-		tlsImplementation := "tls"
-		if query.Get("tlsImplementation") != "" {
-			tlsImplementation = query.Get("tlsImplementation")
+		options := dialer.ExtraOption{TlsImplementation: "tls"}
+		if defaults != nil {
+			options = *defaults
+		}
+		if impl := query.Get("tlsImplementation"); impl != "" {
+			options.TlsImplementation = impl
+		}
+		if imitate := query.Get("utlsImitate"); imitate != "" {
+			options.UtlsImitate = imitate
 		}
 		alpnValue := "h2,http/1.1"
 		if query.Get("alpn") != "" {
@@ -63,22 +75,9 @@ func NewHTTPProxy(u *url.URL, forward netproxy.Dialer) (netproxy.Dialer, error) 
 				"alpn": []string{alpnValue},
 			}.Encode(),
 		}
-		allowInsecure, _ := strconv.ParseBool(query.Get("allowInsecure"))
-		if !allowInsecure {
-			allowInsecure, _ = strconv.ParseBool(query.Get("allow_insecure"))
-		}
-		if !allowInsecure {
-			allowInsecure, _ = strconv.ParseBool(query.Get("allowinsecure"))
-		}
-		if !allowInsecure {
-			allowInsecure, _ = strconv.ParseBool(query.Get("skipVerify"))
-		}
+		options.AllowInsecure = options.AllowInsecure || dialer.AllowInsecureFromQuery(query)
 		var err error
-		s.dialer, _, err = tls2.NewTls(&dialer.ExtraOption{
-			AllowInsecure:     allowInsecure,
-			TlsImplementation: tlsImplementation,
-			UtlsImitate:       query.Get("utlsImitate"),
-		}, s.dialer, tlsURL.String())
+		s.dialer, _, err = tls2.NewTls(&options, s.dialer, tlsURL.String())
 		if err != nil {
 			return nil, err
 		}

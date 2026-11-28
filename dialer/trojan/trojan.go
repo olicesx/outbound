@@ -47,6 +47,14 @@ func NewTrojan(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link stri
 }
 
 func (s *Trojan) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, *dialer.Property, error) {
+	var encryption []string
+	if strings.HasPrefix(s.Encryption, "ss;") {
+		encryption = strings.SplitN(s.Encryption, ";", 3)
+		if len(encryption) != 3 || encryption[1] == "" {
+			return nil, nil, fmt.Errorf("%w: invalid Trojan Shadowsocks encryption parameters", dialer.InvalidParameterErr)
+		}
+	}
+
 	d := nextDialer
 	var err error
 	if s.Type != "grpc" {
@@ -103,12 +111,11 @@ func (s *Trojan) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) 
 			return nil, nil, err
 		}
 	}
-	if strings.HasPrefix(s.Encryption, "ss;") {
-		fields := strings.SplitN(s.Encryption, ";", 3)
+	if encryption != nil {
 		if d, err = protocol.NewDialer("shadowsocks", d, protocol.Header{
 			ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
-			Cipher:       fields[1],
-			Password:     fields[2],
+			Cipher:       encryption[1],
+			Password:     encryption[2],
 			// This stack is the shadowsocks *client* hop toward the
 			// trojan server's ss terminator. With false the first TCP
 			// write would omit the target-address header entirely

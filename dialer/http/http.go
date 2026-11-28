@@ -73,7 +73,7 @@ func ParseHTTPURL(link string) (data *HTTP, err error) {
 
 func (s *HTTP) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, *dialer.Property, error) {
 	u := s.URL()
-	d, err := http.NewHTTPProxy(&u, nextDialer)
+	d, err := http.NewHTTPProxyWithTLSOptions(&u, nextDialer, option)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -91,9 +91,14 @@ func (s *HTTP) URL() url.URL {
 		Host:     net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Fragment: s.Name,
 	}
+	query := url.Values{}
 	if s.SNI != "" {
-		u.RawQuery = url.Values{"sni": []string{s.SNI}, "allowInsecure": []string{common.BoolToString(s.AllowInsecure)}}.Encode()
+		query.Set("sni", s.SNI)
 	}
+	if s.AllowInsecure || s.SNI != "" {
+		query.Set("allowInsecure", common.BoolToString(s.AllowInsecure))
+	}
+	u.RawQuery = query.Encode()
 	if s.Username != "" {
 		if s.Password != "" {
 			u.User = url.UserPassword(s.Username, s.Password)

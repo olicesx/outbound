@@ -231,3 +231,31 @@ func TestForwardCloseWriteProtocolOverBufferedTCP(t *testing.T) {
 		t.Fatalf("peer Read = %d, %v, want EOF", n, err)
 	}
 }
+
+func TestForwardCloseWriteUnderlyingForwarderTCP(t *testing.T) {
+	client, server := tcpPair(t)
+	if err := server.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	inner := &testUnderlyingWrapper{Conn: client, underlying: client}
+	forwarder := NewUnderlyingConnForwarder(inner, func() net.Conn { return client })
+	conn := NewBufferedReaderConn(forwarder, 0)
+	defer conn.Close()
+
+	if err := ForwardCloseWrite(conn); err != nil {
+		t.Fatalf("ForwardCloseWrite: %v", err)
+	}
+	var buf [1]byte
+	if n, err := server.Read(buf[:]); n != 0 || err != io.EOF {
+		t.Fatalf("peer Read = %d, %v, want EOF", n, err)
+	}
+	if _, err := server.Write([]byte("x")); err != nil {
+		t.Fatalf("peer Write after FIN: %v", err)
+	}
+	if _, err := io.ReadFull(conn, buf[:]); err != nil || buf[0] != 'x' {
+		t.Fatalf("client Read after FIN = %q, %v, want x", buf, err)
+	}
+}

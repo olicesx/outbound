@@ -106,6 +106,41 @@ func TestNewBufferedReaderConnWrapsPlainUnderlay(t *testing.T) {
 	}
 }
 
+func TestNewBufferedReaderConnFollowsForwarderReadPath(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	tlsConn := gotls.Client(client, &gotls.Config{ServerName: "underlay.test"})
+	for _, tc := range []struct {
+		name     string
+		inner    net.Conn
+		buffered bool
+	}{
+		{name: "TLS records", inner: tlsConn, buffered: true},
+		{name: "plain stream", inner: client},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			forwarder := NewUnderlyingConnForwarder(tc.inner, func() net.Conn {
+				t.Fatal("buffer detection consulted the raw socket accessor")
+				return nil
+			})
+			got := NewBufferedReaderConn(forwarder, 0)
+			if tc.buffered {
+				if got != forwarder {
+					t.Fatalf("buffered stream: got %T, want the original forwarder", got)
+				}
+			} else if _, ok := got.(*BufferedReaderConn); !ok {
+				t.Fatalf("plain stream: got %T, want *BufferedReaderConn", got)
+			}
+			conn, ok := got.(net.Conn)
+			if !ok || conn.LocalAddr() != tc.inner.LocalAddr() || conn.RemoteAddr() != tc.inner.RemoteAddr() {
+				t.Fatalf("%T lost the underlying net.Conn addresses", got)
+			}
+		})
+	}
+}
+
 func TestNewBufferedReaderConnHonorsAlreadyReadBuffered(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = client.Close() }()

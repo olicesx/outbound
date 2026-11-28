@@ -178,7 +178,8 @@ func (s *Tls) DialContext(ctx context.Context, network, addr string) (c netproxy
 		// The forwarder keeps the raw socket reachable for UnwrapTCPConn:
 		// TLS conns are opaque to unwrapping, and copy loops above need the
 		// kernel receive-queue state to decide whether another read
-		// completes immediately (write batching).
+		// completes immediately (write batching). Reads still go through the
+		// TLS record layer, which already buffers plaintext.
 		return netproxy.NewUnderlyingConnForwarder(
 			tlsConn, func() net.Conn {
 				// rc is a netproxy.Conn; peel it through the same

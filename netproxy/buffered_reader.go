@@ -127,15 +127,17 @@ func ForceBufferedReaderConn(c Conn, size int) *BufferedReaderConn {
 }
 
 func alreadyHasReadBuffer(c Conn) bool {
-	if c == nil {
-		return false
-	}
-	switch c.(type) {
-	case *tls.Conn, *utls.UConn, *BufferedReaderConn:
-		return true
-	}
-	if _, ok := c.(AlreadyReadBuffered); ok {
-		return true
+	const maxDepth = 8
+	for depth := 0; depth < maxDepth; depth++ {
+		switch conn := c.(type) {
+		case *tls.Conn, *utls.UConn, *BufferedReaderConn, AlreadyReadBuffered:
+			return true
+		case *UnderlyingConnForwarder:
+			// Reads follow Conn. The raw socket accessor serves a different purpose.
+			c = conn.Conn
+		default:
+			return false
+		}
 	}
 	return false
 }

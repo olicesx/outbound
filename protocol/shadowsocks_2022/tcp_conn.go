@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,6 +33,7 @@ const (
 	MaxPaddingLength       = 900
 
 	maxReusableWriteFrameSize = 128 << 10
+	tcpHandshakeTimeout       = 30 * time.Second
 )
 
 // TCPConn represents a Shadowsocks TCP connection.
@@ -53,6 +55,11 @@ type TCPConn struct {
 
 	readMutex  sync.Mutex
 	writeMutex sync.Mutex
+
+	// Deadline setters must reach the underlay while Read or Write is blocked.
+	deadlineMu    sync.Mutex
+	readDeadline  tcpDeadline
+	writeDeadline tcpDeadline
 
 	// requestSalt is the salt this client sent with its request stream. The
 	// response fixed-length header echoes it and SIP022 §3.1.3 requires the
@@ -112,37 +119,68 @@ func (c *TCPConn) Close() error {
 	return err
 }
 
-// setHandshakeReadDeadline arms a rolling read deadline for TCP I/O.
-// Only used during the handshake: steady-state chunk reads must not impose a
-// per-chunk deadline (see Read), otherwise connections idle for more than
-// the rolling window are killed even though upper layers (relay
-// watchdog, TCP keepalive) own liveness detection.
-func (c *TCPConn) setHandshakeReadDeadline() {
-	if dl, ok := c.Conn.(interface{ SetReadDeadline(time.Time) error }); ok {
-		// Use a rolling deadline for TCP I/O operations.
-		// This ensures each read operation has sufficient time to complete.
-		// 30 seconds allows for high-latency networks while still detecting
-		// dead connections within a reasonable time.
-		_ = dl.SetReadDeadline(time.Now().Add(30 * time.Second))
-	}
+type tcpDeadline struct {
+	caller    time.Time
+	handshake time.Time
 }
 
-// clearReadDeadline removes the handshake's rolling deadline once the first
-// payload chunk has been delivered.
-func (c *TCPConn) clearReadDeadline() {
-	if dl, ok := c.Conn.(interface{ SetReadDeadline(time.Time) error }); ok {
-		_ = dl.SetReadDeadline(time.Time{})
+func (d *tcpDeadline) effective(caller time.Time) time.Time {
+	if !d.handshake.IsZero() && (caller.IsZero() || d.handshake.Before(caller)) {
+		return d.handshake
 	}
+	return caller
 }
 
-// setHandshakeWriteDeadline arms a rolling write deadline for TCP I/O.
-func (c *TCPConn) setHandshakeWriteDeadline() {
-	if dl, ok := c.Conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
-		// Use a rolling deadline for TCP I/O operations.
-		// This ensures each write operation has sufficient time to complete.
-		// 30 seconds allows for high-latency networks while still detecting
-		// dead connections within a reasonable time.
-		_ = dl.SetWriteDeadline(time.Now().Add(30 * time.Second))
+func (d *tcpDeadline) setCaller(t time.Time, apply func(time.Time) error) error {
+	if err := apply(d.effective(t)); err != nil {
+		return err
+	}
+	d.caller = t
+	return nil
+}
+
+func (c *TCPConn) SetDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+
+	read := c.readDeadline.effective(t)
+	write := c.writeDeadline.effective(t)
+	if read.Equal(write) {
+		if err := c.Conn.SetDeadline(read); err != nil {
+			return err
+		}
+		c.readDeadline.caller = t
+		c.writeDeadline.caller = t
+		return nil
+	}
+	return errors.Join(
+		c.readDeadline.setCaller(t, c.Conn.SetReadDeadline),
+		c.writeDeadline.setCaller(t, c.Conn.SetWriteDeadline),
+	)
+}
+
+func (c *TCPConn) SetReadDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	return c.readDeadline.setCaller(t, c.Conn.SetReadDeadline)
+}
+
+func (c *TCPConn) SetWriteDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	return c.writeDeadline.setCaller(t, c.Conn.SetWriteDeadline)
+}
+
+// setHandshakeDeadline arms, refreshes, or removes a handshake deadline. Caller
+// updates and cleanup use the same lock so cleanup restores the latest deadline.
+func (c *TCPConn) setHandshakeDeadline(d *tcpDeadline, t time.Time, apply func(time.Time) error) {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+
+	previous := d.effective(d.caller)
+	d.handshake = t
+	if effective := d.effective(d.caller); !effective.Equal(previous) {
+		_ = apply(effective)
 	}
 }
 
@@ -282,7 +320,8 @@ func (c *TCPConn) Read(b []byte) (n int, err error) {
 	var payloadLength uint16
 
 	if !c.onceRead {
-		c.setHandshakeReadDeadline()
+		c.setHandshakeDeadline(&c.readDeadline, time.Now().Add(tcpHandshakeTimeout), c.Conn.SetReadDeadline)
+		defer c.setHandshakeDeadline(&c.readDeadline, time.Time{}, c.Conn.SetReadDeadline)
 		var saltBuf [32]byte
 		salt := saltBuf[:c.CipherConf().SaltLen]
 		n, err = io.ReadFull(c.Conn, salt)
@@ -294,7 +333,7 @@ func (c *TCPConn) Read(b []byte) (n int, err error) {
 			return 0, oops.Wrapf(err, "fail to initiate cipher")
 		}
 
-		c.setHandshakeReadDeadline()
+		c.setHandshakeDeadline(&c.readDeadline, time.Now().Add(tcpHandshakeTimeout), c.Conn.SetReadDeadline)
 		var headerBuf [11 + 32 + 16]byte
 		header := headerBuf[:11+c.CipherConf().SaltLen+c.CipherConf().TagLen]
 		if _, err := io.ReadFull(c.Conn, header); err != nil {
@@ -345,11 +384,6 @@ func (c *TCPConn) Read(b []byte) (n int, err error) {
 
 		c.onceRead = true
 	} else {
-		// First steady-state chunk: the handshake (including its first
-		// payload read) is complete, so clear the rolling handshake
-		// deadline. Steady-state reads rely on TCP keepalive and
-		// upper-layer idle watchdogs.
-		c.clearReadDeadline()
 		var payloadLengthBuf [2 + 16]byte
 		payloadLengthRaw := payloadLengthBuf[:2+c.CipherConf().TagLen]
 		if _, err := io.ReadFull(c.Conn, payloadLengthRaw); err != nil {
@@ -460,7 +494,8 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 		common.BytesIncLittleEndian(c.nonceWrite)
 
 		offset += c.sealPayload(frame[offset:], remainingPayload)
-		c.setHandshakeWriteDeadline()
+		c.setHandshakeDeadline(&c.writeDeadline, time.Now().Add(tcpHandshakeTimeout), c.Conn.SetWriteDeadline)
+		defer c.setHandshakeDeadline(&c.writeDeadline, time.Time{}, c.Conn.SetWriteDeadline)
 		if _, err = iout.WriteFull(c.Conn, frame[:offset]); err != nil {
 			c.writeBroken = true
 			return 0, err
@@ -474,7 +509,6 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 	frameSize := encryptedPayloadLen(len(b), c.CipherConf().TagLen)
 	frame := c.borrowWriteFrame(frameSize)
 	offset := c.sealPayload(frame, b)
-	c.setHandshakeWriteDeadline()
 	if _, err = iout.WriteFull(c.Conn, frame[:offset]); err != nil {
 		c.writeBroken = true
 		return 0, err

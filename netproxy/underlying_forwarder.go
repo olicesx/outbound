@@ -10,8 +10,8 @@ import "net"
 // but that method is not part of netproxy.Conn, so unwrapping walks stop at
 // the TLS conn unless a forwarder sits above it.
 //
-// Reads and writes pass straight through to the wrapped conn; the forwarder
-// only adds the UnderlyingConnProvider capability.
+// Reads and writes pass straight through to the wrapped conn. The forwarder
+// exposes the raw socket separately from the wrapped conn's capabilities.
 type UnderlyingConnForwarder struct {
 	Conn
 	raw func() net.Conn
@@ -31,6 +31,22 @@ func (f *UnderlyingConnForwarder) UnderlyingConn() net.Conn {
 		return nil
 	}
 	return f.raw()
+}
+
+// LocalAddr returns the wrapped connection's local address, when available.
+func (f *UnderlyingConnForwarder) LocalAddr() net.Addr {
+	if c, ok := f.Conn.(interface{ LocalAddr() net.Addr }); ok {
+		return c.LocalAddr()
+	}
+	return nil
+}
+
+// RemoteAddr returns the wrapped connection's remote address, when available.
+func (f *UnderlyingConnForwarder) RemoteAddr() net.Addr {
+	if c, ok := f.Conn.(interface{ RemoteAddr() net.Addr }); ok {
+		return c.RemoteAddr()
+	}
+	return nil
 }
 
 // IntrinsicConn continues the wrapper-peeling convention so capability
